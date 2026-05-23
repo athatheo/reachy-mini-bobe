@@ -128,6 +128,17 @@ class Config:
 
     def __init__(self) -> None:
         """Initialize the configuration."""
+        if self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY:
+            external_profiles = _collect_profile_names(self.PROFILES_DIRECTORY)
+            internal_profiles = _collect_profile_names(DEFAULT_PROFILES_DIRECTORY)
+            _raise_on_name_collisions(
+                label="profile",
+                external_root=self.PROFILES_DIRECTORY,
+                internal_root=DEFAULT_PROFILES_DIRECTORY,
+                external_names=external_profiles,
+                internal_names=internal_profiles,
+            )
+
         if self.REACHY_MINI_CUSTOM_PROFILE and self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY:
             selected_profile_path = self.PROFILES_DIRECTORY / self.REACHY_MINI_CUSTOM_PROFILE
             if not selected_profile_path.is_dir():
@@ -140,17 +151,6 @@ class Config:
                     "Either set 'REACHY_MINI_CUSTOM_PROFILE' to one of the available external profiles "
                     "or unset 'REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY' to use built-in profiles."
                 )
-
-        if self.PROFILES_DIRECTORY != DEFAULT_PROFILES_DIRECTORY:
-            external_profiles = _collect_profile_names(self.PROFILES_DIRECTORY)
-            internal_profiles = _collect_profile_names(DEFAULT_PROFILES_DIRECTORY)
-            _raise_on_name_collisions(
-                label="profile",
-                external_root=self.PROFILES_DIRECTORY,
-                internal_root=DEFAULT_PROFILES_DIRECTORY,
-                external_names=external_profiles,
-                internal_names=internal_profiles,
-            )
 
         if self.TOOLS_DIRECTORY is not None:
             builtin_tools_root = Path(__file__).parent / "tools"

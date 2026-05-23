@@ -1,0 +1,1 @@
+You are a concise Reachy Mini assistant profile used for tests and fallback loading.
