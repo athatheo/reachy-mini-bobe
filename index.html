@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Reachy Mini BoBe</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="ambient"></div>
+    <div class="container">
+      <header class="hero">
+        <div class="pill">Reachy Mini App</div>
+        <h1>BoBe</h1>
+        <p class="subtitle">A Claude-backed voice assistant foundation for Reachy Mini, addressed as Bob.</p>
+      </header>
+
+      <div class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Getting Started</p>
+            <h2>Run locally with uv</h2>
+          </div>
+        </div>
+        <p class="muted">Install the app dependencies, start the daemon, then launch BoBe.</p>
+        <pre><code>uv sync --group dev
+uv run reachy-mini-daemon --sim  # in another terminal
+uv run bobe --gradio</code></pre>
+      </div>
+
+      <div class="panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Configuration</p>
+            <h2>Voice bridge + Claude answers</h2>
+          </div>
+        </div>
+        <p class="muted">Set OPENAI_API_KEY for the realtime speech bridge and ANTHROPIC_API_KEY for Claude-backed BoBe answers.</p>
+      </div>
+    </div>
+  </body>
+</html>
