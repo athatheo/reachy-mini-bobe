@@ -1,9 +1,8 @@
 """Conservative emotion selection for BoBe responses."""
 
 from __future__ import annotations
-
-from dataclasses import dataclass
 from typing import Literal
+from dataclasses import dataclass
 
 
 EmotionName = Literal["happy", "thinking", "curious", "surprised", "sad", "neutral"]

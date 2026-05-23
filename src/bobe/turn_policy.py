@@ -1,7 +1,6 @@
 """Pure turn-policy helpers for BoBe wake-word handling."""
 
 from __future__ import annotations
-
 import re
 from dataclasses import dataclass
 
