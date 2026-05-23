@@ -8,15 +8,34 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-import torch
 from numpy.typing import NDArray
-from transformers import AutoProcessor, AutoModelForImageTextToText
 from huggingface_hub import snapshot_download
+
+try:
+    import torch
+except ImportError:  # pragma: no cover - exercised through import behavior
+    torch = None  # type: ignore[assignment]
+
+try:
+    from transformers import AutoProcessor, AutoModelForImageTextToText
+except ImportError:  # pragma: no cover - exercised through import behavior
+    AutoProcessor = None  # type: ignore[assignment]
+    AutoModelForImageTextToText = None  # type: ignore[assignment]
 
 from bobe.config import config
 
 
 logger = logging.getLogger(__name__)
+
+
+def _local_vision_dependencies_available() -> bool:
+    return torch is not None and AutoProcessor is not None and AutoModelForImageTextToText is not None
+
+
+def _is_cuda_oom(error: Exception) -> bool:
+    cuda = getattr(torch, "cuda", None) if torch is not None else None
+    oom_error = getattr(cuda, "OutOfMemoryError", None)
+    return isinstance(oom_error, type) and isinstance(error, oom_error)
 
 
 @dataclass
@@ -46,6 +65,8 @@ class VisionProcessor:
 
     def _determine_device(self) -> str:
         pref = self.vision_config.device_preference
+        if torch is None:
+            return "cpu"
         if pref == "cpu":
             return "cpu"
         if pref == "cuda":
@@ -59,9 +80,13 @@ class VisionProcessor:
 
     def initialize(self) -> bool:
         """Load model and processor onto the selected device."""
+        if not _local_vision_dependencies_available():
+            logger.error("Local vision dependencies missing; install the local_vision extra to enable this feature")
+            return False
+
         try:
             logger.info(f"Loading SmolVLM2 model on {self.device} (HF_HOME={config.HF_HOME})")
-            self.processor = AutoProcessor.from_pretrained(self.model_path)  # type: ignore
+            self.processor = AutoProcessor.from_pretrained(self.model_path)  # type: ignore[union-attr]
 
             # Select dtype depending on device
             if self.device == "cuda":
@@ -193,13 +218,14 @@ class VisionProcessor:
 
     def get_model_info(self) -> Dict[str, Any]:
         """Get information about the loaded model."""
+        cuda_available = bool(torch is not None and torch.cuda.is_available())
         return {
             "initialized": self._initialized,
             "device": self.device,
             "model_path": self.model_path,
-            "cuda_available": torch.cuda.is_available(),
+            "cuda_available": cuda_available,
             "gpu_memory": torch.cuda.get_device_properties(0).total_memory // (1024**3)
-            if torch.cuda.is_available()
+            if cuda_available
             else "N/A",
         }
 
