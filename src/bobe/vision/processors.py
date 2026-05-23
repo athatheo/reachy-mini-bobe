@@ -11,19 +11,25 @@ import numpy as np
 from numpy.typing import NDArray
 from huggingface_hub import snapshot_download
 
-
-try:
-    import torch
-except ImportError:  # pragma: no cover - exercised through import behavior
-    torch = None  # type: ignore[assignment]
-
-try:
-    from transformers import AutoProcessor, AutoModelForImageTextToText
-except ImportError:  # pragma: no cover - exercised through import behavior
-    AutoProcessor = None  # type: ignore[assignment]
-    AutoModelForImageTextToText = None  # type: ignore[assignment]
-
 from bobe.config import config
+
+
+try:
+    import torch as _torch
+except ImportError:  # pragma: no cover - exercised through import behavior
+    _torch = None
+
+torch: Any = _torch
+
+try:
+    from transformers import AutoProcessor as _AutoProcessor
+    from transformers import AutoModelForImageTextToText as _AutoModelForImageTextToText
+except ImportError:  # pragma: no cover - exercised through import behavior
+    _AutoProcessor = None
+    _AutoModelForImageTextToText = None
+
+AutoProcessor: Any = _AutoProcessor
+AutoModelForImageTextToText: Any = _AutoModelForImageTextToText
 
 
 logger = logging.getLogger(__name__)
@@ -87,7 +93,7 @@ class VisionProcessor:
 
         try:
             logger.info(f"Loading SmolVLM2 model on {self.device} (HF_HOME={config.HF_HOME})")
-            self.processor = AutoProcessor.from_pretrained(self.model_path)  # type: ignore[union-attr]
+            self.processor = AutoProcessor.from_pretrained(self.model_path)
 
             # Select dtype depending on device
             if self.device == "cuda":
@@ -104,7 +110,7 @@ class VisionProcessor:
                 model_kwargs["_attn_implementation"] = "flash_attention_2"
 
             # Load model weights
-            self.model = AutoModelForImageTextToText.from_pretrained(self.model_path, **model_kwargs).to(self.device)  # type: ignore
+            self.model = AutoModelForImageTextToText.from_pretrained(self.model_path, **model_kwargs).to(self.device)
 
             if self.model is not None:
                 self.model.eval()

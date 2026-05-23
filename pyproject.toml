@@ -61,7 +61,7 @@ bobe = "bobe.main:Bobe"
 "" = "src"
 
 [tool.setuptools.package-data]
-bobe = [ "images/*", "static/*", ".env.example", "demos/**/*.txt", "prompts_library/*.txt", "profiles/**/*.txt", "profiles/**/*.py", "prompts/**/*.txt",]
+bobe = [ "static/*", "profiles/**/*.txt", "profiles/**/*.py", "prompts/**/*.txt",]
 
 [tool.ruff.lint]
 select = [ "E", "F", "W", "I", "C4", "D",]
