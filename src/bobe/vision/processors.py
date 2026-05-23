@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 from huggingface_hub import snapshot_download
 
+
 try:
     import torch
 except ImportError:  # pragma: no cover - exercised through import behavior

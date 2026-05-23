@@ -1,10 +1,11 @@
+# ruff: noqa: D101,D102,D103,D107
 from types import SimpleNamespace
 
 import pytest
 
 from bobe.claude import (
-    ClaudeNotConfiguredError,
     ClaudeSettings,
+    ClaudeNotConfiguredError,
     ask_claude,
     extract_message_text,
     load_claude_settings,

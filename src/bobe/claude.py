@@ -1,11 +1,10 @@
 """Claude integration helpers for BoBe."""
 
 from __future__ import annotations
-
 import os
 import re
-from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
+from dataclasses import dataclass
 
 
 DEFAULT_WAKE_WORD = "Bob"
