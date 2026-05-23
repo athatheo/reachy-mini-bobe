@@ -1,0 +1,13 @@
+# BoBe's enabled tools.
+# `ask_claude` provides Claude-backed answers; motion tools add expression.
+
+ask_claude
+play_emotion
+stop_emotion
+move_head
+sweep_look
+#do_nothing
+#camera
+#head_tracking
+#dance
+#stop_dance
