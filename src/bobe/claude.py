@@ -3,7 +3,7 @@
 from __future__ import annotations
 import os
 import re
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, cast
 from dataclasses import dataclass
 
 
@@ -102,7 +102,7 @@ async def ask_claude(
     if active_client is None:
         from anthropic import AsyncAnthropic
 
-        active_client = AsyncAnthropic(api_key=active_settings.api_key)
+        active_client = cast(_ClaudeClient, AsyncAnthropic(api_key=cast(str, active_settings.api_key)))
 
     response = await active_client.messages.create(
         model=active_settings.model,
