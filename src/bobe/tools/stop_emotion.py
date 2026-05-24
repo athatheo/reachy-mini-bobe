@@ -14,13 +14,8 @@ class StopEmotion(Tool):
     description = "Stop the current emotion"
     parameters_schema = {
         "type": "object",
-        "properties": {
-            "dummy": {
-                "type": "boolean",
-                "description": "dummy boolean, set it to true",
-            },
-        },
-        "required": ["dummy"],
+        "properties": {},
+        "required": [],
     }
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> Dict[str, Any]:
