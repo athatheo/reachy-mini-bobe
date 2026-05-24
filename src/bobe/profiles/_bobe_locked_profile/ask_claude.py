@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from bobe.claude import ClaudeNotConfiguredError, ask_claude, load_claude_settings
+from bobe.emotion_policy import classify_emotion
 from bobe.tools.core_tools import Tool, ToolDependencies
 
 
@@ -45,4 +46,11 @@ class AskClaude(Tool):
             logger.exception("Claude request failed")
             return {"status": "error", "error": f"Claude request failed: {type(exc).__name__}"}
 
-        return {"status": "ok", "model": settings.model, "answer": answer}
+        emotion = classify_emotion(answer)
+        return {
+            "status": "ok",
+            "model": settings.model,
+            "answer": answer,
+            "emotion": emotion.emotion,
+            "should_play_emotion": emotion.should_play_emotion,
+        }
