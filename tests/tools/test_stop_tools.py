@@ -1,4 +1,4 @@
-# ruff: noqa: D103
+# ruff: noqa: D101,D102,D103,D107
 
 from types import SimpleNamespace
 
