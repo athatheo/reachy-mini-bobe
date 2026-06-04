@@ -23,8 +23,8 @@ from scipy.signal import resample
 
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
-from bobe.config import LOCKED_PROFILE, config
 from bobe.claude import DEFAULT_CLAUDE_MODEL
+from bobe.config import LOCKED_PROFILE, config
 from bobe.openai_realtime import OpenaiRealtimeHandler
 from bobe.headless_personality_ui import mount_personality_routes
 

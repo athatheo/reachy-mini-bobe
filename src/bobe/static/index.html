@@ -16,7 +16,7 @@
       <header class="hero">
         <div class="pill">Headless control</div>
         <h1>Bobe</h1>
-        <p class="subtitle">Configure the voice bridge. Claude answers use ANTHROPIC_API_KEY from the app environment.</p>
+        <p class="subtitle">Configure private OpenAI voice and Anthropic Claude keys for BoBe.</p>
       </header>
 
       <div id="configured" class="panel hidden">
@@ -27,7 +27,7 @@
           </div>
           <span class="chip chip-ok">Connected</span>
         </div>
-        <p class="muted">OpenAI API key is configured for speech. Set ANTHROPIC_API_KEY in the app environment for Claude-backed answers.</p>
+        <p class="muted">OpenAI and Anthropic keys are configured. BoBe is ready to use the private voice bridge and Claude-backed answers.</p>
         <button id="change-key-btn" class="ghost">Change API key</button>
       </div>
 
@@ -35,15 +35,19 @@
         <div class="panel-heading">
           <div>
             <p class="eyebrow">Credentials</p>
-            <h2>Connect OpenAI</h2>
+            <h2>Connect OpenAI and Claude</h2>
           </div>
           <span class="chip">Required</span>
         </div>
-        <p class="muted">Paste your OpenAI API key for the realtime speech loop. Add ANTHROPIC_API_KEY in .env for Claude answers.</p>
-        <label for="api-key">OpenAI API Key</label>
-        <input id="api-key" type="password" placeholder="sk-..." autocomplete="off" />
+        <p class="muted">Paste your own keys. BoBe will not use shared demo keys.</p>
+        <label for="openai-api-key">OpenAI API Key</label>
+        <input id="openai-api-key" type="password" placeholder="sk-..." autocomplete="off" />
+        <label for="anthropic-api-key">Anthropic API Key</label>
+        <input id="anthropic-api-key" type="password" placeholder="sk-ant-..." autocomplete="off" />
+        <label for="claude-model">Claude Model</label>
+        <input id="claude-model" type="text" value="claude-sonnet-4-6" autocomplete="off" />
         <div class="actions">
-          <button id="save-btn">Save key</button>
+          <button id="save-btn">Save keys</button>
           <p id="status" class="status"></p>
         </div>
       </div>
