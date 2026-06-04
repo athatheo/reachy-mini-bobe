@@ -1,12 +1,13 @@
 """Bidirectional local audio stream with optional settings UI.
 
-In headless mode, there is no Gradio UI. If the OpenAI API key is not
+In headless mode, there is no Gradio UI. If required API keys are not
 available via environment/.env, we expose a minimal settings page via the
-Reachy Mini Apps settings server to let non-technical users enter it.
+Reachy Mini Apps settings server to let non-technical users enter them.
 
-The settings UI is served from this package's ``static/`` folder and offers a
-single password field to set ``OPENAI_API_KEY``. Once set, we persist it to the
-app instance's ``.env`` file (if available) and proceed to start streaming.
+The settings UI is served from this package's ``static/`` folder and stores
+``OPENAI_API_KEY`` for the realtime voice bridge plus ``ANTHROPIC_API_KEY`` for
+Claude-backed answers. Keys are persisted to the app instance's private ``.env``
+file when available.
 """
 
 import os
@@ -22,6 +23,7 @@ from scipy.signal import resample
 
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
+from bobe.claude import DEFAULT_CLAUDE_MODEL
 from bobe.config import LOCKED_PROFILE, config
 from bobe.openai_realtime import OpenaiRealtimeHandler
 from bobe.headless_personality_ui import mount_personality_routes
@@ -106,51 +108,54 @@ class LocalStream:
         except Exception:
             return []
 
-    def _persist_api_key(self, key: str) -> None:
-        """Persist API key to environment and instance ``.env`` if possible.
+    def _required_api_keys_configured(self) -> bool:
+        """Return whether all explicit user-provided keys are configured."""
+        return bool(
+            config.OPENAI_API_KEY
+            and str(config.OPENAI_API_KEY).strip()
+            and os.getenv("ANTHROPIC_API_KEY", "").strip()
+        )
 
-        Behavior:
-        - Always sets ``OPENAI_API_KEY`` in process env and in-memory config.
-        - Writes/updates ``<instance_path>/.env``:
-          * If ``.env`` exists, replaces/append OPENAI_API_KEY line.
-          * Else, copies template from ``<instance_path>/.env.example`` when present,
-            otherwise falls back to the packaged template
-            ``bobe/.env.example``.
-          * Ensures the resulting file contains the full template plus the key.
-        - Loads the written ``.env`` into the current process environment.
-        """
-        k = (key or "").strip()
-        if not k:
+    def _persist_api_settings(
+        self,
+        *,
+        openai_api_key: str,
+        anthropic_api_key: str,
+        claude_model: str,
+    ) -> None:
+        """Persist explicit API settings to environment and instance ``.env``."""
+        values = {
+            "OPENAI_API_KEY": openai_api_key.strip(),
+            "ANTHROPIC_API_KEY": anthropic_api_key.strip(),
+            "CLAUDE_MODEL": (claude_model or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL,
+        }
+        if not values["OPENAI_API_KEY"] or not values["ANTHROPIC_API_KEY"]:
             return
-        # Update live process env and config so consumers see it immediately
+
+        os.environ.update(values)
         try:
-            os.environ["OPENAI_API_KEY"] = k
-        except Exception:  # best-effort
-            pass
-        try:
-            config.OPENAI_API_KEY = k
+            config.OPENAI_API_KEY = values["OPENAI_API_KEY"]
         except Exception:
             pass
 
         if not self._instance_path:
             return
-        try:
-            inst = Path(self._instance_path)
-            env_path = inst / ".env"
-            lines = self._read_env_lines(env_path)
-            replaced = False
-            for i, ln in enumerate(lines):
-                if ln.strip().startswith("OPENAI_API_KEY="):
-                    lines[i] = f"OPENAI_API_KEY={k}"
-                    replaced = True
-                    break
-            if not replaced:
-                lines.append(f"OPENAI_API_KEY={k}")
-            final_text = "\n".join(lines) + "\n"
-            env_path.write_text(final_text, encoding="utf-8")
-            logger.info("Persisted OPENAI_API_KEY to %s", env_path)
 
-            # Load the newly written .env into this process to ensure downstream imports see it
+        try:
+            env_path = Path(self._instance_path) / ".env"
+            lines = self._read_env_lines(env_path)
+            for key, value in values.items():
+                replacement = f"{key}={value}"
+                for index, line in enumerate(lines):
+                    if line.strip().startswith(f"{key}="):
+                        lines[index] = replacement
+                        break
+                else:
+                    lines.append(replacement)
+
+            env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            logger.info("Persisted explicit API settings to %s", env_path)
+
             try:
                 from dotenv import load_dotenv
 
@@ -158,7 +163,7 @@ class LocalStream:
             except Exception:
                 pass
         except Exception as e:
-            logger.warning("Failed to persist OPENAI_API_KEY: %s", e)
+            logger.warning("Failed to persist explicit API settings: %s", e)
 
     def _persist_personality(self, profile: Optional[str]) -> None:
         """Persist the startup personality to the instance .env and config."""
@@ -239,8 +244,10 @@ class LocalStream:
             except Exception:
                 pass
 
-        class ApiKeyPayload(BaseModel):
+        class ApiSettingsPayload(BaseModel):
             openai_api_key: str
+            anthropic_api_key: str
+            claude_model: str = DEFAULT_CLAUDE_MODEL
 
         # GET / -> index.html
         @self._settings_app.get("/")
@@ -252,11 +259,19 @@ class LocalStream:
         def _favicon() -> Response:
             return Response(status_code=204)
 
-        # GET /status -> whether key is set
+        # GET /status -> whether required keys are set
         @self._settings_app.get("/status")
         def _status() -> JSONResponse:
-            has_key = bool(config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip())
-            return JSONResponse({"has_key": has_key})
+            has_openai_key = bool(config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip())
+            has_anthropic_key = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+            return JSONResponse(
+                {
+                    "has_key": has_openai_key and has_anthropic_key,
+                    "has_openai_key": has_openai_key,
+                    "has_anthropic_key": has_anthropic_key,
+                    "claude_model": os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
+                }
+            )
 
         # GET /ready -> whether backend finished loading tools
         @self._settings_app.get("/ready")
@@ -268,40 +283,22 @@ class LocalStream:
                 ready = False
             return JSONResponse({"ready": ready})
 
-        # POST /openai_api_key -> set/persist key
-        @self._settings_app.post("/openai_api_key")
-        def _set_key(payload: ApiKeyPayload) -> JSONResponse:
-            key = (payload.openai_api_key or "").strip()
-            if not key:
-                return JSONResponse({"ok": False, "error": "empty_key"}, status_code=400)
-            self._persist_api_key(key)
+        # POST /api_keys -> set/persist explicit user-provided keys
+        @self._settings_app.post("/api_keys")
+        def _set_api_keys(payload: ApiSettingsPayload) -> JSONResponse:
+            openai_key = (payload.openai_api_key or "").strip()
+            anthropic_key = (payload.anthropic_api_key or "").strip()
+            claude_model = (payload.claude_model or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
+            if not openai_key:
+                return JSONResponse({"ok": False, "error": "missing_openai_api_key"}, status_code=400)
+            if not anthropic_key:
+                return JSONResponse({"ok": False, "error": "missing_anthropic_api_key"}, status_code=400)
+            self._persist_api_settings(
+                openai_api_key=openai_key,
+                anthropic_api_key=anthropic_key,
+                claude_model=claude_model,
+            )
             return JSONResponse({"ok": True})
-
-        # POST /validate_api_key -> validate key without persisting it
-        @self._settings_app.post("/validate_api_key")
-        async def _validate_key(payload: ApiKeyPayload) -> JSONResponse:
-            key = (payload.openai_api_key or "").strip()
-            if not key:
-                return JSONResponse({"valid": False, "error": "empty_key"}, status_code=400)
-
-            # Try to validate by checking if we can fetch the models
-            try:
-                import httpx
-
-                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get("https://api.openai.com/v1/models", headers=headers)
-                    if response.status_code == 200:
-                        return JSONResponse({"valid": True})
-                    elif response.status_code == 401:
-                        return JSONResponse({"valid": False, "error": "invalid_api_key"}, status_code=401)
-                    else:
-                        return JSONResponse(
-                            {"valid": False, "error": "validation_failed"}, status_code=response.status_code
-                        )
-            except Exception as e:
-                logger.warning(f"API key validation failed: {e}")
-                return JSONResponse({"valid": False, "error": "validation_error"}, status_code=500)
 
         self._settings_initialized = True
 
@@ -340,33 +337,17 @@ class LocalStream:
             except Exception:
                 pass  # Instance .env loading is optional; continue with defaults
 
-        # If key is still missing, try to download one from HuggingFace
-        if not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
-            logger.info("OPENAI_API_KEY not set, attempting to download from HuggingFace...")
-            try:
-                from gradio_client import Client
-                client = Client("HuggingFaceM4/gradium_setup", verbose=False)
-                key, status = client.predict(api_name="/claim_b_key")
-                if key and key.strip():
-                    logger.info("Successfully downloaded API key from HuggingFace")
-                    # Persist it immediately
-                    self._persist_api_key(key)
-            except Exception as e:
-                logger.warning(f"Failed to download API key from HuggingFace: {e}")
-
-        # Always expose settings UI if a settings app is available
-        # (do this AFTER loading/downloading the key so status endpoint sees the right value)
+        # Always expose settings UI if a settings app is available.
         self._init_settings_ui_if_needed()
 
-        # If key is still missing -> wait until provided via the settings UI
-        if not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
-            logger.warning("OPENAI_API_KEY not found. Open the app settings page to enter it.")
-            # Poll until the key becomes available (set via the settings UI)
+        # Never auto-download shared/demo keys. Wait for explicit user-provided keys.
+        if not self._required_api_keys_configured():
+            logger.warning("Required API keys missing. Open the app settings page to enter OpenAI and Anthropic keys.")
             try:
-                while not (config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip()):
+                while not self._required_api_keys_configured():
                     time.sleep(0.2)
             except KeyboardInterrupt:
-                logger.info("Interrupted while waiting for API key.")
+                logger.info("Interrupted while waiting for API keys.")
                 return
 
         # Start media after key is set/available
