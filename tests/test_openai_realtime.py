@@ -176,6 +176,36 @@ def test_compute_response_cost(usage_kwargs: dict[str, Any], expect_positive: bo
         assert cost == 0.0
 
 
+@pytest.mark.asyncio
+async def test_completed_user_transcript_ignores_non_wake_word() -> None:
+    """Completed transcripts without Bob should not enqueue a response."""
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+
+    await handler._handle_completed_user_transcript("what time is it")
+
+    output = await handler.output_queue.get()
+    assert output.args[0] == {"role": "user", "content": "what time is it"}
+    assert handler._pending_responses.empty()
+
+
+@pytest.mark.asyncio
+async def test_completed_user_transcript_enqueues_wake_word_response() -> None:
+    """Completed transcripts addressed to Bob should enqueue one response."""
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+
+    await handler._handle_completed_user_transcript("Bob, what can you do?")
+
+    output = await handler.output_queue.get()
+    assert output.args[0] == {"role": "user", "content": "Bob, what can you do?"}
+
+    queued = await handler._pending_responses.get()
+    instructions = queued["response"]["instructions"]
+    assert "what can you do" in instructions
+    assert "English or Greek" in instructions
+
+
 # ---- Stress test: response.create rejection + retry ----
 
 

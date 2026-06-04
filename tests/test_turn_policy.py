@@ -47,3 +47,16 @@ def test_decide_turn_handles_wake_word_only():
     assert decision.should_respond
     assert decision.request_text == ""
     assert decision.reason == "wake_word_only"
+
+
+def test_decide_turn_accepts_greek_wake_word_alias():
+    decision = decide_turn("Μπομπ, τι μπορείς να κάνεις;")
+
+    assert decision.should_respond
+    assert decision.request_text == "τι μπορείς να κάνεις"
+
+
+def test_decide_turn_rejects_greek_wake_word_inside_longer_word():
+    decision = decide_turn("Μπομπάκι τι κάνεις;")
+
+    assert not decision.should_respond

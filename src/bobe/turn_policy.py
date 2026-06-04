@@ -8,6 +8,7 @@ from bobe.claude import DEFAULT_WAKE_WORD, should_respond_to_wake_word
 
 
 _LEADING_FILLERS = {"hey", "hi", "hello", "ok", "okay", "yo"}
+_DEFAULT_WAKE_WORD_ALIASES = ("Bob", "Μπομπ", "Μπόμπ")
 
 
 @dataclass(frozen=True)
@@ -35,12 +36,20 @@ def decide_turn(text: str, wake_word: str = DEFAULT_WAKE_WORD) -> TurnDecision:
 
 
 def _wake_word_match(text: str, wake_word: str) -> re.Match[str] | None:
-    if not should_respond_to_wake_word(text, wake_word):
-        return None
+    for word in _wake_word_aliases(wake_word):
+        if not should_respond_to_wake_word(text, word):
+            continue
+        return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text, re.IGNORECASE)
+    return None
+
+
+def _wake_word_aliases(wake_word: str) -> tuple[str, ...]:
     word = wake_word.strip()
     if not word:
-        return None
-    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])", text, re.IGNORECASE)
+        return ()
+    if word.casefold() == DEFAULT_WAKE_WORD.casefold():
+        return _DEFAULT_WAKE_WORD_ALIASES
+    return (word,)
 
 
 def _remove_wake_word(text: str, match: re.Match[str]) -> str:
