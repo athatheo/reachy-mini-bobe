@@ -87,10 +87,10 @@ class BreathingMove(Move):  # type: ignore
         self.neutral_antennas = np.array([0.0, 0.0])
 
         # Breathing parameters
-        self.breathing_z_amplitude = 0.005  # 5mm gentle breathing
-        self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
-        self.antenna_sway_amplitude = np.deg2rad(15)  # 15 degrees
-        self.antenna_frequency = 0.5  # Hz (faster antenna sway)
+        self.breathing_z_amplitude = 0.0015  # 1.5mm subtle breathing
+        self.breathing_frequency = 0.05  # Hz (3 breaths per minute)
+        self.antenna_sway_amplitude = np.deg2rad(4)  # subtle antenna sway
+        self.antenna_frequency = 0.15
 
     @property
     def duration(self) -> float:
@@ -263,7 +263,7 @@ class MovementManager:
         self.move_queue: deque[Move] = deque()
 
         # Configuration
-        self.idle_inactivity_delay = 0.3  # seconds
+        self.idle_inactivity_delay = 8.0  # seconds
         self.target_frequency = CONTROL_LOOP_FREQUENCY_HZ
         self.target_period = 1.0 / self.target_frequency
 

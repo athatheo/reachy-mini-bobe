@@ -19,6 +19,7 @@ from websockets.exceptions import ConnectionClosedError
 
 from bobe.config import config
 from bobe.prompts import get_session_voice, get_session_instructions
+from bobe.turn_policy import decide_turn
 from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
@@ -425,7 +426,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             if not bg_tool.is_idle_tool_call:
                 await self._safe_response_create(
                     response={
-                        "instructions": "Use the tool result just returned and answer concisely in speech.",
+                        "instructions": (
+                            "Use the tool result just returned and answer concisely in speech. "
+                            "Speak only English or Greek."
+                        ),
                     },
                 )
 
@@ -437,6 +441,30 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.warning("Connection closed while sending tool result")
             self.connection = None
             self._response_done_event.set()
+
+
+    async def _handle_completed_user_transcript(self, transcript: str) -> None:
+        """Record a completed user transcript and respond only when addressed as Bob."""
+        await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
+
+        turn = decide_turn(transcript)
+        if not turn.should_respond:
+            logger.info("Ignoring transcript without wake word: %r", transcript)
+            return
+
+        if turn.request_text:
+            instructions = (
+                "Respond only to this wake-word request. "
+                "Speak only English or Greek. "
+                f"User request after removing the wake word: {turn.request_text!r}"
+            )
+        else:
+            instructions = (
+                "The user only said the wake word. Briefly ask how you can help. "
+                "Speak only English or Greek."
+            )
+
+        await self._safe_response_create(response={"instructions": instructions})
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
@@ -452,10 +480,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                     "type": "audio/pcm",
                                     "rate": self.input_sample_rate,
                                 },
-                                "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
+                                "transcription": {"model": "gpt-4o-transcribe"},
                                 "turn_detection": {
                                     "type": "server_vad",
                                     "interrupt_response": True,
+                                    "create_response": False,
                                 },
                             },
                             "output": {
@@ -575,7 +604,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             except asyncio.CancelledError:
                                 pass
 
-                        await self.output_queue.put(AdditionalOutputs({"role": "user", "content": event.transcript}))
+                        await self._handle_completed_user_transcript(event.transcript)
 
                     # Handle assistant transcription
                     if event.type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
@@ -849,23 +878,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Send an idle signal to the openai server."""
         logger.debug("Sending idle signal")
         self.is_idle_tool_call = True
-        timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {idle_duration:.1f}s] You've been idle for a while. Feel free to get creative - dance, show an emotion, look around, do nothing, or just be yourself!"
+        timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {idle_duration:.1f}s]"
         if not self.connection:
             logger.debug("No connection, cannot send idle signal")
             return
-        await self.connection.conversation.item.create(
-            item={
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": timestamp_msg}],
-            },
-        )
-        await self._safe_response_create(
-            response={
-                "instructions": "You MUST respond with function calls only - no speech or text. Choose appropriate actions for idle behavior.",
-                "tool_choice": "required",
-            },
-        )
+        logger.debug("Idle signal suppressed: %s", timestamp_msg)
 
     def _persist_api_key_if_needed(self) -> None:
         """Persist the API key into `.env` inside `instance_path/` when appropriate.

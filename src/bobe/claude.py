@@ -54,7 +54,7 @@ def should_respond_to_wake_word(text: str, wake_word: str = DEFAULT_WAKE_WORD) -
     word = wake_word.strip()
     if not word:
         return False
-    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(word)}(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
+    return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text, re.IGNORECASE) is not None
 
 
 def build_claude_system_prompt() -> str:
@@ -62,6 +62,7 @@ def build_claude_system_prompt() -> str:
     return (
         "You are BoBe, a helpful personal assistant speaking through a Reachy Mini robot. "
         "Answer naturally, briefly, and in first person. Prefer responses that are easy to speak aloud. "
+        "Only speak English or Greek. Use Greek when the user asks in Greek, otherwise use English. "
         "When useful, suggest an emotion label such as happy, thinking, curious, sad, or surprised, "
         "but do not include private implementation details."
     )
