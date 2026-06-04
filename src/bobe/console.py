@@ -46,6 +46,18 @@ except Exception:  # pragma: no cover - only loaded when settings_app is used
 logger = logging.getLogger(__name__)
 
 
+def _is_plausible_openai_key(value: str | None) -> bool:
+    """Return whether a value looks like an OpenAI API key."""
+    key = (value or "").strip()
+    return key.startswith("sk-") and len(key) >= 20
+
+
+def _is_plausible_anthropic_key(value: str | None) -> bool:
+    """Return whether a value looks like an Anthropic API key."""
+    key = (value or "").strip()
+    return key.startswith("sk-ant-") and len(key) >= 20
+
+
 class LocalStream:
     """LocalStream using Reachy Mini's recorder/player."""
 
@@ -110,10 +122,8 @@ class LocalStream:
 
     def _required_api_keys_configured(self) -> bool:
         """Return whether all explicit user-provided keys are configured."""
-        return bool(
-            config.OPENAI_API_KEY
-            and str(config.OPENAI_API_KEY).strip()
-            and os.getenv("ANTHROPIC_API_KEY", "").strip()
+        return _is_plausible_openai_key(str(config.OPENAI_API_KEY or "")) and _is_plausible_anthropic_key(
+            os.getenv("ANTHROPIC_API_KEY")
         )
 
     def _persist_api_settings(
@@ -262,8 +272,8 @@ class LocalStream:
         # GET /status -> whether required keys are set
         @self._settings_app.get("/status")
         def _status() -> JSONResponse:
-            has_openai_key = bool(config.OPENAI_API_KEY and str(config.OPENAI_API_KEY).strip())
-            has_anthropic_key = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+            has_openai_key = _is_plausible_openai_key(str(config.OPENAI_API_KEY or ""))
+            has_anthropic_key = _is_plausible_anthropic_key(os.getenv("ANTHROPIC_API_KEY"))
             return JSONResponse(
                 {
                     "has_key": has_openai_key and has_anthropic_key,
@@ -289,10 +299,10 @@ class LocalStream:
             openai_key = (payload.openai_api_key or "").strip()
             anthropic_key = (payload.anthropic_api_key or "").strip()
             claude_model = (payload.claude_model or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
-            if not openai_key:
-                return JSONResponse({"ok": False, "error": "missing_openai_api_key"}, status_code=400)
-            if not anthropic_key:
-                return JSONResponse({"ok": False, "error": "missing_anthropic_api_key"}, status_code=400)
+            if not _is_plausible_openai_key(openai_key):
+                return JSONResponse({"ok": False, "error": "invalid_openai_api_key"}, status_code=400)
+            if not _is_plausible_anthropic_key(anthropic_key):
+                return JSONResponse({"ok": False, "error": "invalid_anthropic_api_key"}, status_code=400)
             self._persist_api_settings(
                 openai_api_key=openai_key,
                 anthropic_api_key=anthropic_key,
