@@ -47,6 +47,14 @@ async function saveKeys({ openaiApiKey, anthropicApiKey, claudeModel }) {
   return data;
 }
 
+function looksLikeOpenAIKey(value) {
+  return value.startsWith("sk-") && value.length >= 20;
+}
+
+function looksLikeAnthropicKey(value) {
+  return value.startsWith("sk-ant-") && value.length >= 20;
+}
+
 function show(el, flag) {
   el.classList.toggle("hidden", !flag);
 }
@@ -98,12 +106,12 @@ async function init() {
     const anthropicApiKey = anthropicInput.value.trim();
     const claudeModel = modelInput.value.trim() || "claude-sonnet-4-6";
 
-    markError(openaiInput, !openaiApiKey);
-    markError(anthropicInput, !anthropicApiKey);
+    markError(openaiInput, !looksLikeOpenAIKey(openaiApiKey));
+    markError(anthropicInput, !looksLikeAnthropicKey(anthropicApiKey));
     markError(modelInput, !claudeModel);
 
-    if (!openaiApiKey || !anthropicApiKey || !claudeModel) {
-      statusEl.textContent = "Please enter OpenAI key, Anthropic key, and Claude model.";
+    if (!looksLikeOpenAIKey(openaiApiKey) || !looksLikeAnthropicKey(anthropicApiKey) || !claudeModel) {
+      statusEl.textContent = "Please enter valid OpenAI and Anthropic keys plus a Claude model.";
       statusEl.className = "status warn";
       return;
     }
@@ -116,7 +124,13 @@ async function init() {
       statusEl.className = "status ok";
       window.location.reload();
     } catch (e) {
-      statusEl.textContent = "Failed to save keys. Please try again.";
+      if (e.message === "invalid_openai_api_key") {
+        statusEl.textContent = "OpenAI key should start with sk-.";
+      } else if (e.message === "invalid_anthropic_api_key") {
+        statusEl.textContent = "Anthropic key should start with sk-ant-.";
+      } else {
+        statusEl.textContent = "Failed to save keys. Please try again.";
+      }
       statusEl.className = "status error";
     }
   });
