@@ -7,7 +7,9 @@ from dataclasses import dataclass
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
-DEFAULT_MAX_TOKENS = 512
+DEFAULT_MAX_TOKENS = 1024  # search tool-use blocks count toward output tokens
+WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
+DEFAULT_WEB_SEARCH_MAX_USES = 3
 
 
 class ClaudeNotConfiguredError(RuntimeError):
@@ -21,6 +23,7 @@ class ClaudeSettings:
     api_key: str | None
     model: str = DEFAULT_CLAUDE_MODEL
     max_tokens: int = DEFAULT_MAX_TOKENS
+    web_search: bool = True
 
     @property
     def is_configured(self) -> bool:
@@ -42,6 +45,7 @@ def load_claude_settings(env: Mapping[str, str] | None = None) -> ClaudeSettings
         api_key=_clean_env_value(source.get("ANTHROPIC_API_KEY")),
         model=source.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL,
         max_tokens=max(1, max_tokens),
+        web_search=(source.get("BOBE_CLAUDE_WEB_SEARCH", "1").strip().lower() not in {"0", "false", "no", "off"}),
     )
 
 
@@ -50,6 +54,7 @@ def build_claude_system_prompt() -> str:
     return (
         "You are BoBe, a helpful personal assistant speaking through a Reachy Mini robot. "
         "Answer naturally, briefly, and in first person. Prefer responses that are easy to speak aloud. "
+        "Use the web_search tool when the question needs current information such as weather, news, or prices. "
         "Only speak English or Greek. Use Greek when the user asks in Greek, otherwise use English. "
         "When useful, suggest an emotion label such as happy, thinking, curious, sad, or surprised, "
         "but do not include private implementation details."
@@ -93,12 +98,22 @@ async def ask_claude(
 
         active_client = cast(_ClaudeClient, AsyncAnthropic(api_key=cast(str, active_settings.api_key)))
 
-    response = await active_client.messages.create(
-        model=active_settings.model,
-        max_tokens=active_settings.max_tokens,
-        system=build_claude_system_prompt(),
-        messages=[{"role": "user", "content": question}],
-    )
+    request: dict[str, Any] = {
+        "model": active_settings.model,
+        "max_tokens": active_settings.max_tokens,
+        "system": build_claude_system_prompt(),
+        "messages": [{"role": "user", "content": question}],
+    }
+    if active_settings.web_search:
+        request["tools"] = [
+            {
+                "type": WEB_SEARCH_TOOL_TYPE,
+                "name": "web_search",
+                "max_uses": DEFAULT_WEB_SEARCH_MAX_USES,
+            }
+        ]
+
+    response = await active_client.messages.create(**request)
     return extract_message_text(response)
 
 

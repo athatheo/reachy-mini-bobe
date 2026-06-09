@@ -30,8 +30,15 @@ def test_load_claude_settings_defaults_to_current_sonnet():
     settings = load_claude_settings({})
 
     assert settings.model == "claude-sonnet-4-6"
-    assert settings.max_tokens == 512
+    assert settings.max_tokens == 1024
+    assert settings.web_search
     assert not settings.is_configured
+
+
+def test_load_claude_settings_can_disable_web_search():
+    settings = load_claude_settings({"BOBE_CLAUDE_WEB_SEARCH": "0"})
+
+    assert not settings.web_search
 
 
 def test_load_claude_settings_uses_environment_overrides():
@@ -62,7 +69,7 @@ async def test_ask_claude_requires_api_key():
 
 
 @pytest.mark.asyncio
-async def test_ask_claude_sends_spoken_friendly_request():
+async def test_ask_claude_sends_spoken_friendly_request_with_web_search():
     client = FakeClient()
 
     answer = await ask_claude("What should I do today?", settings=ClaudeSettings(api_key="key"), client=client)
@@ -71,3 +78,16 @@ async def test_ask_claude_sends_spoken_friendly_request():
     assert client.messages.kwargs["model"] == "claude-sonnet-4-6"
     assert client.messages.kwargs["messages"] == [{"role": "user", "content": "What should I do today?"}]
     assert "Reachy Mini" in client.messages.kwargs["system"]
+
+    (tool,) = client.messages.kwargs["tools"]
+    assert tool["name"] == "web_search"
+    assert tool["type"].startswith("web_search_")
+
+
+@pytest.mark.asyncio
+async def test_ask_claude_omits_tools_when_web_search_disabled():
+    client = FakeClient()
+
+    await ask_claude("hi", settings=ClaudeSettings(api_key="key", web_search=False), client=client)
+
+    assert "tools" not in client.messages.kwargs
