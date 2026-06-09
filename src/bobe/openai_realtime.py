@@ -19,7 +19,15 @@ from websockets.exceptions import ConnectionClosedError
 
 from bobe.config import config
 from bobe.prompts import get_session_voice, get_session_instructions
-from bobe.turn_policy import decide_turn
+from bobe.wake_word import (
+    WAKE_SAMPLE_RATE,
+    DEFAULT_FLUSH_SECONDS,
+    WakeSession,
+    AudioRingBuffer,
+    WakeWordDetector,
+    is_sleep_phrase,
+    load_wake_config,
+)
 from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
@@ -117,6 +125,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._response_done_event.set()
         self._last_response_rejected: bool = False
 
+        # Local wake-word gating: while asleep, mic audio never leaves the robot.
+        self.wake_config = load_wake_config()
+        self.wake_session = WakeSession(timeout_s=self.wake_config.timeout_s)
+        self._wake_buffer = AudioRingBuffer(sample_rate=self.input_sample_rate)
+        self._wake_detector: WakeWordDetector | None = None
+        if self.wake_config.enabled:
+            self._wake_detector = WakeWordDetector(
+                on_wake=self.wake_session.request_wake,
+                model_name=self.wake_config.model_name,
+                threshold=self.wake_config.threshold,
+            )
+        else:
+            # Always-on mode (sim/Gradio testing): behave like before the wake gate.
+            self.wake_session.wake()
+
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
         return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path)
@@ -213,6 +236,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 openai_api_key = "DUMMY"
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
+
+        if self._wake_detector is not None:
+            self._wake_detector.start()
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -444,26 +470,24 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
 
     async def _handle_completed_user_transcript(self, transcript: str) -> None:
-        """Record a completed user transcript and respond only when addressed as Bob."""
+        """Record a completed user transcript and respond while the wake session is active."""
         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
 
-        turn = decide_turn(transcript)
-        if not turn.should_respond:
-            logger.info("Ignoring transcript without wake word: %r", transcript)
+        if self.wake_config.enabled and not self.wake_session.awake:
+            # No audio should reach the backend while asleep; guard against stragglers.
+            logger.debug("Ignoring transcript while asleep: %r", transcript)
             return
 
-        if turn.request_text:
-            instructions = (
-                "Respond only to this wake-word request. "
-                "Speak only English or Greek. "
-                f"User request after removing the wake word: {turn.request_text!r}"
-            )
-        else:
-            instructions = (
-                "The user only said the wake word. Briefly ask how you can help. "
-                "Speak only English or Greek."
-            )
+        if self.wake_config.enabled and is_sleep_phrase(transcript, self.wake_config.sleep_phrases):
+            await self._transition_to_sleep("sleep phrase")
+            return
 
+        self.wake_session.touch()
+        instructions = (
+            "Respond to the user's last spoken request. "
+            "Ignore a leading wake phrase such as 'hey jarvis' or 'jarvis'. "
+            "Speak only English or Greek."
+        )
         await self._safe_response_create(response={"instructions": instructions})
 
     async def _run_realtime_session(self) -> None:
@@ -539,6 +563,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.reset()
                         self.deps.movement_manager.set_listening(True)
+                        self.wake_session.touch()
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
@@ -615,6 +640,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     if event.type in ("response.audio.delta", "response.output_audio.delta"):
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.feed(event.delta)
+                        self.wake_session.touch()
                         self.last_activity_time = asyncio.get_event_loop().time()
                         logger.debug("last activity time updated to %s", self.last_activity_time)
                         await self.output_queue.put(
@@ -706,9 +732,90 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 # Stop background tool manager tasks (listener + cleanup) in all patus.
                 await self.tool_manager.shutdown()
 
+    def _to_wake_rate(self, audio_frame: NDArray[Any], input_sample_rate: int) -> NDArray[np.int16]:
+        """Convert a mono frame to the 16kHz int16 format openWakeWord expects."""
+        mono = audio_frame.reshape(-1)
+        if input_sample_rate != WAKE_SAMPLE_RATE:
+            mono = resample(mono, int(len(mono) * WAKE_SAMPLE_RATE / input_sample_rate))
+        converted: NDArray[np.int16] = audio_to_int16(mono)
+        return converted
+
+    def _make_chime(self, *, ascending: bool) -> NDArray[np.int16]:
+        """Generate a short two-tone chime marking a wake/sleep transition."""
+        sample_rate = self.output_sample_rate
+        freqs = (660.0, 880.0) if ascending else (880.0, 660.0)
+        fade = max(1, int(sample_rate * 0.01))
+        tones = []
+        for freq in freqs:
+            t = np.arange(int(sample_rate * 0.12)) / sample_rate
+            tone = 0.25 * np.sin(2 * np.pi * freq * t)
+            tone[:fade] *= np.linspace(0.0, 1.0, fade)
+            tone[-fade:] *= np.linspace(1.0, 0.0, fade)
+            tones.append(tone)
+        return (np.concatenate(tones) * 32767).astype(np.int16)
+
+    async def _play_chime(self, *, ascending: bool) -> None:
+        try:
+            chime = self._make_chime(ascending=ascending)
+            await self.output_queue.put((self.output_sample_rate, chime.reshape(1, -1)))
+        except Exception:
+            logger.debug("Chime skipped", exc_info=True)
+
+    def _queue_antenna_cue(self, *, awake: bool) -> None:
+        """Raise antennas while streaming, relax them when back to local-only."""
+        try:
+            from bobe.dance_emotion_moves import GotoQueueMove
+
+            robot = self.deps.reachy_mini
+            head_pose = robot.get_current_head_pose()
+            head_joints, antennas = robot.get_current_joint_positions()
+            target = (0.5, -0.5) if awake else (0.0, 0.0)
+            move = GotoQueueMove(
+                target_head_pose=head_pose,
+                start_head_pose=head_pose,
+                target_antennas=target,
+                start_antennas=(float(antennas[0]), float(antennas[1])),
+                target_body_yaw=float(head_joints[0]),
+                start_body_yaw=float(head_joints[0]),
+                duration=0.6,
+            )
+            self.deps.movement_manager.queue_move(move)
+        except Exception:
+            logger.debug("Antenna cue skipped", exc_info=True)
+
+    async def _transition_to_awake(self) -> None:
+        """Open the streaming window after a local wake-word detection."""
+        self.wake_session.wake()
+        logger.info("Wake word heard: streaming audio to OpenAI until timeout or sleep phrase")
+        await self._play_chime(ascending=True)
+        self._queue_antenna_cue(awake=True)
+
+        # Flush the buffered audio that arrived with/after the wake phrase so a
+        # one-breath request like "hey jarvis, what's the weather" is not lost.
+        tail = self._wake_buffer.drain_tail(DEFAULT_FLUSH_SECONDS)
+        if tail.size and self.connection:
+            try:
+                await self.connection.input_audio_buffer.append(
+                    audio=base64.b64encode(tail.tobytes()).decode("utf-8")
+                )
+            except Exception as e:
+                logger.debug("Could not flush pre-wake audio: %s", e)
+
+    async def _transition_to_sleep(self, reason: str) -> None:
+        """Close the streaming window; audio stays on the robot again."""
+        self.wake_session.sleep()
+        logger.info("Going to sleep (%s): audio stays local until the wake word", reason)
+        await self._play_chime(ascending=False)
+        self._queue_antenna_cue(awake=False)
+        if self.connection:
+            try:
+                await self.connection.input_audio_buffer.clear()
+            except Exception as e:
+                logger.debug("Could not clear input buffer on sleep: %s", e)
+
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
-        """Receive audio frame from the microphone and send it to the OpenAI server.
+        """Receive a mic frame; keep it local while asleep, otherwise send upstream.
 
         Handles both mono and stereo audio formats, converting to the expected
         mono format for OpenAI's API. Resamples if the input sample rate differs
@@ -733,15 +840,29 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 audio_frame = audio_frame[:, 0]
 
         # Resample if needed
+        upstream_frame = audio_frame
         if self.input_sample_rate != input_sample_rate:
-            audio_frame = resample(audio_frame, int(len(audio_frame) * self.input_sample_rate / input_sample_rate))
+            upstream_frame = resample(audio_frame, int(len(audio_frame) * self.input_sample_rate / input_sample_rate))
 
         # Cast if needed
-        audio_frame = audio_to_int16(audio_frame)
+        upstream_frame = audio_to_int16(upstream_frame)
+
+        if self.wake_config.enabled:
+            if self.wake_session.consume_wake_request():
+                await self._transition_to_awake()
+            elif self.wake_session.expired():
+                await self._transition_to_sleep("inactivity timeout")
+
+            if not self.wake_session.awake:
+                # Asleep: audio never leaves the robot (local detector + ring buffer only).
+                self._wake_buffer.append(upstream_frame.reshape(-1))
+                if self._wake_detector is not None:
+                    self._wake_detector.feed(self._to_wake_rate(audio_frame, input_sample_rate))
+                return
 
         # Send to OpenAI (guard against races during reconnect)
         try:
-            audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
+            audio_message = base64.b64encode(upstream_frame.tobytes()).decode("utf-8")
             await self.connection.input_audio_buffer.append(audio=audio_message)
         except Exception as e:
             logger.debug("Dropping audio frame: connection not ready (%s)", e)
@@ -768,6 +889,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutdown_requested = True
+
+        # Stop the local wake-word detector thread
+        if self._wake_detector is not None:
+            self._wake_detector.stop()
 
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()

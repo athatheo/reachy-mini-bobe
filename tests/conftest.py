@@ -18,3 +18,8 @@ os.environ["REACHY_MINI_SKIP_DOTENV"] = "1"
 os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY", None)
+
+# Disable local wake-word gating by default so handler tests run always-on and
+# never spin up a detector thread (which would download openWakeWord models).
+# Gating tests opt back in by overriding handler.wake_config/wake_session.
+os.environ["BOBE_WAKE_DISABLED"] = "1"

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 import os
-import re
 from typing import Any, Mapping, Protocol, cast
 from dataclasses import dataclass
 
 
-DEFAULT_WAKE_WORD = "Bob"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 512
 
@@ -22,7 +20,6 @@ class ClaudeSettings:
 
     api_key: str | None
     model: str = DEFAULT_CLAUDE_MODEL
-    wake_word: str = DEFAULT_WAKE_WORD
     max_tokens: int = DEFAULT_MAX_TOKENS
 
     @property
@@ -44,17 +41,8 @@ def load_claude_settings(env: Mapping[str, str] | None = None) -> ClaudeSettings
     return ClaudeSettings(
         api_key=_clean_env_value(source.get("ANTHROPIC_API_KEY")),
         model=source.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL,
-        wake_word=source.get("BOBE_WAKE_WORD", DEFAULT_WAKE_WORD).strip() or DEFAULT_WAKE_WORD,
         max_tokens=max(1, max_tokens),
     )
-
-
-def should_respond_to_wake_word(text: str, wake_word: str = DEFAULT_WAKE_WORD) -> bool:
-    """Return whether text contains the configured wake word as a standalone word."""
-    word = wake_word.strip()
-    if not word:
-        return False
-    return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text, re.IGNORECASE) is not None
 
 
 def build_claude_system_prompt() -> str:

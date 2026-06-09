@@ -17,10 +17,17 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 
 ## Current milestone
 
-- Wake word/persona defaults to `Bob`.
+- Local wake word: say `Hey Jarvis` to wake BoBe (openWakeWord, fully on-device).
 - Voice input/output uses the official Reachy Mini conversation app pipeline.
 - Normal assistant answers are routed through Claude with the `ask_claude` profile tool.
 - Expressive robot responses use the existing Reachy Mini motion tools, including `play_emotion`, `move_head`, and `sweep_look`.
+
+## Privacy model
+
+- While asleep, microphone audio never leaves the robot: frames go to a local openWakeWord detector and a short in-memory ring buffer that is continuously discarded.
+- Saying `Hey Jarvis` opens a streaming window (chime + antennas up). During that window audio streams to OpenAI Realtime for transcription and speech, like any cloud voice assistant.
+- The window closes (chime + antennas relaxed) when you say `go to sleep` (or Greek `κοιμήσου`) or after `BOBE_WAKE_TIMEOUT_S` (default 300s) without session activity.
+- Tune with `BOBE_WAKE_MODEL`, `BOBE_WAKE_THRESHOLD`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_SLEEP_PHRASE`; set `BOBE_WAKE_DISABLED=1` for always-on streaming (simulation/Gradio testing).
 
 Claude Code session launching is intentionally not enabled yet. That needs a later authorization and shell-safety layer before voice commands can start local coding sessions safely.
 
