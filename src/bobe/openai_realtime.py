@@ -6,7 +6,6 @@ import asyncio
 import logging
 from typing import Any, Final, Tuple, Literal, Optional
 from pathlib import Path
-from datetime import datetime
 
 import cv2
 import numpy as np
@@ -93,9 +92,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.connection: Any = None
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
 
-        self.last_activity_time = asyncio.get_event_loop().time()
-        self.start_time = asyncio.get_event_loop().time()
-        self.is_idle_tool_call = False
         self.gradio_mode = gradio_mode
         self.instance_path = instance_path
         # Track how the API key was provided (env vs textbox) and its value
@@ -447,17 +443,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         ),
                     )
 
-            # If this tool call was triggered by an idle signal, don't make the robot speak.
-            # For other tool calls, let the robot reply out loud.
-            if not bg_tool.is_idle_tool_call:
-                await self._safe_response_create(
-                    response={
-                        "instructions": (
-                            "Use the tool result just returned and answer concisely in speech. "
-                            "Speak only English or Greek."
-                        ),
-                    },
-                )
+            await self._safe_response_create(
+                response={
+                    "instructions": (
+                        "Use the tool result just returned and answer concisely in speech. "
+                        "Speak only English or Greek."
+                    ),
+                },
+            )
 
             # Re-synchronize the head wobble after a tool call that may have taken some time
             if self.deps.head_wobbler is not None:
@@ -638,8 +631,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.feed(event.delta)
                         self.wake_session.touch()
-                        self.last_activity_time = asyncio.get_event_loop().time()
-                        logger.debug("last activity time updated to %s", self.last_activity_time)
                         await self.output_queue.put(
                             (
                                 self.output_sample_rate,
@@ -654,8 +645,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         call_id: str = str(getattr(event, "call_id", uuid.uuid4()))
 
                         logger.info(
-                            "Tool call received — tool_name=%r, call_id=%s, is_idle=%s, args=%s",
-                            tool_name, call_id, self.is_idle_tool_call, args_json_str,
+                            "Tool call received — tool_name=%r, call_id=%s, args=%s",
+                            tool_name, call_id, args_json_str,
                         )
 
                         if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
@@ -674,7 +665,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 args_json_str=args_json_str,
                                 deps=self.deps,
                             ),
-                            is_idle_tool_call=self.is_idle_tool_call,
+                            # The idle-prompt feature was removed; tools only run from user turns.
+                            is_idle_tool_call=False,
                         )
 
                         await self.output_queue.put(
@@ -686,14 +678,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             ),
                         )
 
-                        if self.is_idle_tool_call:
-                            self.is_idle_tool_call = False
-                        else:
-                            await self._safe_response_create(
-                                response={
-                                    "instructions": "Notify what the tool has been running giving meaningful information about the task",
-                                },
-                            )
+                        await self._safe_response_create(
+                            response={
+                                "instructions": "Notify what the tool has been running giving meaningful information about the task",
+                            },
+                        )
 
                         logger.info("Started background tool: %s (id=%s, call_id=%s)", tool_name, bg_tool.tool_id, call_id)
 
@@ -879,18 +868,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Emit audio frame to be played by the speaker."""
         # sends to the stream the stuff put in the output queue by the openai event handler
         # This is called periodically by the fastrtc Stream
-
-        # Handle idle
-        idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
-        if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
-            try:
-                await self.send_idle_signal(idle_duration)
-            except Exception as e:
-                logger.warning("Idle signal skipped (connection closed?): %s", e)
-                return None
-
-            self.last_activity_time = asyncio.get_event_loop().time()  # avoid repeated resets
-
         return await wait_for_item(self.output_queue)  # type: ignore[no-any-return]
 
     async def shutdown(self) -> None:
@@ -931,13 +908,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 self.output_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-
-    def format_timestamp(self) -> str:
-        """Format current timestamp with date, time, and elapsed seconds."""
-        loop_time = asyncio.get_event_loop().time()  # monotonic
-        elapsed_seconds = loop_time - self.start_time
-        dt = datetime.now()  # wall-clock
-        return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')} | +{elapsed_seconds:.1f}s]"
 
     async def get_available_voices(self) -> list[str]:
         """Try to discover available voices for the configured realtime model.
@@ -1005,16 +975,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return voices
         except Exception:
             return fallback
-
-    async def send_idle_signal(self, idle_duration: float) -> None:
-        """Send an idle signal to the openai server."""
-        logger.debug("Sending idle signal")
-        self.is_idle_tool_call = True
-        timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {idle_duration:.1f}s]"
-        if not self.connection:
-            logger.debug("No connection, cannot send idle signal")
-            return
-        logger.debug("Idle signal suppressed: %s", timestamp_msg)
 
     def _persist_api_key_if_needed(self) -> None:
         """Persist the API key into `.env` inside `instance_path/` when appropriate.
