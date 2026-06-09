@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 import os
-import re
 from typing import Any, Mapping, Protocol, cast
 from dataclasses import dataclass
 
 
-DEFAULT_WAKE_WORD = "Bob"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 512
 
