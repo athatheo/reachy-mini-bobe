@@ -470,7 +470,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
 
     async def _handle_completed_user_transcript(self, transcript: str) -> None:
-        """Record a completed user transcript and respond while the wake session is active."""
+        """Record a completed user transcript and watch for the sleep phrase.
+
+        Responses are created automatically by server VAD; creating another one
+        here would answer the same question twice.
+        """
         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
 
         if self.wake_config.enabled and not self.wake_session.awake:
@@ -483,12 +487,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return
 
         self.wake_session.touch()
-        instructions = (
-            "Respond to the user's last spoken request. "
-            "Ignore a leading wake phrase such as 'hey jarvis' or 'jarvis'. "
-            "Speak only English or Greek."
-        )
-        await self._safe_response_create(response={"instructions": instructions})
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
@@ -508,7 +506,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 "turn_detection": {
                                     "type": "server_vad",
                                     "interrupt_response": True,
-                                    "create_response": False,
                                 },
                             },
                             "output": {
@@ -806,13 +803,22 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Close the streaming window; audio stays on the robot again."""
         self.wake_session.sleep()
         logger.info("Going to sleep (%s): audio stays local until the wake word", reason)
-        await self._play_chime(ascending=False)
-        self._queue_antenna_cue(awake=False)
+
+        # Stop any in-flight answer (e.g. the auto-response to "go to sleep").
         if self.connection:
+            try:
+                await self.connection.response.cancel()
+            except Exception as e:
+                logger.debug("No active response to cancel on sleep: %s", e)
             try:
                 await self.connection.input_audio_buffer.clear()
             except Exception as e:
                 logger.debug("Could not clear input buffer on sleep: %s", e)
+        if hasattr(self, "_clear_queue") and callable(self._clear_queue):
+            self._clear_queue()
+
+        await self._play_chime(ascending=False)
+        self._queue_antenna_cue(awake=False)
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:

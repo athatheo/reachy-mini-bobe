@@ -267,8 +267,12 @@ async def test_receive_goes_back_to_sleep_after_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_completed_user_transcript_responds_while_awake() -> None:
-    """While awake, transcripts get a response without any wake word."""
+async def test_completed_user_transcript_awake_defers_to_server_response() -> None:
+    """While awake, transcripts touch the session but never enqueue a second response.
+
+    Server VAD already creates the answer; a manual response.create here would
+    answer the same question twice.
+    """
     handler = _build_wake_enabled_handler()
     handler.wake_session.wake()
 
@@ -276,9 +280,8 @@ async def test_completed_user_transcript_responds_while_awake() -> None:
 
     output = await handler.output_queue.get()
     assert output.args[0] == {"role": "user", "content": "what time is it"}
-
-    queued = await handler._pending_responses.get()
-    assert "English or Greek" in queued["response"]["instructions"]
+    assert handler._pending_responses.empty()
+    assert handler.wake_session.awake
 
 
 @pytest.mark.asyncio
