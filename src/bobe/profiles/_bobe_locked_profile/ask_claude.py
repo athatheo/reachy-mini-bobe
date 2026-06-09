@@ -15,7 +15,11 @@ class AskClaude(Tool):
     """Ask Claude for the answer BoBe should speak."""
 
     name = "ask_claude"
-    description = "Ask Claude online for a concise answer to the user's question. Use this for normal BoBe assistant answers."
+    description = (
+        "Ask Claude online for a concise answer to the user's question. "
+        "Claude can search the web, so use this for anything needing current information "
+        "such as weather, news, or prices, as well as normal BoBe assistant answers."
+    )
     parameters_schema = {
         "type": "object",
         "properties": {
