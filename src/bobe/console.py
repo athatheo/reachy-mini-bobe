@@ -269,17 +269,27 @@ class LocalStream:
         def _favicon() -> Response:
             return Response(status_code=204)
 
-        # GET /status -> whether required keys are set
+        # GET /status -> required keys plus live wake/streaming state
         @self._settings_app.get("/status")
         def _status() -> JSONResponse:
             has_openai_key = _is_plausible_openai_key(str(config.OPENAI_API_KEY or ""))
             has_anthropic_key = _is_plausible_anthropic_key(os.getenv("ANTHROPIC_API_KEY"))
+
+            wake_config = getattr(self.handler, "wake_config", None)
+            wake_session = getattr(self.handler, "wake_session", None)
+            wake_enabled = bool(wake_config and wake_config.enabled)
+            awake = bool(wake_session and wake_session.awake)
+
             return JSONResponse(
                 {
                     "has_key": has_openai_key and has_anthropic_key,
                     "has_openai_key": has_openai_key,
                     "has_anthropic_key": has_anthropic_key,
                     "claude_model": os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
+                    "wake_enabled": wake_enabled,
+                    "awake": awake,
+                    "wake_model": wake_config.model_name if wake_config else None,
+                    "wake_timeout_s": wake_config.timeout_s if wake_config else None,
                 }
             )
 

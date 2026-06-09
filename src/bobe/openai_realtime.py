@@ -769,7 +769,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             robot = self.deps.reachy_mini
             head_pose = robot.get_current_head_pose()
             head_joints, antennas = robot.get_current_joint_positions()
-            target = (0.5, -0.5) if awake else (0.0, 0.0)
+            # Mirrored joints: (-, +) perks both antennas outward; (+, -) crosses them.
+            target = (-0.5, 0.5) if awake else (0.0, 0.0)
             move = GotoQueueMove(
                 target_head_pose=head_pose,
                 start_head_pose=head_pose,
