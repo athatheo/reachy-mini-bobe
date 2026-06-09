@@ -59,6 +59,45 @@ function show(el, flag) {
   el.classList.toggle("hidden", !flag);
 }
 
+function renderWakeStatus(st) {
+  const panel = document.getElementById("live-status");
+  const chip = document.getElementById("wake-chip");
+  const text = document.getElementById("wake-text");
+  if (!panel || !chip || !text) return;
+  show(panel, true);
+
+  if (!st.wake_enabled) {
+    chip.textContent = "Always on";
+    chip.className = "chip";
+    text.textContent = "Wake-word gating is disabled: audio streams continuously while the app runs.";
+  } else if (st.awake) {
+    chip.textContent = "Awake \u00b7 streaming";
+    chip.className = "chip";
+    const mins = Math.round((st.wake_timeout_s || 300) / 60);
+    text.textContent =
+      "Conversation window open: audio is streaming to OpenAI. " +
+      "Say 'go to sleep' or stay quiet for " + mins + " minutes to close it.";
+  } else {
+    chip.textContent = "Asleep \u00b7 local only";
+    chip.className = "chip chip-ok";
+    text.textContent =
+      "Listening locally for 'Hey Jarvis'. No audio leaves the robot until the wake word is heard.";
+  }
+}
+
+function startWakeStatusPolling() {
+  const poll = async () => {
+    try {
+      const url = new URL("/status", window.location.origin);
+      url.searchParams.set("_", Date.now().toString());
+      const resp = await fetchWithTimeout(url, {}, 2000);
+      if (resp.ok) renderWakeStatus(await resp.json());
+    } catch (e) {}
+  };
+  poll();
+  setInterval(poll, 2000);
+}
+
 function markError(input, flag) {
   input.classList.toggle("error", flag);
 }
@@ -87,6 +126,7 @@ async function init() {
     show(formPanel, true);
   }
   show(loading, false);
+  startWakeStatusPolling();
 
   changeKeyBtn.addEventListener("click", () => {
     show(configuredPanel, false);
