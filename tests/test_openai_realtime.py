@@ -244,6 +244,34 @@ async def test_receive_goes_back_to_sleep_after_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_receive_drops_mic_frames_while_robot_is_speaking() -> None:
+    """Half-duplex: the robot's own speech window blocks mic forwarding (echo guard)."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler.connection = FakeGatingConnection()
+
+    handler._speaking_until = asyncio.get_event_loop().time() + 5.0
+    await handler.receive(_mic_frame())
+    assert handler.connection.input_audio_buffer.appended == []
+
+    handler._speaking_until = asyncio.get_event_loop().time() - 1.0
+    await handler.receive(_mic_frame())
+    assert len(handler.connection.input_audio_buffer.appended) == 1
+
+
+@pytest.mark.asyncio
+async def test_chime_extends_speaker_busy_window() -> None:
+    """Chimes count as robot speech for the half-duplex guard."""
+    handler = _build_wake_enabled_handler()
+    before = asyncio.get_event_loop().time()
+
+    await handler._play_chime(ascending=True)
+
+    assert handler._speaking_until > before
+    assert handler._speaker_active()
+
+
+@pytest.mark.asyncio
 async def test_completed_user_transcript_awake_defers_to_server_response() -> None:
     """While awake, transcripts touch the session but never enqueue a second response.
 
