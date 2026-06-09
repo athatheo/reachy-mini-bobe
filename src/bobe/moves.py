@@ -87,8 +87,9 @@ class BreathingMove(Move):  # type: ignore
         self.neutral_antennas = np.array([0.0, 0.0])
 
         # Breathing parameters
-        self.breathing_z_amplitude = 0.0015  # 1.5mm subtle breathing
+        self.breathing_z_amplitude = 0.003  # 3mm gentle breathing
         self.breathing_frequency = 0.05  # Hz (3 breaths per minute)
+        self.head_pitch_amplitude_deg = 1.5  # slight head bob synced with breathing
         self.antenna_sway_amplitude = np.deg2rad(4)  # subtle antenna sway
         self.antenna_frequency = 0.15
 
@@ -118,9 +119,11 @@ class BreathingMove(Move):  # type: ignore
             # Phase 2: Breathing patterns from neutral base
             breathing_time = t - self.interpolation_duration
 
-            # Gentle z-axis breathing
-            z_offset = self.breathing_z_amplitude * np.sin(2 * np.pi * self.breathing_frequency * breathing_time)
-            head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=0, yaw=0, degrees=True, mm=False)
+            # Gentle z-axis breathing with a slight synced head bob
+            phase = 2 * np.pi * self.breathing_frequency * breathing_time
+            z_offset = self.breathing_z_amplitude * np.sin(phase)
+            pitch_offset = self.head_pitch_amplitude_deg * np.sin(phase)
+            head_pose = create_head_pose(x=0, y=0, z=z_offset, roll=0, pitch=pitch_offset, yaw=0, degrees=True, mm=False)
 
             # Antenna sway (opposite directions)
             antenna_sway = self.antenna_sway_amplitude * np.sin(2 * np.pi * self.antenna_frequency * breathing_time)
