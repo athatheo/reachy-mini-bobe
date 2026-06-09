@@ -9,6 +9,7 @@ import pytest
 
 import bobe.openai_realtime as rt_mod
 import bobe.tools.background_tool_manager as btm_mod
+from bobe.wake_word import WakeConfig, WakeSession
 from bobe.openai_realtime import OpenaiRealtimeHandler, _compute_response_cost
 from bobe.tools.core_tools import ToolDependencies
 from bobe.tools.background_tool_manager import ToolCallRoutine
@@ -176,34 +177,132 @@ def test_compute_response_cost(usage_kwargs: dict[str, Any], expect_positive: bo
         assert cost == 0.0
 
 
-@pytest.mark.asyncio
-async def test_completed_user_transcript_ignores_non_wake_word() -> None:
-    """Completed transcripts without Bob should not enqueue a response."""
+# ---- Wake-word gating ----
+
+
+class FakeInputAudioBuffer:
+    """Records audio appended/cleared by the handler."""
+
+    def __init__(self) -> None:
+        """Initialize empty append/clear counters."""
+        self.appended: list[str] = []
+        self.cleared = 0
+
+    async def append(self, audio: str) -> None:
+        """Record an appended audio payload."""
+        self.appended.append(audio)
+
+    async def clear(self) -> None:
+        """Record a buffer clear."""
+        self.cleared += 1
+
+
+class FakeGatingConnection:
+    """Minimal connection stub for receive() gating tests."""
+
+    def __init__(self) -> None:
+        """Initialize with a recording input audio buffer."""
+        self.input_audio_buffer = FakeInputAudioBuffer()
+
+
+def _build_wake_enabled_handler() -> rt_mod.OpenaiRealtimeHandler:
+    """Build a handler with wake gating enabled and no detector thread."""
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler.wake_config = WakeConfig(enabled=True)
+    handler.wake_session = WakeSession()
+    handler._wake_detector = None
+    return handler
+
+
+def _mic_frame(samples: int = 2400) -> tuple[int, Any]:
+    import numpy as np
+
+    return (24000, np.ones(samples, dtype=np.int16))
+
+
+@pytest.mark.asyncio
+async def test_receive_keeps_audio_local_while_asleep() -> None:
+    """No audio reaches the backend while the wake session is asleep."""
+    handler = _build_wake_enabled_handler()
+    handler.connection = FakeGatingConnection()
+
+    for _ in range(3):
+        await handler.receive(_mic_frame())
+
+    assert handler.connection.input_audio_buffer.appended == []
+    assert handler._wake_buffer.drain_tail(seconds=10.0).size > 0
+
+
+@pytest.mark.asyncio
+async def test_receive_flushes_buffer_and_streams_after_wake() -> None:
+    """A wake request flushes buffered audio, then live frames stream upstream."""
+    handler = _build_wake_enabled_handler()
+    handler.connection = FakeGatingConnection()
+
+    await handler.receive(_mic_frame())  # buffered locally
+    handler.wake_session.request_wake()
+    await handler.receive(_mic_frame())  # wake transition + live frame
+
+    appended = handler.connection.input_audio_buffer.appended
+    assert len(appended) == 2  # buffer tail flush + live frame
+    assert handler.wake_session.awake
+
+
+@pytest.mark.asyncio
+async def test_receive_goes_back_to_sleep_after_timeout() -> None:
+    """The streaming window closes after the inactivity timeout."""
+    clock = [1000.0]
+    handler = _build_wake_enabled_handler()
+    handler.wake_session = WakeSession(timeout_s=300.0, clock=lambda: clock[0])
+    handler.wake_session.wake()
+    handler.connection = FakeGatingConnection()
+
+    clock[0] += 301.0
+    await handler.receive(_mic_frame())
+
+    assert not handler.wake_session.awake
+    assert handler.connection.input_audio_buffer.appended == []
+    assert handler.connection.input_audio_buffer.cleared == 1
+
+
+@pytest.mark.asyncio
+async def test_completed_user_transcript_responds_while_awake() -> None:
+    """While awake, transcripts get a response without any wake word."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
 
     await handler._handle_completed_user_transcript("what time is it")
 
     output = await handler.output_queue.get()
     assert output.args[0] == {"role": "user", "content": "what time is it"}
+
+    queued = await handler._pending_responses.get()
+    assert "English or Greek" in queued["response"]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_completed_user_transcript_sleep_phrase_closes_session() -> None:
+    """The sleep phrase puts the session back to sleep instead of responding."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+
+    await handler._handle_completed_user_transcript("okay, go to sleep")
+
+    assert not handler.wake_session.awake
     assert handler._pending_responses.empty()
 
 
 @pytest.mark.asyncio
-async def test_completed_user_transcript_enqueues_wake_word_response() -> None:
-    """Completed transcripts addressed to Bob should enqueue one response."""
-    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
-    handler = rt_mod.OpenaiRealtimeHandler(deps)
+async def test_completed_user_transcript_ignored_while_asleep() -> None:
+    """Straggler transcripts while asleep never enqueue a response."""
+    handler = _build_wake_enabled_handler()
 
-    await handler._handle_completed_user_transcript("Bob, what can you do?")
+    await handler._handle_completed_user_transcript("background chatter")
 
     output = await handler.output_queue.get()
-    assert output.args[0] == {"role": "user", "content": "Bob, what can you do?"}
-
-    queued = await handler._pending_responses.get()
-    instructions = queued["response"]["instructions"]
-    assert "what can you do" in instructions
-    assert "English or Greek" in instructions
+    assert output.args[0] == {"role": "user", "content": "background chatter"}
+    assert handler._pending_responses.empty()
 
 
 # ---- Stress test: response.create rejection + retry ----

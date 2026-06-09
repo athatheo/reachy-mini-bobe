@@ -9,7 +9,6 @@ from bobe.claude import (
     ask_claude,
     extract_message_text,
     load_claude_settings,
-    should_respond_to_wake_word,
 )
 
 
@@ -27,10 +26,9 @@ class FakeClient:
         self.messages = FakeMessages()
 
 
-def test_load_claude_settings_defaults_to_bob_and_current_sonnet():
+def test_load_claude_settings_defaults_to_current_sonnet():
     settings = load_claude_settings({})
 
-    assert settings.wake_word == "Bob"
     assert settings.model == "claude-sonnet-4-6"
     assert settings.max_tokens == 512
     assert not settings.is_configured
@@ -42,28 +40,13 @@ def test_load_claude_settings_uses_environment_overrides():
             "ANTHROPIC_API_KEY": " sk-ant-test ",
             "CLAUDE_MODEL": "claude-opus-4-7",
             "CLAUDE_MAX_TOKENS": "123",
-            "BOBE_WAKE_WORD": "Bobby",
         }
     )
 
     assert settings.api_key == "sk-ant-test"
     assert settings.model == "claude-opus-4-7"
     assert settings.max_tokens == 123
-    assert settings.wake_word == "Bobby"
     assert settings.is_configured
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("Bob, what is next?", True),
-        ("hey bob can you help", True),
-        ("bobcat facts", False),
-        ("this has no wake word", False),
-    ],
-)
-def test_should_respond_to_wake_word_matches_standalone_word(text, expected):
-    assert should_respond_to_wake_word(text) is expected
 
 
 def test_extract_message_text_handles_objects_and_dicts():

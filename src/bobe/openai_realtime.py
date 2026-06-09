@@ -23,8 +23,8 @@ from bobe.wake_word import (
     WAKE_SAMPLE_RATE,
     DEFAULT_FLUSH_SECONDS,
     WakeSession,
-    WakeWordDetector,
     AudioRingBuffer,
+    WakeWordDetector,
     is_sleep_phrase,
     load_wake_config,
 )

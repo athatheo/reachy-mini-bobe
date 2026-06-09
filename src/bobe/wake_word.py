@@ -7,13 +7,12 @@ the inactivity timeout or the sleep phrase puts BoBe back to sleep.
 """
 
 from __future__ import annotations
-
 import os
+import time
 import queue
 import logging
 import threading
-import time
-from typing import Callable, Mapping
+from typing import Mapping, Callable
 from collections import deque
 from dataclasses import dataclass
 
@@ -218,14 +217,16 @@ class WakeWordDetector:
             return None
 
         try:
-            return Model(wakeword_models=[self._model_name])
+            model: object = Model(wakeword_models=[self._model_name])
+            return model
         except Exception:
             logger.info("Wake model %r missing, downloading openWakeWord models...", self._model_name)
             try:
                 import openwakeword
 
                 openwakeword.utils.download_models()
-                return Model(wakeword_models=[self._model_name])
+                model = Model(wakeword_models=[self._model_name])
+                return model
             except Exception:
                 logger.exception("Failed to load wake model %r; wake-word detection disabled", self._model_name)
                 return None
