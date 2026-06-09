@@ -260,15 +260,14 @@ async def test_receive_drops_mic_frames_while_robot_is_speaking() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chime_extends_speaker_busy_window() -> None:
-    """Chimes count as robot speech for the half-duplex guard."""
+async def test_wake_chime_does_not_block_the_mic() -> None:
+    """The wake chime must not trip the echo guard, or it would clip the command."""
     handler = _build_wake_enabled_handler()
-    before = asyncio.get_event_loop().time()
+    handler._speaking_until = 0.0
 
     await handler._play_chime(ascending=True)
 
-    assert handler._speaking_until > before
-    assert handler._speaker_active()
+    assert handler._speaking_until == 0.0
 
 
 @pytest.mark.asyncio

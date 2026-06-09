@@ -749,9 +749,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         return (np.concatenate(tones) * 32767).astype(np.int16)
 
     async def _play_chime(self, *, ascending: bool) -> None:
+        # Deliberately not counted as robot speech: blocking the mic during the
+        # wake chime would clip a command said in one breath with the wake word.
         try:
             chime = self._make_chime(ascending=ascending)
-            self._note_speech_audio(chime.size)
             await self.output_queue.put((self.output_sample_rate, chime.reshape(1, -1)))
         except Exception:
             logger.debug("Chime skipped", exc_info=True)
