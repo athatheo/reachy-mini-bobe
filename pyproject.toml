@@ -22,7 +22,9 @@ dependencies = [
  "eclipse-zenoh~=1.7.0",
  "gradio_client>=1.13.3",
  "anthropic>=0.104.1",
- "openwakeword>=0.6.0",
+ # Git pin: PyPI 0.6.0 requires tflite-runtime on Linux, which has no Python 3.12
+ # ARM wheels for the robot; main switched to ai-edge-litert which does.
+ "openwakeword @ git+https://github.com/dscripka/openWakeWord@368c03716d1e92591906a84949bc477f3a834455",
 ]
 [[project.authors]]
 name = "Pollen Robotics"
