@@ -199,6 +199,20 @@ def _mic_frame(samples: int = 2400) -> tuple[int, Any]:
 
 
 @pytest.mark.asyncio
+async def test_receive_feeds_wake_detector_without_connection() -> None:
+    """Local wake scoring must run even before the OpenAI websocket connects."""
+    handler = _build_wake_enabled_handler()
+    detector = MagicMock()
+    detector.is_running.return_value = True
+    handler._wake_detector = detector
+    handler.connection = None
+
+    await handler.receive(_mic_frame())
+
+    assert detector.feed.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_receive_keeps_audio_local_while_asleep() -> None:
     """No audio reaches the backend while the wake session is asleep."""
     handler = _build_wake_enabled_handler()
@@ -310,9 +324,50 @@ async def test_completed_user_transcript_ignored_while_asleep() -> None:
 
     await handler._handle_completed_user_transcript("background chatter")
 
-    output = await handler.output_queue.get()
-    assert output.args[0] == {"role": "user", "content": "background chatter"}
+    assert handler.output_queue.empty()
     assert handler._pending_responses.empty()
+
+
+@pytest.mark.asyncio
+async def test_receive_stops_streaming_after_sleep_phrase() -> None:
+    """After the sleep phrase, mic audio stays local instead of streaming upstream."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler.connection = FakeGatingConnection()
+
+    await handler._handle_completed_user_transcript("go to sleep")
+    assert not handler.wake_session.awake
+
+    for _ in range(3):
+        await handler.receive(_mic_frame())
+
+    assert handler.connection.input_audio_buffer.appended == []
+
+
+@pytest.mark.asyncio
+async def test_sleep_phrase_works_when_wake_disabled() -> None:
+    """Sleep phrase closes the streaming window even in always-on wake mode."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_config = WakeConfig(enabled=False)
+    handler.wake_session.wake()
+    handler.connection = FakeGatingConnection()
+
+    await handler._maybe_sleep_from_transcript("go to sleep")
+    assert not handler.wake_session.awake
+
+    await handler.receive(_mic_frame())
+    assert handler.connection.input_audio_buffer.appended == []
+
+
+@pytest.mark.asyncio
+async def test_partial_transcript_sleep_phrase_closes_session() -> None:
+    """Partial transcripts can end the streaming window without waiting for final ASR."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+
+    assert await handler._maybe_sleep_from_transcript("please go to sleep now")
+
+    assert not handler.wake_session.awake
 
 
 # ---- Stress test: response.create rejection + retry ----

@@ -1,6 +1,6 @@
 {
   "phrase": "hey jarvis",
-  "threshold": 0.699,
+  "threshold": 0.84,
   "sample_rate": 16000,
   "audio_window_samples": 16000,
   "n_mels": 40,
@@ -38,7 +38,7 @@
   ],
   "trigger": {
     "consecutive_frames": 2,
-    "refractory_seconds": 0.7,
+    "refractory_seconds": 2.5,
     "ema_alpha": 0.5,
     "note": "Trigger when raw prob > threshold for `consecutive_frames` in a row, then suppress for `refractory_seconds`. ema_alpha is for display smoothing only (not the trigger gate; the EMA lags and was suppressing short, confident detections)."
   },

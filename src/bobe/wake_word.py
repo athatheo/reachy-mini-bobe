@@ -33,7 +33,8 @@ DEFAULT_WAKE_BACKEND = "heed"
 DEFAULT_WAKE_MODEL = "hey_jarvis"
 DEFAULT_WAKE_THRESHOLD: float | None = None  # None => model default (Heed) or openWakeWord fallback
 DEFAULT_OPENWAKEWORD_THRESHOLD = 0.28
-DEFAULT_WAKE_GAIN = 2.0  # digital boost for the quiet robot mic (detector path only)
+DEFAULT_WAKE_GAIN = 1.75  # digital boost for the quiet robot mic (detector path only)
+DEFAULT_WAKE_SUPPRESS_AFTER_SLEEP_S = 4.0
 DEFAULT_WAKE_TIMEOUT_S = 300.0
 DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")
 DEFAULT_BUFFER_SECONDS = 3.0
@@ -217,6 +218,16 @@ class WakeWordDetector:
         # Rolling (timestamp, score, pre-gain RMS) samples for live diagnostics.
         self._stats_lock = threading.Lock()
         self._recent_stats: deque[tuple[float, float, float]] = deque()
+        self._suppress_until = 0.0
+
+    def suppress_for(self, seconds: float) -> None:
+        """Ignore detections for ``seconds`` (e.g. after returning to sleep)."""
+        if seconds > 0:
+            self._suppress_until = time.monotonic() + seconds
+
+    def is_running(self) -> bool:
+        """Return whether the background detection thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
         """Start the detection thread (idempotent)."""
@@ -257,6 +268,7 @@ class WakeWordDetector:
             "score_peak": round(max(scores), 4) if scores else 0.0,
             "rms_peak": round(max(levels), 1) if levels else 0.0,
             "rms_last": round(levels[-1], 1) if levels else 0.0,
+            "thread_alive": self.is_running(),
         }
 
     def _record_stats(self, score: float, rms: float) -> None:
@@ -320,6 +332,9 @@ class WakeWordDetector:
                 # openWakeWord returns numpy scalars; cast so scores stay JSON-serializable.
                 score = float(max(scores.values())) if scores else 0.0
                 self._record_stats(score, rms)
+                now = time.monotonic()
+                if now < self._suppress_until:
+                    continue
                 if score >= self._threshold:
                     logger.info("Wake word detected (score=%.2f)", score)
                     self._reset_model(model)

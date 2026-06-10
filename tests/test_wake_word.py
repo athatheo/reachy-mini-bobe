@@ -120,7 +120,7 @@ def test_load_wake_config_defaults():
     assert config.backend == "heed"
     assert config.model_name == "hey_jarvis"
     assert config.threshold is None
-    assert config.gain == 2.0
+    assert config.gain == 1.75
     assert config.timeout_s == 300.0
     assert "go to sleep" in config.sleep_phrases
 

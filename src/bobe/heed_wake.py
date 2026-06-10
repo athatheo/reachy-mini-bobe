@@ -229,10 +229,20 @@ class HeedWakeWordDetector:
         self._thread: threading.Thread | None = None
         self._stats_lock = threading.Lock()
         self._recent_stats: deque[tuple[float, float, float]] = deque()
+        self._suppress_until = 0.0
+
+    def suppress_for(self, seconds: float) -> None:
+        """Ignore detections for ``seconds`` (e.g. after returning to sleep)."""
+        if seconds > 0:
+            self._suppress_until = time.monotonic() + seconds
 
     @property
     def phrase(self) -> str:
         return self._meta.phrase
+
+    def is_running(self) -> bool:
+        """Return whether the background detection thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -271,6 +281,7 @@ class HeedWakeWordDetector:
             "score_peak": round(max(scores), 4) if scores else 0.0,
             "rms_peak": round(max(levels), 1) if levels else 0.0,
             "rms_last": round(levels[-1], 1) if levels else 0.0,
+            "thread_alive": self.is_running(),
         }
 
     def _record_stats(self, score: float, rms: float) -> None:
@@ -364,6 +375,9 @@ class HeedWakeWordDetector:
                 else:
                     above = 0
                 now = time.monotonic()
+                if now < self._suppress_until:
+                    above = 0
+                    continue
                 if above >= meta.consecutive_frames and now - last_trigger > meta.refractory_seconds:
                     logger.info("Heed wake word detected (score=%.3f)", prob)
                     last_trigger = now
