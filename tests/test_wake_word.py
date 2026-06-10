@@ -116,7 +116,8 @@ def test_load_wake_config_defaults():
 
     assert config.enabled
     assert config.model_name == "hey_jarvis"
-    assert config.threshold == 0.5
+    assert config.threshold == 0.35
+    assert config.gain == 2.0
     assert config.timeout_s == 300.0
     assert "go to sleep" in config.sleep_phrases
 
@@ -127,6 +128,7 @@ def test_load_wake_config_env_overrides():
             "BOBE_WAKE_DISABLED": "1",
             "BOBE_WAKE_MODEL": "alexa",
             "BOBE_WAKE_THRESHOLD": "0.7",
+            "BOBE_WAKE_GAIN": "3.5",
             "BOBE_WAKE_TIMEOUT_S": "60",
             "BOBE_SLEEP_PHRASE": "time for bed",
         }
@@ -135,6 +137,7 @@ def test_load_wake_config_env_overrides():
     assert not config.enabled
     assert config.model_name == "alexa"
     assert config.threshold == 0.7
+    assert config.gain == 3.5
     assert config.timeout_s == 60.0
     assert config.sleep_phrases[0] == "time for bed"
 
@@ -175,6 +178,32 @@ def test_detector_fires_callback_when_threshold_crossed(monkeypatch):
 
     assert fired
     assert fake_model.reset_called
+
+
+def test_detector_applies_gain_to_quiet_audio(monkeypatch):
+    seen_max = []
+
+    class RecordingModel:
+        def predict(self, chunk):
+            seen_max.append(int(np.abs(chunk).max()))
+            return {"hey_jarvis": 0.0}
+
+        def reset(self):
+            pass
+
+    detector = WakeWordDetector(on_wake=lambda: None, threshold=0.5, gain=2.0)
+    monkeypatch.setattr(detector, "_load_model", lambda: RecordingModel())
+
+    detector.start()
+    try:
+        detector.feed(np.full(DETECTOR_FRAME_SAMPLES, 1000, dtype=np.int16))
+        deadline = time.time() + 3.0
+        while not seen_max and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        detector.stop()
+
+    assert seen_max and seen_max[0] == 2000
 
 
 def test_detector_accumulates_partial_frames(monkeypatch):

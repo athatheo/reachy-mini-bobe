@@ -27,7 +27,8 @@ WAKE_SAMPLE_RATE = 16000
 DETECTOR_FRAME_SAMPLES = 1280  # 80 ms at 16 kHz, openWakeWord's native frame size
 
 DEFAULT_WAKE_MODEL = "hey_jarvis"
-DEFAULT_WAKE_THRESHOLD = 0.5
+DEFAULT_WAKE_THRESHOLD = 0.35  # sensitive enough for across-the-room voice
+DEFAULT_WAKE_GAIN = 2.0  # digital boost for the quiet robot mic (detector path only)
 DEFAULT_WAKE_TIMEOUT_S = 300.0
 DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")
 DEFAULT_BUFFER_SECONDS = 3.0
@@ -41,6 +42,7 @@ class WakeConfig:
     enabled: bool = True
     model_name: str = DEFAULT_WAKE_MODEL
     threshold: float = DEFAULT_WAKE_THRESHOLD
+    gain: float = DEFAULT_WAKE_GAIN
     timeout_s: float = DEFAULT_WAKE_TIMEOUT_S
     sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES
 
@@ -64,6 +66,7 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
         enabled=(source.get("BOBE_WAKE_DISABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}),
         model_name=(source.get("BOBE_WAKE_MODEL") or DEFAULT_WAKE_MODEL).strip() or DEFAULT_WAKE_MODEL,
         threshold=_float("BOBE_WAKE_THRESHOLD", DEFAULT_WAKE_THRESHOLD),
+        gain=max(1.0, _float("BOBE_WAKE_GAIN", DEFAULT_WAKE_GAIN)),
         timeout_s=max(1.0, _float("BOBE_WAKE_TIMEOUT_S", DEFAULT_WAKE_TIMEOUT_S)),
         sleep_phrases=tuple(sleep_phrases),
     )
@@ -178,11 +181,13 @@ class WakeWordDetector:
         *,
         model_name: str = DEFAULT_WAKE_MODEL,
         threshold: float = DEFAULT_WAKE_THRESHOLD,
+        gain: float = DEFAULT_WAKE_GAIN,
     ) -> None:
         """Initialize the detector; the model loads lazily in its own thread."""
         self._on_wake = on_wake
         self._model_name = model_name
         self._threshold = threshold
+        self._gain = gain
         self._queue: queue.Queue[NDArray[np.int16]] = queue.Queue(maxsize=64)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -235,7 +240,12 @@ class WakeWordDetector:
         model = self._load_model()
         if model is None:
             return
-        logger.info("Wake-word detector listening for %r (threshold=%.2f)", self._model_name, self._threshold)
+        logger.info(
+            "Wake-word detector listening for %r (threshold=%.2f, gain=%.1fx)",
+            self._model_name,
+            self._threshold,
+            self._gain,
+        )
 
         pending = np.zeros(0, dtype=np.int16)
         while not self._stop_event.is_set():
@@ -247,6 +257,8 @@ class WakeWordDetector:
             while pending.size >= DETECTOR_FRAME_SAMPLES:
                 chunk = pending[:DETECTOR_FRAME_SAMPLES]
                 pending = pending[DETECTOR_FRAME_SAMPLES:]
+                if self._gain != 1.0:
+                    chunk = np.clip(chunk.astype(np.int32) * self._gain, -32768, 32767).astype(np.int16)
                 try:
                     scores = model.predict(chunk)  # type: ignore[attr-defined]
                 except Exception:
