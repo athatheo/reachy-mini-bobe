@@ -133,6 +133,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 on_wake=self.wake_session.request_wake,
                 model_name=self.wake_config.model_name,
                 threshold=self.wake_config.threshold,
+                gain=self.wake_config.gain,
             )
         else:
             # Always-on mode (sim/Gradio testing): behave like before the wake gate.
