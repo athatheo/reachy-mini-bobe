@@ -1,8 +1,10 @@
 # ruff: noqa: D101,D102,D103,D107
 
+import json
 import time
 
 import numpy as np
+import pytest
 
 from bobe.wake_word import (
     DETECTOR_FRAME_SAMPLES,
@@ -209,7 +211,8 @@ def test_detector_applies_gain_to_quiet_audio(monkeypatch):
 def test_detector_debug_state_reports_scores_and_levels(monkeypatch):
     class ScoringModel:
         def predict(self, chunk):
-            return {"hey_jarvis": 0.27}
+            # openWakeWord returns numpy scalars, which must not leak into JSON.
+            return {"hey_jarvis": np.float32(0.27)}
 
         def reset(self):
             pass
@@ -230,8 +233,9 @@ def test_detector_debug_state_reports_scores_and_levels(monkeypatch):
 
     state = detector.debug_state()
     assert state["frames_window"] == 1
-    assert state["score_peak"] == 0.27
+    assert state["score_peak"] == pytest.approx(0.27, abs=1e-4)
     assert state["rms_peak"] == 1000.0
+    json.dumps(state)  # must stay JSON-serializable for the /status endpoint
 
 
 def test_detector_accumulates_partial_frames(monkeypatch):

@@ -295,7 +295,8 @@ class WakeWordDetector:
                 except Exception:
                     logger.exception("Wake-word inference failed; stopping detector")
                     return
-                score = max(scores.values()) if scores else 0.0
+                # openWakeWord returns numpy scalars; cast so scores stay JSON-serializable.
+                score = float(max(scores.values())) if scores else 0.0
                 self._record_stats(score, rms)
                 if score >= self._threshold:
                     logger.info("Wake word detected (score=%.2f)", score)
