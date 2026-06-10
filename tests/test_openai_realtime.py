@@ -244,30 +244,16 @@ async def test_receive_goes_back_to_sleep_after_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_receive_drops_mic_frames_while_robot_is_speaking() -> None:
-    """Half-duplex: the robot's own speech window blocks mic forwarding (echo guard)."""
+async def test_receive_streams_mic_frames_while_awake() -> None:
+    """While awake, mic frames stream continuously so the user can barge in mid-sentence."""
     handler = _build_wake_enabled_handler()
     handler.wake_session.wake()
     handler.connection = FakeGatingConnection()
 
-    handler._speaking_until = asyncio.get_event_loop().time() + 5.0
-    await handler.receive(_mic_frame())
-    assert handler.connection.input_audio_buffer.appended == []
+    for _ in range(3):
+        await handler.receive(_mic_frame())
 
-    handler._speaking_until = asyncio.get_event_loop().time() - 1.0
-    await handler.receive(_mic_frame())
-    assert len(handler.connection.input_audio_buffer.appended) == 1
-
-
-@pytest.mark.asyncio
-async def test_wake_chime_does_not_block_the_mic() -> None:
-    """The wake chime must not trip the echo guard, or it would clip the command."""
-    handler = _build_wake_enabled_handler()
-    handler._speaking_until = 0.0
-
-    await handler._play_chime(ascending=True)
-
-    assert handler._speaking_until == 0.0
+    assert len(handler.connection.input_audio_buffer.appended) == 3
 
 
 @pytest.mark.asyncio
