@@ -27,7 +27,7 @@ WAKE_SAMPLE_RATE = 16000
 DETECTOR_FRAME_SAMPLES = 1280  # 80 ms at 16 kHz, openWakeWord's native frame size
 
 DEFAULT_WAKE_MODEL = "hey_jarvis"
-DEFAULT_WAKE_THRESHOLD = 0.35  # sensitive enough for across-the-room voice
+DEFAULT_WAKE_THRESHOLD = 0.28  # measured: real attempts score 0.36+, noise stays under 0.06
 DEFAULT_WAKE_GAIN = 2.0  # digital boost for the quiet robot mic (detector path only)
 DEFAULT_WAKE_TIMEOUT_S = 300.0
 DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")

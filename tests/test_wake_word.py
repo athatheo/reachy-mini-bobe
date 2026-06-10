@@ -118,7 +118,7 @@ def test_load_wake_config_defaults():
 
     assert config.enabled
     assert config.model_name == "hey_jarvis"
-    assert config.threshold == 0.35
+    assert config.threshold == 0.28
     assert config.gain == 2.0
     assert config.timeout_s == 300.0
     assert "go to sleep" in config.sleep_phrases
