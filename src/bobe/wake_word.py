@@ -1,9 +1,9 @@
 """Local wake-word detection and session gating for BoBe.
 
 While asleep, microphone audio stays on the robot: frames are fed to a local
-openWakeWord model and a short ring buffer, and nothing is sent upstream.
-After the wake phrase is detected, audio streams to the realtime backend until
-the inactivity timeout or the sleep phrase puts BoBe back to sleep.
+wake-word model (Heed by default) and a short ring buffer, and nothing is sent
+upstream. After the wake phrase is detected, audio streams to the realtime
+backend until the inactivity timeout or the sleep phrase puts BoBe back to sleep.
 """
 
 from __future__ import annotations
@@ -13,11 +13,14 @@ import queue
 import logging
 import threading
 from typing import Mapping, Callable
+from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+
+from bobe.heed_wake import HeedWakeWordDetector, default_heed_model_dir
 
 
 logger = logging.getLogger(__name__)
@@ -26,8 +29,10 @@ logger = logging.getLogger(__name__)
 WAKE_SAMPLE_RATE = 16000
 DETECTOR_FRAME_SAMPLES = 1280  # 80 ms at 16 kHz, openWakeWord's native frame size
 
+DEFAULT_WAKE_BACKEND = "heed"
 DEFAULT_WAKE_MODEL = "hey_jarvis"
-DEFAULT_WAKE_THRESHOLD = 0.28  # compromise: 0.20 false-triggers on ambient noise, 0.35 misses soft speech
+DEFAULT_WAKE_THRESHOLD: float | None = None  # None => model default (Heed) or openWakeWord fallback
+DEFAULT_OPENWAKEWORD_THRESHOLD = 0.28
 DEFAULT_WAKE_GAIN = 2.0  # digital boost for the quiet robot mic (detector path only)
 DEFAULT_WAKE_TIMEOUT_S = 300.0
 DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")
@@ -41,11 +46,23 @@ class WakeConfig:
     """Environment-driven configuration for wake-word gating."""
 
     enabled: bool = True
+    backend: str = DEFAULT_WAKE_BACKEND
     model_name: str = DEFAULT_WAKE_MODEL
-    threshold: float = DEFAULT_WAKE_THRESHOLD
+    model_dir: str | None = None
+    threshold: float | None = DEFAULT_WAKE_THRESHOLD
     gain: float = DEFAULT_WAKE_GAIN
     timeout_s: float = DEFAULT_WAKE_TIMEOUT_S
     sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES
+
+
+def _optional_float(source: Mapping[str, str], name: str) -> float | None:
+    raw = source.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
@@ -63,10 +80,15 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
     if custom_phrase and custom_phrase.casefold() not in {p.casefold() for p in sleep_phrases}:
         sleep_phrases.insert(0, custom_phrase)
 
+    backend = (source.get("BOBE_WAKE_BACKEND") or DEFAULT_WAKE_BACKEND).strip().lower()
+    model_dir = (source.get("BOBE_WAKE_MODEL_DIR") or "").strip() or None
+
     return WakeConfig(
         enabled=(source.get("BOBE_WAKE_DISABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}),
+        backend=backend,
         model_name=(source.get("BOBE_WAKE_MODEL") or DEFAULT_WAKE_MODEL).strip() or DEFAULT_WAKE_MODEL,
-        threshold=_float("BOBE_WAKE_THRESHOLD", DEFAULT_WAKE_THRESHOLD),
+        model_dir=model_dir,
+        threshold=_optional_float(source, "BOBE_WAKE_THRESHOLD"),
         gain=max(1.0, _float("BOBE_WAKE_GAIN", DEFAULT_WAKE_GAIN)),
         timeout_s=max(1.0, _float("BOBE_WAKE_TIMEOUT_S", DEFAULT_WAKE_TIMEOUT_S)),
         sleep_phrases=tuple(sleep_phrases),
@@ -181,13 +203,13 @@ class WakeWordDetector:
         on_wake: Callable[[], None],
         *,
         model_name: str = DEFAULT_WAKE_MODEL,
-        threshold: float = DEFAULT_WAKE_THRESHOLD,
+        threshold: float | None = DEFAULT_OPENWAKEWORD_THRESHOLD,
         gain: float = DEFAULT_WAKE_GAIN,
     ) -> None:
         """Initialize the detector; the model loads lazily in its own thread."""
         self._on_wake = on_wake
         self._model_name = model_name
-        self._threshold = threshold
+        self._threshold = threshold if threshold is not None else DEFAULT_OPENWAKEWORD_THRESHOLD
         self._gain = gain
         self._queue: queue.Queue[NDArray[np.int16]] = queue.Queue(maxsize=64)
         self._stop_event = threading.Event()
@@ -318,3 +340,35 @@ class WakeWordDetector:
                 self._queue.get_nowait()
             except queue.Empty:
                 return
+
+
+WakeDetector = WakeWordDetector | HeedWakeWordDetector
+
+
+def resolve_heed_model_dir(config: WakeConfig) -> Path:
+    """Resolve the Heed export directory from config or bundled defaults."""
+    if config.model_dir:
+        return Path(config.model_dir).expanduser()
+    if config.model_name == DEFAULT_WAKE_MODEL:
+        return default_heed_model_dir()
+    return default_heed_model_dir().parent / config.model_name
+
+
+def create_wake_detector(on_wake: Callable[[], None], config: WakeConfig) -> WakeDetector | None:
+    """Instantiate the configured wake-word backend."""
+    if config.backend == "heed":
+        return HeedWakeWordDetector(
+            on_wake,
+            model_dir=resolve_heed_model_dir(config),
+            threshold=config.threshold,
+            gain=config.gain,
+        )
+    if config.backend == "openwakeword":
+        return WakeWordDetector(
+            on_wake,
+            model_name=config.model_name,
+            threshold=config.threshold,
+            gain=config.gain,
+        )
+    logger.error("Unknown wake backend %r; wake-word detection disabled", config.backend)
+    return None

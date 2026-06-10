@@ -57,5 +57,6 @@ cache/
 .Trash-*
 .nfs*
 
-# User-created personalities (managed by UI)
-src/bobe/profiles/user_personalities/
+# Heed wake-word training artifacts (exported model ships in src/bobe/wake_models/)
+wake_training/
+.heed/

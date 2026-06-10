@@ -25,7 +25,7 @@ dependencies = [
  # Git pin: PyPI 0.6.0 requires tflite-runtime on Linux, which has no Python 3.12
  # ARM wheels for the robot; main switched to ai-edge-litert which does.
  "openwakeword @ git+https://github.com/dscripka/openWakeWord@368c03716d1e92591906a84949bc477f3a834455",
- "heed-wakeword[export]>=0.1.3",
+ "onnxruntime>=1.16",
 ]
 [[project.authors]]
 name = "Pollen Robotics"
@@ -74,7 +74,7 @@ bobe = "bobe.main:Bobe"
 "" = "src"
 
 [tool.setuptools.package-data]
-bobe = [ "static/*", "profiles/**/*.txt", "profiles/**/*.py", "prompts/**/*.txt",]
+bobe = [ "static/*", "profiles/**/*.txt", "profiles/**/*.py", "prompts/**/*.txt", "wake_models/**/*.onnx", "wake_models/**/wake_model", "wake_models/**/*.b64", "wake_models/**/*.json",]
 
 [tool.ruff.lint]
 select = [ "E", "F", "W", "I", "C4", "D",]

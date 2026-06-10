@@ -117,8 +117,9 @@ def test_load_wake_config_defaults():
     config = load_wake_config({})
 
     assert config.enabled
+    assert config.backend == "heed"
     assert config.model_name == "hey_jarvis"
-    assert config.threshold == 0.28
+    assert config.threshold is None
     assert config.gain == 2.0
     assert config.timeout_s == 300.0
     assert "go to sleep" in config.sleep_phrases
@@ -128,6 +129,7 @@ def test_load_wake_config_env_overrides():
     config = load_wake_config(
         {
             "BOBE_WAKE_DISABLED": "1",
+            "BOBE_WAKE_BACKEND": "openwakeword",
             "BOBE_WAKE_MODEL": "alexa",
             "BOBE_WAKE_THRESHOLD": "0.7",
             "BOBE_WAKE_GAIN": "3.5",
@@ -137,6 +139,7 @@ def test_load_wake_config_env_overrides():
     )
 
     assert not config.enabled
+    assert config.backend == "openwakeword"
     assert config.model_name == "alexa"
     assert config.threshold == 0.7
     assert config.gain == 3.5

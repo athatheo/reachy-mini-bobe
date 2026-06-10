@@ -23,9 +23,9 @@ from bobe.wake_word import (
     DEFAULT_FLUSH_SECONDS,
     WakeSession,
     AudioRingBuffer,
-    WakeWordDetector,
     is_sleep_phrase,
     load_wake_config,
+    create_wake_detector,
 )
 from bobe.tools.core_tools import (
     ToolDependencies,
@@ -130,13 +130,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.wake_test_mode = False
         self.wake_test_detections = 0
         self._wake_buffer = AudioRingBuffer(sample_rate=self.input_sample_rate)
-        self._wake_detector: WakeWordDetector | None = None
+        self._wake_detector = None
         if self.wake_config.enabled:
-            self._wake_detector = WakeWordDetector(
+            self._wake_detector = create_wake_detector(
                 on_wake=self.wake_session.request_wake,
-                model_name=self.wake_config.model_name,
-                threshold=self.wake_config.threshold,
-                gain=self.wake_config.gain,
+                config=self.wake_config,
             )
         else:
             # Always-on mode (sim/Gradio testing): behave like before the wake gate.
