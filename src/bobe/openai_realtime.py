@@ -126,6 +126,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         self.wake_config = load_wake_config()
         self.wake_session = WakeSession(timeout_s=self.wake_config.timeout_s)
+        # Diagnostic mode: keep scoring the mic but never wake or stream upstream.
+        self.wake_test_mode = False
+        self.wake_test_detections = 0
         self._wake_buffer = AudioRingBuffer(sample_rate=self.input_sample_rate)
         self._wake_detector: WakeWordDetector | None = None
         if self.wake_config.enabled:
@@ -844,6 +847,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         upstream_frame = audio_to_int16(upstream_frame)
 
         if self.wake_config.enabled:
+            if self.wake_test_mode:
+                # Diagnostics: score everything locally, count would-be wakes,
+                # but never open the streaming window or answer.
+                if self.wake_session.consume_wake_request():
+                    self.wake_test_detections += 1
+                if self._wake_detector is not None:
+                    self._wake_detector.feed(self._to_wake_rate(audio_frame, input_sample_rate))
+                return
+
             if self.wake_session.consume_wake_request():
                 await self._transition_to_awake()
             elif self.wake_session.expired():

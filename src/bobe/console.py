@@ -294,6 +294,28 @@ class LocalStream:
                     "wake_model": wake_config.model_name if wake_config else None,
                     "wake_timeout_s": wake_config.timeout_s if wake_config else None,
                     "wake_debug": wake_debug,
+                    "wake_test_mode": bool(getattr(self.handler, "wake_test_mode", False)),
+                    "wake_test_detections": int(getattr(self.handler, "wake_test_detections", 0)),
+                }
+            )
+
+        class WakeTestPayload(BaseModel):
+            enabled: bool
+
+        # POST /wake-test -> toggle diagnostic mode (scores recorded, no waking/answers)
+        @self._settings_app.post("/wake-test")
+        def _wake_test(payload: WakeTestPayload) -> JSONResponse:
+            handler = self.handler
+            handler.wake_test_mode = payload.enabled
+            if payload.enabled:
+                handler.wake_test_detections = 0
+                wake_session = getattr(handler, "wake_session", None)
+                if wake_session is not None:
+                    wake_session.sleep()
+            return JSONResponse(
+                {
+                    "wake_test_mode": handler.wake_test_mode,
+                    "wake_test_detections": handler.wake_test_detections,
                 }
             )
 
