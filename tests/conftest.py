@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = PROJECT_ROOT / "src"
@@ -19,7 +21,10 @@ os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY", None)
 os.environ.pop("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY", None)
 
-# Disable local wake-word gating by default so handler tests run always-on and
-# never spin up a detector thread (which would download openWakeWord models).
-# Gating tests opt back in by overriding handler.wake_config/wake_session.
-os.environ["BOBE_WAKE_DISABLED"] = "1"
+
+@pytest.fixture(autouse=True)
+def _stub_wake_detector_unless_real(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Avoid spinning up ONNX/openWakeWord detectors in handler tests."""
+    if request.node.get_closest_marker("wake_detector"):
+        return
+    monkeypatch.setattr("bobe.openai_realtime.create_wake_detector", lambda *args, **kwargs: None)

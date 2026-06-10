@@ -183,10 +183,10 @@ class FakeGatingConnection:
 
 
 def _build_wake_enabled_handler() -> rt_mod.OpenaiRealtimeHandler:
-    """Build a handler with wake gating enabled and no detector thread."""
+    """Build a handler with wake gating and no detector thread."""
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
-    handler.wake_config = WakeConfig(enabled=True)
+    handler.wake_config = WakeConfig()
     handler.wake_session = WakeSession()
     handler._wake_detector = None
     return handler
@@ -341,21 +341,6 @@ async def test_receive_stops_streaming_after_sleep_phrase() -> None:
     for _ in range(3):
         await handler.receive(_mic_frame())
 
-    assert handler.connection.input_audio_buffer.appended == []
-
-
-@pytest.mark.asyncio
-async def test_sleep_phrase_works_when_wake_disabled() -> None:
-    """Sleep phrase closes the streaming window even in always-on wake mode."""
-    handler = _build_wake_enabled_handler()
-    handler.wake_config = WakeConfig(enabled=False)
-    handler.wake_session.wake()
-    handler.connection = FakeGatingConnection()
-
-    await handler._maybe_sleep_from_transcript("go to sleep")
-    assert not handler.wake_session.awake
-
-    await handler.receive(_mic_frame())
     assert handler.connection.input_audio_buffer.appended == []
 
 

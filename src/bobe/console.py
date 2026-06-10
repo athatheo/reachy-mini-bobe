@@ -277,7 +277,7 @@ class LocalStream:
 
             wake_config = getattr(self.handler, "wake_config", None)
             wake_session = getattr(self.handler, "wake_session", None)
-            wake_enabled = bool(wake_config and wake_config.enabled)
+            wake_enabled = wake_config is not None
             awake = bool(wake_session and wake_session.awake)
 
             wake_detector = getattr(self.handler, "_wake_detector", None)

@@ -34,7 +34,6 @@ DEFAULT_WAKE_MODEL = "hey_jarvis"
 DEFAULT_WAKE_THRESHOLD: float | None = None  # None => model default (Heed) or openWakeWord fallback
 DEFAULT_OPENWAKEWORD_THRESHOLD = 0.28
 DEFAULT_WAKE_GAIN = 1.75  # digital boost for the quiet robot mic (detector path only)
-DEFAULT_WAKE_SUPPRESS_AFTER_SLEEP_S = 4.0
 DEFAULT_WAKE_TIMEOUT_S = 300.0
 DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")
 DEFAULT_BUFFER_SECONDS = 3.0
@@ -46,7 +45,6 @@ DEBUG_WINDOW_SECONDS = 10.0
 class WakeConfig:
     """Environment-driven configuration for wake-word gating."""
 
-    enabled: bool = True
     backend: str = DEFAULT_WAKE_BACKEND
     model_name: str = DEFAULT_WAKE_MODEL
     model_dir: str | None = None
@@ -85,7 +83,6 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
     model_dir = (source.get("BOBE_WAKE_MODEL_DIR") or "").strip() or None
 
     return WakeConfig(
-        enabled=(source.get("BOBE_WAKE_DISABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}),
         backend=backend,
         model_name=(source.get("BOBE_WAKE_MODEL") or DEFAULT_WAKE_MODEL).strip() or DEFAULT_WAKE_MODEL,
         model_dir=model_dir,
@@ -218,12 +215,6 @@ class WakeWordDetector:
         # Rolling (timestamp, score, pre-gain RMS) samples for live diagnostics.
         self._stats_lock = threading.Lock()
         self._recent_stats: deque[tuple[float, float, float]] = deque()
-        self._suppress_until = 0.0
-
-    def suppress_for(self, seconds: float) -> None:
-        """Ignore detections for ``seconds`` (e.g. after returning to sleep)."""
-        if seconds > 0:
-            self._suppress_until = time.monotonic() + seconds
 
     def is_running(self) -> bool:
         """Return whether the background detection thread is alive."""
@@ -332,9 +323,6 @@ class WakeWordDetector:
                 # openWakeWord returns numpy scalars; cast so scores stay JSON-serializable.
                 score = float(max(scores.values())) if scores else 0.0
                 self._record_stats(score, rms)
-                now = time.monotonic()
-                if now < self._suppress_until:
-                    continue
                 if score >= self._threshold:
                     logger.info("Wake word detected (score=%.2f)", score)
                     self._reset_model(model)

@@ -21,7 +21,6 @@ from bobe.prompts import get_session_voice, get_session_instructions
 from bobe.wake_word import (
     WAKE_SAMPLE_RATE,
     DEFAULT_FLUSH_SECONDS,
-    DEFAULT_WAKE_SUPPRESS_AFTER_SLEEP_S,
     WakeSession,
     AudioRingBuffer,
     is_sleep_phrase,
@@ -131,15 +130,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.wake_test_mode = False
         self.wake_test_detections = 0
         self._wake_buffer = AudioRingBuffer(sample_rate=self.input_sample_rate)
-        self._wake_detector = None
-        if self.wake_config.enabled:
-            self._wake_detector = create_wake_detector(
-                on_wake=self.wake_session.request_wake,
-                config=self.wake_config,
-            )
-        else:
-            # Always-on mode (sim/Gradio testing): behave like before the wake gate.
-            self.wake_session.wake()
+        self._wake_detector = create_wake_detector(
+            on_wake=self.wake_session.request_wake,
+            config=self.wake_config,
+        )
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -834,7 +828,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._queue_antenna_cue(awake=False)
         if self._wake_detector is not None:
             self._wake_detector.start()
-            self._wake_detector.suppress_for(DEFAULT_WAKE_SUPPRESS_AFTER_SLEEP_S)
 
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
@@ -867,24 +860,20 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Cast if needed
         upstream_frame = audio_to_int16(upstream_frame)
 
-        if self.wake_config.enabled:
-            if self.wake_test_mode:
-                if self.wake_session.consume_wake_request():
-                    self.wake_test_detections += 1
-                self._feed_wake_detector(audio_frame, input_sample_rate)
-                return
-
+        if self.wake_test_mode:
             if self.wake_session.consume_wake_request():
-                await self._transition_to_awake()
-            elif self.wake_session.expired():
-                await self._transition_to_sleep("inactivity timeout")
+                self.wake_test_detections += 1
+            self._feed_wake_detector(audio_frame, input_sample_rate)
+            return
 
-            if not self.wake_session.awake:
-                self._wake_buffer.append(upstream_frame.reshape(-1))
-                self._feed_wake_detector(audio_frame, input_sample_rate)
-                return
+        if self.wake_session.consume_wake_request():
+            await self._transition_to_awake()
+        elif self.wake_session.expired():
+            await self._transition_to_sleep("inactivity timeout")
 
-        elif not self.wake_session.awake:
+        if not self.wake_session.awake:
+            self._wake_buffer.append(upstream_frame.reshape(-1))
+            self._feed_wake_detector(audio_frame, input_sample_rate)
             return
 
         if not self.connection:

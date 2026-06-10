@@ -116,7 +116,6 @@ def test_sleep_phrase_matches_english_and_greek():
 def test_load_wake_config_defaults():
     config = load_wake_config({})
 
-    assert config.enabled
     assert config.backend == "heed"
     assert config.model_name == "hey_jarvis"
     assert config.threshold is None
@@ -128,7 +127,6 @@ def test_load_wake_config_defaults():
 def test_load_wake_config_env_overrides():
     config = load_wake_config(
         {
-            "BOBE_WAKE_DISABLED": "1",
             "BOBE_WAKE_BACKEND": "openwakeword",
             "BOBE_WAKE_MODEL": "alexa",
             "BOBE_WAKE_THRESHOLD": "0.7",
@@ -138,7 +136,6 @@ def test_load_wake_config_env_overrides():
         }
     )
 
-    assert not config.enabled
     assert config.backend == "openwakeword"
     assert config.model_name == "alexa"
     assert config.threshold == 0.7
