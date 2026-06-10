@@ -206,6 +206,34 @@ def test_detector_applies_gain_to_quiet_audio(monkeypatch):
     assert seen_max and seen_max[0] == 2000
 
 
+def test_detector_debug_state_reports_scores_and_levels(monkeypatch):
+    class ScoringModel:
+        def predict(self, chunk):
+            return {"hey_jarvis": 0.27}
+
+        def reset(self):
+            pass
+
+    detector = WakeWordDetector(on_wake=lambda: None, threshold=0.9, gain=1.0)
+    monkeypatch.setattr(detector, "_load_model", lambda: ScoringModel())
+
+    assert detector.debug_state()["frames_window"] == 0
+
+    detector.start()
+    try:
+        detector.feed(np.full(DETECTOR_FRAME_SAMPLES, 1000, dtype=np.int16))
+        deadline = time.time() + 3.0
+        while detector.debug_state()["frames_window"] == 0 and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        detector.stop()
+
+    state = detector.debug_state()
+    assert state["frames_window"] == 1
+    assert state["score_peak"] == 0.27
+    assert state["rms_peak"] == 1000.0
+
+
 def test_detector_accumulates_partial_frames(monkeypatch):
     fired = []
     detector = WakeWordDetector(on_wake=lambda: fired.append(True), threshold=0.5)

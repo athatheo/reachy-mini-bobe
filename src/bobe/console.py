@@ -280,6 +280,9 @@ class LocalStream:
             wake_enabled = bool(wake_config and wake_config.enabled)
             awake = bool(wake_session and wake_session.awake)
 
+            wake_detector = getattr(self.handler, "_wake_detector", None)
+            wake_debug = wake_detector.debug_state() if wake_detector is not None else None
+
             return JSONResponse(
                 {
                     "has_key": has_openai_key and has_anthropic_key,
@@ -290,6 +293,7 @@ class LocalStream:
                     "awake": awake,
                     "wake_model": wake_config.model_name if wake_config else None,
                     "wake_timeout_s": wake_config.timeout_s if wake_config else None,
+                    "wake_debug": wake_debug,
                 }
             )
 

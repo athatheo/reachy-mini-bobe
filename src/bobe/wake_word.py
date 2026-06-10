@@ -33,6 +33,7 @@ DEFAULT_WAKE_TIMEOUT_S = 300.0
 DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")
 DEFAULT_BUFFER_SECONDS = 3.0
 DEFAULT_FLUSH_SECONDS = 1.6
+DEBUG_WINDOW_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,9 @@ class WakeWordDetector:
         self._queue: queue.Queue[NDArray[np.int16]] = queue.Queue(maxsize=64)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Rolling (timestamp, score, pre-gain RMS) samples for live diagnostics.
+        self._stats_lock = threading.Lock()
+        self._recent_stats: deque[tuple[float, float, float]] = deque()
 
     def start(self) -> None:
         """Start the detection thread (idempotent)."""
@@ -213,6 +217,32 @@ class WakeWordDetector:
             self._queue.put_nowait(frame)
         except queue.Full:
             pass
+
+    def debug_state(self) -> dict[str, float | int]:
+        """Return peak score and mic level over the last few seconds."""
+        now = time.monotonic()
+        with self._stats_lock:
+            while self._recent_stats and now - self._recent_stats[0][0] > DEBUG_WINDOW_SECONDS:
+                self._recent_stats.popleft()
+            entries = list(self._recent_stats)
+        scores = [score for _, score, _ in entries]
+        levels = [rms for _, _, rms in entries]
+        return {
+            "threshold": self._threshold,
+            "gain": self._gain,
+            "frames_window": len(entries),
+            "score_last": round(scores[-1], 4) if scores else 0.0,
+            "score_peak": round(max(scores), 4) if scores else 0.0,
+            "rms_peak": round(max(levels), 1) if levels else 0.0,
+            "rms_last": round(levels[-1], 1) if levels else 0.0,
+        }
+
+    def _record_stats(self, score: float, rms: float) -> None:
+        now = time.monotonic()
+        with self._stats_lock:
+            self._recent_stats.append((now, score, rms))
+            while self._recent_stats and now - self._recent_stats[0][0] > DEBUG_WINDOW_SECONDS:
+                self._recent_stats.popleft()
 
     def _load_model(self) -> object | None:
         try:
@@ -257,6 +287,7 @@ class WakeWordDetector:
             while pending.size >= DETECTOR_FRAME_SAMPLES:
                 chunk = pending[:DETECTOR_FRAME_SAMPLES]
                 pending = pending[DETECTOR_FRAME_SAMPLES:]
+                rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
                 if self._gain != 1.0:
                     chunk = np.clip(chunk.astype(np.int32) * self._gain, -32768, 32767).astype(np.int16)
                 try:
@@ -265,6 +296,7 @@ class WakeWordDetector:
                     logger.exception("Wake-word inference failed; stopping detector")
                     return
                 score = max(scores.values()) if scores else 0.0
+                self._record_stats(score, rms)
                 if score >= self._threshold:
                     logger.info("Wake word detected (score=%.2f)", score)
                     self._reset_model(model)
