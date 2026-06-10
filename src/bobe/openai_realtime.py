@@ -1,4 +1,3 @@
-import os
 import json
 import uuid
 import base64
@@ -54,7 +53,6 @@ IMAGE_INPUT_COST_PER_1M = 5.0
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 
 # Extra time after the speaker goes quiet before the mic is forwarded again.
-_HALF_DUPLEX_TAIL_S: Final[float] = 0.3
 
 
 def _compute_response_cost(usage: Any) -> float:
@@ -139,12 +137,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         else:
             # Always-on mode (sim/Gradio testing): behave like before the wake gate.
             self.wake_session.wake()
-
-        # Half-duplex echo guard: drop mic frames while the robot's own audio is
-        # playing so its speech is not transcribed and answered a second time.
-        # Tradeoff: no voice barge-in while it talks. Disable with BOBE_HALF_DUPLEX=0.
-        self._half_duplex = os.getenv("BOBE_HALF_DUPLEX", "1").strip().lower() not in {"0", "false", "no", "off"}
-        self._speaking_until = 0.0
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -642,7 +634,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             self.deps.head_wobbler.feed(event.delta)
                         self.wake_session.touch()
                         delta_audio = np.frombuffer(base64.b64decode(event.delta), dtype=np.int16)
-                        self._note_speech_audio(delta_audio.size)
                         await self.output_queue.put(
                             (
                                 self.output_sample_rate,
@@ -749,23 +740,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         return (np.concatenate(tones) * 32767).astype(np.int16)
 
     async def _play_chime(self, *, ascending: bool) -> None:
-        # Deliberately not counted as robot speech: blocking the mic during the
-        # wake chime would clip a command said in one breath with the wake word.
         try:
             chime = self._make_chime(ascending=ascending)
             await self.output_queue.put((self.output_sample_rate, chime.reshape(1, -1)))
         except Exception:
             logger.debug("Chime skipped", exc_info=True)
-
-    def _note_speech_audio(self, samples: int) -> None:
-        """Extend the speaker-busy window used by the half-duplex echo guard."""
-        now = asyncio.get_event_loop().time()
-        duration = samples / float(self.output_sample_rate)
-        self._speaking_until = max(now, self._speaking_until) + duration
-
-    def _speaker_active(self) -> bool:
-        """Return whether the robot's own audio is (still) playing."""
-        return asyncio.get_event_loop().time() < self._speaking_until + _HALF_DUPLEX_TAIL_S
 
     def _queue_antenna_cue(self, *, awake: bool) -> None:
         """Raise antennas while streaming, relax them when back to local-only."""
@@ -875,11 +854,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 if self._wake_detector is not None:
                     self._wake_detector.feed(self._to_wake_rate(audio_frame, input_sample_rate))
                 return
-
-        # Half-duplex: while the robot is talking, drop mic frames so its own
-        # voice cannot be transcribed and answered again (echo double-answer).
-        if self._half_duplex and self._speaker_active():
-            return
 
         # Send to OpenAI (guard against races during reconnect)
         try:
