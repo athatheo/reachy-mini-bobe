@@ -1,5 +1,6 @@
 import json
 import uuid
+import time
 import base64
 import random
 import asyncio
@@ -51,8 +52,8 @@ TEXT_OUTPUT_COST_PER_1M = 16.0
 IMAGE_INPUT_COST_PER_1M = 5.0
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
-
-# Extra time after the speaker goes quiet before the mic is forwarded again.
+# Ignore server VAD briefly after assistant audio so speaker echo does not freeze motors.
+_ASSISTANT_VAD_GUARD_S: Final[float] = 0.4
 
 
 def _compute_response_cost(usage: Any) -> float:
@@ -122,6 +123,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
         self._last_response_rejected: bool = False
+        self._last_assistant_audio_at: float = 0.0
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         self.wake_config = load_wake_config()
@@ -138,6 +140,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
         return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path)
+
+    def _should_ignore_server_vad(self) -> bool:
+        """Return True when server VAD is likely picking up BoBe's own speaker output."""
+        if not self._response_done_event.is_set():
+            return True
+        return (time.monotonic() - self._last_assistant_audio_at) < _ASSISTANT_VAD_GUARD_S
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a new personality (profile) at runtime if possible.
@@ -554,17 +562,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 async for event in self.connection:
                     logger.debug(f"OpenAI event: {event.type}")
                     if event.type == "input_audio_buffer.speech_started":
-                        if hasattr(self, "_clear_queue") and callable(self._clear_queue):
-                            self._clear_queue()
-                        if self.deps.head_wobbler is not None:
-                            self.deps.head_wobbler.reset()
-                        self.deps.movement_manager.set_listening(True)
-                        self.wake_session.touch()
-                        logger.debug("User speech started")
+                        if self._should_ignore_server_vad():
+                            logger.debug("Ignoring speech_started during assistant output")
+                        else:
+                            if hasattr(self, "_clear_queue") and callable(self._clear_queue):
+                                self._clear_queue()
+                            if self.deps.head_wobbler is not None:
+                                self.deps.head_wobbler.reset()
+                            self.deps.movement_manager.set_listening(True)
+                            self.wake_session.touch()
+                            logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
-                        self.deps.movement_manager.set_listening(False)
-                        logger.debug("User speech stopped - server will auto-commit with VAD")
+                        if not self._should_ignore_server_vad():
+                            self.deps.movement_manager.set_listening(False)
+                            logger.debug("User speech stopped - server will auto-commit with VAD")
 
                     if event.type in (
                         "response.audio.done",  # GA
@@ -637,6 +649,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                     # Handle audio delta
                     if event.type in ("response.audio.delta", "response.output_audio.delta"):
+                        self._last_assistant_audio_at = time.monotonic()
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.feed(event.delta)
                         if self.wake_session.awake:

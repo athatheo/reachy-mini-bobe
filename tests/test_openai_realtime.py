@@ -1,6 +1,7 @@
 import random
 import asyncio
 import logging
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -721,3 +722,26 @@ async def test_response_sender_loop_times_out_waiting_for_previous_response(
     assert len(timeout_logs) == 1, (
         f"Expected 1 pre-condition timeout warning, got {len(timeout_logs)}"
     )
+
+
+def test_should_ignore_server_vad_while_response_active() -> None:
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._response_done_event.clear()
+    assert handler._should_ignore_server_vad() is True
+
+
+def test_should_ignore_server_vad_after_recent_assistant_audio() -> None:
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._response_done_event.set()
+    handler._last_assistant_audio_at = time.monotonic()
+    assert handler._should_ignore_server_vad() is True
+
+
+def test_should_accept_server_vad_after_assistant_guard_elapsed() -> None:
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._response_done_event.set()
+    handler._last_assistant_audio_at = time.monotonic() - rt_mod._ASSISTANT_VAD_GUARD_S - 0.1
+    assert handler._should_ignore_server_vad() is False

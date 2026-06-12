@@ -37,14 +37,14 @@
     }
   ],
   "trigger": {
-    "consecutive_frames": 2,
+    "consecutive_frames": 3,
     "refractory_seconds": 2.5,
     "ema_alpha": 0.5,
     "note": "Trigger when raw prob > threshold for `consecutive_frames` in a row, then suppress for `refractory_seconds`. ema_alpha is for display smoothing only (not the trigger gate; the EMA lags and was suppressing short, confident detections)."
   },
   "energy_gate": {
     "rms_threshold_dbfs": -55.0,
-    "voice_band_min_fraction": 0.15,
+    "voice_band_min_fraction": 0.18,
     "voice_band_lo_hz": 100.0,
     "voice_band_hi_hz": 7000.0,
     "note": "Skip the model entirely when gate fails. Prevents amplified-mic-noise false readings during silence."
