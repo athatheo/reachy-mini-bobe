@@ -39,7 +39,8 @@ Copy `.env.example` to `.env` for local development and set the keys you need:
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 CLAUDE_MODEL="claude-sonnet-4-6"
-BOBE_WAKE_WORD="Bob"
+BOBE_WAKE_BACKEND=heed
+BOBE_WAKE_MODEL="hey_jarvis"
 ```
 
 The OpenAI key is used by the inherited realtime speech bridge. The Anthropic key is used by BoBe's `ask_claude` tool for Claude-backed answers.
