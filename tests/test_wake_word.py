@@ -11,6 +11,7 @@ from bobe.wake_word import (
     WakeSession,
     AudioRingBuffer,
     WakeWordDetector,
+    create_wake_detector,
     is_sleep_phrase,
     load_wake_config,
 )
@@ -142,6 +143,25 @@ def test_load_wake_config_env_overrides():
     assert config.gain == 3.5
     assert config.timeout_s == 60.0
     assert config.sleep_phrases[0] == "time for bed"
+
+
+def test_load_wake_config_remote_backend():
+    config = load_wake_config(
+        {
+            "BOBE_WAKE_BACKEND": "remote",
+            "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
+            "BOBE_WAKE_TOKEN": "secret",
+        }
+    )
+
+    assert config.backend == "remote"
+    assert config.remote_url == "ws://mac-mini.local:8765/v1/stream"
+    assert config.remote_token == "secret"
+
+
+def test_create_wake_detector_remote_requires_url():
+    config = load_wake_config({"BOBE_WAKE_BACKEND": "remote"})
+    assert create_wake_detector(lambda: None, config) is None
 
 
 # ---- Detector ----

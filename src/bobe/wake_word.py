@@ -21,6 +21,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from bobe.heed_wake import HeedWakeWordDetector, default_heed_model_dir
+from bobe.wake.remote_client import RemoteWakeClient
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,8 @@ class WakeConfig:
     gain: float = DEFAULT_WAKE_GAIN
     timeout_s: float = DEFAULT_WAKE_TIMEOUT_S
     sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES
+    remote_url: str | None = None
+    remote_token: str | None = None
 
 
 def _optional_float(source: Mapping[str, str], name: str) -> float | None:
@@ -90,6 +93,8 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
         gain=max(1.0, _float("BOBE_WAKE_GAIN", DEFAULT_WAKE_GAIN)),
         timeout_s=max(1.0, _float("BOBE_WAKE_TIMEOUT_S", DEFAULT_WAKE_TIMEOUT_S)),
         sleep_phrases=tuple(sleep_phrases),
+        remote_url=(source.get("BOBE_WAKE_REMOTE_URL") or "").strip() or None,
+        remote_token=(source.get("BOBE_WAKE_TOKEN") or "").strip() or None,
     )
 
 
@@ -345,7 +350,7 @@ class WakeWordDetector:
                 return
 
 
-WakeDetector = WakeWordDetector | HeedWakeWordDetector
+WakeDetector = WakeWordDetector | HeedWakeWordDetector | RemoteWakeClient
 
 
 def resolve_heed_model_dir(config: WakeConfig) -> Path:
@@ -371,6 +376,16 @@ def create_wake_detector(on_wake: Callable[[], None], config: WakeConfig) -> Wak
             on_wake,
             model_name=config.model_name,
             threshold=config.threshold,
+            gain=config.gain,
+        )
+    if config.backend == "remote":
+        if not config.remote_url:
+            logger.error("BOBE_WAKE_REMOTE_URL is required when BOBE_WAKE_BACKEND=remote")
+            return None
+        return RemoteWakeClient(
+            on_wake,
+            url=config.remote_url,
+            token=config.remote_token,
             gain=config.gain,
         )
     logger.error("Unknown wake backend %r; wake-word detection disabled", config.backend)

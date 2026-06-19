@@ -803,6 +803,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def _transition_to_awake(self) -> None:
         """Open the streaming window after a local wake-word detection."""
+        self._pause_wake_detector()
         self.wake_session.wake()
         logger.info("Wake word heard: streaming audio to OpenAI until timeout or sleep phrase")
         await self._play_chime(ascending=True)
@@ -839,10 +840,23 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         await self._play_chime(ascending=False)
         self._queue_antenna_cue(awake=False)
-        if self._wake_detector is not None:
-            self._wake_detector.start()
+        self._resume_wake_detector()
 
-    # Microphone receive
+    def _pause_wake_detector(self) -> None:
+        detector = self._wake_detector
+        if detector is not None and hasattr(detector, "pause"):
+            detector.pause()
+
+    def _resume_wake_detector(self) -> None:
+        detector = self._wake_detector
+        if detector is None:
+            return
+        if hasattr(detector, "resume"):
+            detector.resume()
+        if not detector.is_running():
+            logger.warning("Wake detector thread not running; restarting")
+            detector.start()
+
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive a mic frame; keep it local while asleep, otherwise send upstream.
 
