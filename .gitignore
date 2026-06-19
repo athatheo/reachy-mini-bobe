@@ -12,6 +12,7 @@ env/
 
 # Environment variables
 .env
+config/wake-daemon.env
 
 # Build and distribution
 build/

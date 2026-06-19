@@ -77,7 +77,7 @@ bobe = "bobe.main:Bobe"
 "" = "src"
 
 [tool.setuptools.package-data]
-bobe = [ "static/*", "profiles/**/*.txt", "profiles/**/*.py", "prompts/**/*.txt", "wake_models/**/*.onnx", "wake_models/**/wake_model", "wake_models/**/*.b64", "wake_models/**/*.json",]
+bobe = [ "static/*", "profiles/**/*.txt", "profiles/**/*.py", "prompts/**/*.txt", "wake_models/**/*.onnx", "wake_models/**/wake_model", "wake_models/**/*.b64", "wake_models/**/*.json", ".env.example",]
 
 [tool.ruff.lint]
 select = [ "E", "F", "W", "I", "C4", "D",]

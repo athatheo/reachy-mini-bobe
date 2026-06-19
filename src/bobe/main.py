@@ -6,6 +6,7 @@ import time
 import asyncio
 import argparse
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import gradio as gr
@@ -127,6 +128,17 @@ def run(
         type="messages",
         resizable=True,
     )
+
+    if instance_path:
+        try:
+            from dotenv import load_dotenv
+
+            env_path = Path(instance_path) / ".env"
+            if env_path.exists():
+                load_dotenv(dotenv_path=str(env_path), override=True)
+                logger.info("Loaded instance configuration from %s", env_path)
+        except Exception as exc:
+            logger.warning("Could not load instance .env from %s: %s", instance_path, exc)
 
     handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
 
