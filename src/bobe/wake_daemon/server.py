@@ -95,11 +95,14 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     )
 
                 now = time.monotonic()
-                if now - last_stats_at >= 1.0:
-                    debug = engine.debug_state()
+                debug = engine.debug_state()
+                interval = 0.25 if debug.get("in_speech") else 1.0
+                if now - last_stats_at >= interval:
                     await websocket.send_json(
                         stats_message(
                             transcript=debug.get("transcript_last", ""),
+                            partial=debug.get("transcript_partial", ""),
+                            transcript_stream=debug.get("transcript_stream", []),
                             rms=debug.get("rms_last", 0.0),
                             in_speech=debug.get("in_speech", False),
                             paused=paused,

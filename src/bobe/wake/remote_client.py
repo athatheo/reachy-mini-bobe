@@ -56,6 +56,8 @@ class RemoteWakeClient:
         self._daemon_engine = ""
         self._connected = False
         self._last_transcript = ""
+        self._last_partial_logged = ""
+        self._transcript_stream: list[dict[str, float | int | str | bool]] = []
 
     @property
     def phrase(self) -> str:
@@ -119,6 +121,8 @@ class RemoteWakeClient:
             "rms_peak": round(max(rms_values), 1) if rms_values else 0.0,
             "rms_last": round(rms_values[-1], 1) if rms_values else 0.0,
             "transcript_last": self._last_transcript,
+            "transcript_partial": self._remote_stats.get("partial", ""),
+            "transcript_stream": list(self._transcript_stream)[-12:],
             "connected": self._connected,
             "paused": self._paused,
             "thread_alive": self.is_running(),
@@ -152,11 +156,22 @@ class RemoteWakeClient:
         ):
             if key in payload and payload[key] is not None:
                 stats[key] = payload[key]  # type: ignore[assignment]
-        transcript = str(payload.get("transcript") or payload.get("partial") or "")
+        transcript = str(payload.get("transcript") or "")
+        partial = str(payload.get("partial") or "")
+        stream = payload.get("transcript_stream")
         with self._stats_lock:
             self._remote_stats.update(stats)
-            if transcript:
+            if isinstance(stream, list):
+                self._transcript_stream = [entry for entry in stream if isinstance(entry, dict)][-12:]
+            if partial:
+                self._last_transcript = partial
+                if partial != self._last_partial_logged:
+                    self._last_partial_logged = partial
+                    self._log_event("transcript", partial, partial=True)
+            elif transcript:
                 self._last_transcript = transcript
+                self._last_partial_logged = ""
+                self._log_event("transcript", transcript, partial=False)
 
     def _record_stats(self, rms: float, transcript: str) -> None:
         now = time.monotonic()

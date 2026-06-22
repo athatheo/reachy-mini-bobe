@@ -59,6 +59,19 @@ function show(el, flag) {
   el.classList.toggle("hidden", !flag);
 }
 
+function renderCredentials(st) {
+  const formPanel = document.getElementById("form-panel");
+  const configuredPanel = document.getElementById("configured");
+  if (!formPanel || !configuredPanel) return;
+  if (st.has_key) {
+    show(configuredPanel, true);
+    show(formPanel, false);
+  } else {
+    show(configuredPanel, false);
+    show(formPanel, true);
+  }
+}
+
 function renderWakeStatus(st) {
   const panel = document.getElementById("live-status");
   const chip = document.getElementById("wake-chip");
@@ -98,8 +111,9 @@ function renderWakeDebug(st) {
   const panel = document.getElementById("wake-debug");
   const chip = document.getElementById("wake-debug-chip");
   const metrics = document.getElementById("wake-debug-metrics");
+  const streamEl = document.getElementById("wake-transcript-stream");
   const logEl = document.getElementById("wake-debug-log");
-  if (!panel || !chip || !metrics || !logEl) return;
+  if (!panel || !chip || !metrics || !streamEl || !logEl) return;
 
   const debug = st.wake_debug || {};
   const remote = debug.remote_stats || {};
@@ -113,6 +127,7 @@ function renderWakeDebug(st) {
   chip.className = connected ? "chip chip-ok" : "chip";
 
   const transcript = remote.transcript || debug.transcript_last || "";
+  const partial = remote.partial || debug.transcript_partial || "";
   const rms = remote.rms ?? debug.rms_last ?? 0;
   const inSpeech = remote.in_speech ? "yes" : "no";
   const latency = remote.latency_ms_last ?? remote.latency_ms ?? debug.latency_ms_last ?? "\u2014";
@@ -123,21 +138,45 @@ function renderWakeDebug(st) {
   metrics.innerHTML = [
     formatMetric("Daemon URL", url),
     formatMetric("Engine", `${engine} / ${model}`),
-    formatMetric("Transcript", transcript || "\u2014"),
+    formatMetric("Latest transcript", transcript || "\u2014"),
+    formatMetric("Live partial", partial || "\u2014"),
     formatMetric("Mic RMS", Number(rms).toFixed ? Number(rms).toFixed(1) : rms),
     formatMetric("In speech", inSpeech),
     formatMetric("Whisper latency (ms)", latency),
   ].join("");
 
+  const stream = Array.isArray(debug.transcript_stream) ? debug.transcript_stream : [];
+  if (partial) {
+    streamEl.textContent = stream
+      .map((entry) => {
+        const text = entry.text || "";
+        return text ? `[final] ${text}` : "";
+      })
+      .filter(Boolean)
+      .concat(partial ? [`[live] ${partial}`] : [])
+      .join("\n");
+  } else if (stream.length === 0) {
+    streamEl.textContent = connected
+      ? "Listening... partial Whisper text will appear here while you speak."
+      : "Connect to the Mac wake daemon to see live Whisper transcripts.";
+  } else {
+    streamEl.textContent = stream
+      .map((entry) => `[final] ${entry.text || ""}`)
+      .filter((line) => line !== "[final] ")
+      .join("\n");
+  }
+  streamEl.scrollTop = streamEl.scrollHeight;
+
   const events = Array.isArray(debug.events) ? debug.events : [];
-  if (events.length === 0) {
+  const connectionEvents = events.filter((entry) => entry.level !== "transcript");
+  if (connectionEvents.length === 0) {
     logEl.textContent = connected
-      ? "Waiting for Whisper stats from the Mac daemon..."
+      ? "Waiting for daemon events..."
       : "Not connected to the Mac wake daemon yet.";
     return;
   }
 
-  logEl.innerHTML = events
+  logEl.innerHTML = connectionEvents
     .slice(-20)
     .map((entry) => {
       const level = entry.level || "info";
@@ -159,6 +198,7 @@ function startWakeStatusPolling() {
         const st = await resp.json();
         renderWakeStatus(st);
         renderWakeDebug(st);
+        renderCredentials(st);
       }
     } catch (e) {}
   };
@@ -193,6 +233,7 @@ async function init() {
   } else {
     show(formPanel, true);
   }
+  renderCredentials(st);
   show(loading, false);
   startWakeStatusPolling();
 

@@ -50,8 +50,7 @@ def persist_wake_env(
     if env_path.exists():
         lines = env_path.read_text(encoding="utf-8").splitlines()
     else:
-        example = Path(__file__).parent / ".env.example"
-        lines = example.read_text(encoding="utf-8").splitlines() if example.exists() else []
+        lines = []
 
     upsert_wake_env_lines(
         lines,

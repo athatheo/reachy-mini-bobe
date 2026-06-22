@@ -273,8 +273,10 @@ class LocalStream:
         # GET /status -> required keys plus live wake/streaming state
         @self._settings_app.get("/status")
         def _status() -> JSONResponse:
-            has_openai_key = _is_plausible_openai_key(str(config.OPENAI_API_KEY or ""))
-            has_anthropic_key = _is_plausible_anthropic_key(os.getenv("ANTHROPIC_API_KEY"))
+            openai_key = os.getenv("OPENAI_API_KEY") or str(config.OPENAI_API_KEY or "")
+            anthropic_key = os.getenv("ANTHROPIC_API_KEY") or ""
+            has_openai_key = _is_plausible_openai_key(openai_key)
+            has_anthropic_key = _is_plausible_anthropic_key(anthropic_key)
 
             wake_config = getattr(self.handler, "wake_config", None)
             wake_session = getattr(self.handler, "wake_session", None)
