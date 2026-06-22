@@ -27,6 +27,7 @@ from bobe.claude import DEFAULT_CLAUDE_MODEL
 from bobe.config import LOCKED_PROFILE, config
 from bobe.openai_realtime import OpenaiRealtimeHandler
 from bobe.headless_personality_ui import mount_personality_routes
+from bobe.wake_env import persist_wake_env
 
 
 try:
@@ -305,6 +306,39 @@ class LocalStream:
 
         class WakeTestPayload(BaseModel):
             enabled: bool
+
+        class WakeConfigPayload(BaseModel):
+            backend: str = "remote"
+            remote_url: str
+            token: str
+            gain: float = 1.75
+
+        # POST /wake-config -> persist remote wake settings for next restart
+        @self._settings_app.post("/wake-config")
+        def _wake_config(payload: WakeConfigPayload) -> JSONResponse:
+            remote_url = (payload.remote_url or "").strip()
+            token = (payload.token or "").strip()
+            backend = (payload.backend or "remote").strip().lower()
+            if backend != "remote":
+                return JSONResponse({"ok": False, "error": "unsupported_backend"}, status_code=400)
+            if not remote_url.startswith("ws://") and not remote_url.startswith("wss://"):
+                return JSONResponse({"ok": False, "error": "invalid_remote_url"}, status_code=400)
+            if not token:
+                return JSONResponse({"ok": False, "error": "missing_token"}, status_code=400)
+            if self._instance_path is None:
+                return JSONResponse({"ok": False, "error": "missing_instance_path"}, status_code=500)
+            try:
+                env_path = persist_wake_env(
+                    self._instance_path,
+                    backend=backend,
+                    remote_url=remote_url,
+                    token=token,
+                    gain=max(1.0, float(payload.gain)),
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist wake config: %s", exc)
+                return JSONResponse({"ok": False, "error": "persist_failed"}, status_code=500)
+            return JSONResponse({"ok": True, "env_path": str(env_path), "restart_required": True})
 
         # POST /wake-test -> toggle diagnostic mode (scores recorded, no waking/answers)
         @self._settings_app.post("/wake-test")

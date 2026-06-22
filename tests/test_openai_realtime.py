@@ -774,8 +774,8 @@ def test_should_accept_server_vad_after_assistant_guard_elapsed() -> None:
     assert handler._should_ignore_server_vad() is False
 
 
-def test_sleep_cue_translates_head_on_y_axis() -> None:
-    """Going to sleep lowers the head ~3 cm on world Y; waking restores it."""
+def test_sleep_cue_translates_head_on_z_axis() -> None:
+    """Going to sleep lowers the head ~3 cm vertically; waking restores it."""
     from reachy_mini.utils import create_head_pose
 
     neutral = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True, mm=True)
@@ -789,12 +789,12 @@ def test_sleep_cue_translates_head_on_y_axis() -> None:
 
     handler._queue_antenna_cue(awake=False)
     sleep_move = movement_manager.queue_move.call_args[0][0]
-    assert sleep_move.target_head_pose[1, 3] == pytest.approx(-0.03)
+    assert sleep_move.target_head_pose[2, 3] == pytest.approx(-0.03)
     assert sleep_move.target_antennas == (0.0, 0.0)
 
     robot.get_current_head_pose.return_value = sleep_move.target_head_pose
     movement_manager.reset_mock()
     handler._queue_antenna_cue(awake=True)
     wake_move = movement_manager.queue_move.call_args[0][0]
-    assert wake_move.target_head_pose[1, 3] == pytest.approx(0.0)
+    assert wake_move.target_head_pose[2, 3] == pytest.approx(0.0)
     assert wake_move.target_antennas == (-0.5, 0.5)

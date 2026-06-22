@@ -54,8 +54,8 @@ IMAGE_INPUT_COST_PER_1M = 5.0
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 # Ignore server VAD briefly after assistant audio so speaker echo does not freeze motors.
 _ASSISTANT_VAD_GUARD_S: Final[float] = 0.4
-# World-frame head translation applied when falling asleep (millimeters).
-_SLEEP_HEAD_Y_OFFSET_MM: Final[float] = 30.0
+# World-frame head translation applied when falling asleep (millimeters, vertical).
+_SLEEP_HEAD_Z_OFFSET_MM: Final[float] = 30.0
 
 
 def _compute_response_cost(usage: Any) -> float:
@@ -805,8 +805,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             head_joints, antennas = robot.get_current_joint_positions()
             # Mirrored joints: (-, +) perks both antennas outward; (+, -) crosses them.
             target = (-0.5, 0.5) if awake else (0.0, 0.0)
-            y_offset_mm = _SLEEP_HEAD_Y_OFFSET_MM if awake else -_SLEEP_HEAD_Y_OFFSET_MM
-            head_offset = create_head_pose(0, y_offset_mm, 0, 0, 0, 0, degrees=True, mm=True)
+            z_offset_mm = _SLEEP_HEAD_Z_OFFSET_MM if awake else -_SLEEP_HEAD_Z_OFFSET_MM
+            head_offset = create_head_pose(0, 0, z_offset_mm, 0, 0, 0, degrees=True, mm=True)
             target_head_pose = compose_world_offset(head_pose, head_offset, reorthonormalize=True)
             move = GotoQueueMove(
                 target_head_pose=target_head_pose,

@@ -133,6 +133,9 @@ def run(
         try:
             from dotenv import load_dotenv
 
+            from bobe.wake_env import merge_packaged_wake_defaults
+
+            merge_packaged_wake_defaults(instance_path)
             env_path = Path(instance_path) / ".env"
             if env_path.exists():
                 load_dotenv(dotenv_path=str(env_path), override=True)
