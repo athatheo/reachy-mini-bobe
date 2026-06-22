@@ -106,6 +106,7 @@ def test_ring_buffer_drain_tail_slices_and_clears():
 def test_sleep_phrase_matches_english_and_greek():
     assert is_sleep_phrase("Go to sleep!")
     assert is_sleep_phrase("okay bobe, go to sleep now")
+    assert is_sleep_phrase("got to sleep")
     assert is_sleep_phrase("Κοιμήσου")
     assert not is_sleep_phrase("let's talk about sleep schedules")
     assert not is_sleep_phrase("")

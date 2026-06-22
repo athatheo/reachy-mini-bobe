@@ -83,10 +83,13 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 pcm = np.frombuffer(data, dtype=np.int16)
                 event = engine.feed(pcm)
                 if event is not None:
+                    transcript = str(event["transcript"])
+                    latency_ms = float(event["latency_ms"])
+                    logger.info("Wake phrase detected (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
                     await websocket.send_json(
                         wake_message(
-                            transcript=str(event["transcript"]),
-                            latency_ms=float(event["latency_ms"]),
+                            transcript=transcript,
+                            latency_ms=latency_ms,
                             phrase=str(event["phrase"]),
                         )
                     )
@@ -100,6 +103,9 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                             rms=debug.get("rms_last", 0.0),
                             in_speech=debug.get("in_speech", False),
                             paused=paused,
+                            latency_ms_last=debug.get("latency_ms_last", 0.0),
+                            engine="faster-whisper",
+                            model=runtime.whisper_model,
                         )
                     )
                     last_stats_at = now

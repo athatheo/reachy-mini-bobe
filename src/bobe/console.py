@@ -282,6 +282,7 @@ class LocalStream:
 
             wake_detector = getattr(self.handler, "_wake_detector", None)
             wake_debug = wake_detector.debug_state() if wake_detector is not None else None
+            wake_remote_url = getattr(wake_config, "remote_url", None) if wake_config else None
 
             return JSONResponse(
                 {
@@ -294,6 +295,7 @@ class LocalStream:
                     "wake_backend": wake_config.backend if wake_config else None,
                     "wake_model": wake_config.model_name if wake_config else None,
                     "wake_phrase": getattr(wake_detector, "phrase", None) if wake_detector is not None else None,
+                    "wake_remote_url": wake_remote_url,
                     "wake_timeout_s": wake_config.timeout_s if wake_config else None,
                     "wake_debug": wake_debug,
                     "wake_test_mode": bool(getattr(self.handler, "wake_test_mode", False)),

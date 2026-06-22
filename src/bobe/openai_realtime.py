@@ -54,6 +54,8 @@ IMAGE_INPUT_COST_PER_1M = 5.0
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 # Ignore server VAD briefly after assistant audio so speaker echo does not freeze motors.
 _ASSISTANT_VAD_GUARD_S: Final[float] = 0.4
+# World-frame head translation applied when falling asleep (millimeters).
+_SLEEP_HEAD_Y_OFFSET_MM: Final[float] = 30.0
 
 
 def _compute_response_cost(usage: Any) -> float:
@@ -124,6 +126,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._response_done_event.set()
         self._last_response_rejected: bool = False
         self._last_assistant_audio_at: float = 0.0
+        self._latest_user_transcript: str = ""
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         self.wake_config = load_wake_config()
@@ -469,14 +472,19 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self._response_done_event.set()
 
 
-    async def _maybe_sleep_from_transcript(self, transcript: str) -> bool:
+    async def _maybe_sleep_from_transcript(self, transcript: str | None) -> bool:
         """Return True after transitioning to sleep on a sleep phrase."""
         if not self.wake_session.awake:
             return False
-        if not is_sleep_phrase(transcript, self.wake_config.sleep_phrases):
+        if not transcript or not is_sleep_phrase(transcript, self.wake_config.sleep_phrases):
             return False
         await self._transition_to_sleep("sleep phrase")
         return True
+
+    def _record_user_transcript(self, transcript: str | None) -> None:
+        """Track the latest user transcript for early sleep detection."""
+        if transcript:
+            self._latest_user_transcript = transcript
 
     async def _handle_completed_user_transcript(self, transcript: str) -> None:
         """Record a completed user transcript and watch for the sleep phrase.
@@ -565,6 +573,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         if self._should_ignore_server_vad():
                             logger.debug("Ignoring speech_started during assistant output")
                         else:
+                            self._latest_user_transcript = ""
                             if hasattr(self, "_clear_queue") and callable(self._clear_queue):
                                 self._clear_queue()
                             if self.deps.head_wobbler is not None:
@@ -576,6 +585,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     if event.type == "input_audio_buffer.speech_stopped":
                         if not self._should_ignore_server_vad():
                             self.deps.movement_manager.set_listening(False)
+                            if await self._maybe_sleep_from_transcript(self._latest_user_transcript):
+                                continue
                             logger.debug("User speech stopped - server will auto-commit with VAD")
 
                     if event.type in (
@@ -587,6 +598,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         logger.debug("response completed")
 
                     if event.type == "response.created":
+                        if await self._maybe_sleep_from_transcript(self._latest_user_transcript):
+                            continue
                         self._response_done_event.clear()
                         logger.debug("Response created (active)")
 
@@ -607,6 +620,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     # Handle partial transcription (user speaking in real-time)
                     if event.type == "conversation.item.input_audio_transcription.partial":
                         logger.debug(f"User partial transcript: {event.transcript}")
+                        self._record_user_transcript(getattr(event, "transcript", None))
 
                         if await self._maybe_sleep_from_transcript(event.transcript):
                             continue
@@ -631,6 +645,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
                         logger.debug(f"User transcript: {event.transcript}")
+                        self._record_user_transcript(getattr(event, "transcript", None))
 
                         # Cancel any pending partial emission
                         if self.partial_transcript_task and not self.partial_transcript_task.done():
@@ -779,17 +794,22 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.debug("Chime skipped", exc_info=True)
 
     def _queue_antenna_cue(self, *, awake: bool) -> None:
-        """Raise antennas while streaming, relax them when back to local-only."""
+        """Raise antennas while streaming; relax them and nod head down when asleep."""
         try:
             from bobe.dance_emotion_moves import GotoQueueMove
+            from reachy_mini.utils import create_head_pose
+            from reachy_mini.utils.interpolation import compose_world_offset
 
             robot = self.deps.reachy_mini
             head_pose = robot.get_current_head_pose()
             head_joints, antennas = robot.get_current_joint_positions()
             # Mirrored joints: (-, +) perks both antennas outward; (+, -) crosses them.
             target = (-0.5, 0.5) if awake else (0.0, 0.0)
+            y_offset_mm = _SLEEP_HEAD_Y_OFFSET_MM if awake else -_SLEEP_HEAD_Y_OFFSET_MM
+            head_offset = create_head_pose(0, y_offset_mm, 0, 0, 0, 0, degrees=True, mm=True)
+            target_head_pose = compose_world_offset(head_pose, head_offset, reorthonormalize=True)
             move = GotoQueueMove(
-                target_head_pose=head_pose,
+                target_head_pose=target_head_pose,
                 start_head_pose=head_pose,
                 target_antennas=target,
                 start_antennas=(float(antennas[0]), float(antennas[1])),

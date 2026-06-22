@@ -77,6 +77,11 @@ function renderWakeStatus(st) {
     text.textContent =
       "Conversation window open: audio is streaming to OpenAI. " +
       "Say 'go to sleep' or stay quiet for " + mins + " minutes to close it.";
+  } else if (st.wake_backend === "remote") {
+    chip.textContent = "Asleep \u00b7 Mac wake";
+    chip.className = "chip chip-ok";
+    text.textContent =
+      "Mic audio streams to the Mac Whisper daemon while asleep. Say 'Hey Jarvis' to wake BoBe.";
   } else {
     chip.textContent = "Asleep \u00b7 local only";
     chip.className = "chip chip-ok";
@@ -85,13 +90,76 @@ function renderWakeStatus(st) {
   }
 }
 
+function formatMetric(label, value) {
+  return `<div><span>${label}</span>${value ?? "\u2014"}</div>`;
+}
+
+function renderWakeDebug(st) {
+  const panel = document.getElementById("wake-debug");
+  const chip = document.getElementById("wake-debug-chip");
+  const metrics = document.getElementById("wake-debug-metrics");
+  const logEl = document.getElementById("wake-debug-log");
+  if (!panel || !chip || !metrics || !logEl) return;
+
+  const debug = st.wake_debug || {};
+  const remote = debug.remote_stats || {};
+  const showPanel = st.wake_enabled && (st.wake_backend === "remote" || debug.backend === "remote");
+  show(panel, showPanel);
+  if (!showPanel) return;
+
+  const connected = Boolean(debug.connected);
+  const paused = Boolean(debug.paused);
+  chip.textContent = connected ? (paused ? "Connected \u00b7 paused" : "Connected") : "Disconnected";
+  chip.className = connected ? "chip chip-ok" : "chip";
+
+  const transcript = remote.transcript || debug.transcript_last || "";
+  const rms = remote.rms ?? debug.rms_last ?? 0;
+  const inSpeech = remote.in_speech ? "yes" : "no";
+  const latency = remote.latency_ms_last ?? remote.latency_ms ?? debug.latency_ms_last ?? "\u2014";
+  const engine = debug.daemon_engine || remote.engine || "faster-whisper";
+  const model = remote.model || "\u2014";
+  const url = st.wake_remote_url || debug.url || "\u2014";
+
+  metrics.innerHTML = [
+    formatMetric("Daemon URL", url),
+    formatMetric("Engine", `${engine} / ${model}`),
+    formatMetric("Transcript", transcript || "\u2014"),
+    formatMetric("Mic RMS", Number(rms).toFixed ? Number(rms).toFixed(1) : rms),
+    formatMetric("In speech", inSpeech),
+    formatMetric("Whisper latency (ms)", latency),
+  ].join("");
+
+  const events = Array.isArray(debug.events) ? debug.events : [];
+  if (events.length === 0) {
+    logEl.textContent = connected
+      ? "Waiting for Whisper stats from the Mac daemon..."
+      : "Not connected to the Mac wake daemon yet.";
+    return;
+  }
+
+  logEl.innerHTML = events
+    .slice(-20)
+    .map((entry) => {
+      const level = entry.level || "info";
+      const time = entry.ts ? new Date(entry.ts * 1000).toLocaleTimeString() : "";
+      const msg = entry.message || "";
+      return `<span class="log-${level}">[${time}] ${msg}</span>`;
+    })
+    .join("\n");
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
 function startWakeStatusPolling() {
   const poll = async () => {
     try {
       const url = new URL("/status", window.location.origin);
       url.searchParams.set("_", Date.now().toString());
       const resp = await fetchWithTimeout(url, {}, 2000);
-      if (resp.ok) renderWakeStatus(await resp.json());
+      if (resp.ok) {
+        const st = await resp.json();
+        renderWakeStatus(st);
+        renderWakeDebug(st);
+      }
     } catch (e) {}
   };
   poll();

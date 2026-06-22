@@ -51,6 +51,9 @@ class RemoteWakeClient:
         self._thread: threading.Thread | None = None
         self._stats_lock = threading.Lock()
         self._recent_stats: deque[tuple[float, float, str]] = deque()
+        self._event_log: deque[dict[str, float | int | str | bool]] = deque(maxlen=40)
+        self._remote_stats: dict[str, float | int | str | bool] = {}
+        self._daemon_engine = ""
         self._connected = False
         self._last_transcript = ""
 
@@ -97,12 +100,15 @@ class RemoteWakeClient:
         self._paused = False
         self._control_queue.put("resume")
 
-    def debug_state(self) -> dict[str, float | int | str | bool]:
+    def debug_state(self) -> dict[str, float | int | str | bool | list[dict[str, float | int | str | bool]] | dict[str, float | int | str | bool]]:
         now = time.monotonic()
         with self._stats_lock:
             while self._recent_stats and now - self._recent_stats[0][0] > DEBUG_WINDOW_SECONDS:
                 self._recent_stats.popleft()
             entries = list(self._recent_stats)
+            events = list(self._event_log)
+            remote_stats = dict(self._remote_stats)
+            daemon_engine = self._daemon_engine
         rms_values = [rms for _, rms, _ in entries]
         return {
             "backend": "remote",
@@ -116,7 +122,41 @@ class RemoteWakeClient:
             "connected": self._connected,
             "paused": self._paused,
             "thread_alive": self.is_running(),
+            "daemon_engine": daemon_engine,
+            "remote_stats": remote_stats,
+            "events": events[-20:],
         }
+
+    def _log_event(self, level: str, message: str, **fields: float | int | str | bool) -> None:
+        entry: dict[str, float | int | str | bool] = {
+            "ts": round(time.time(), 3),
+            "level": level,
+            "message": message,
+        }
+        entry.update(fields)
+        with self._stats_lock:
+            self._event_log.append(entry)
+
+    def _apply_remote_stats(self, payload: dict[str, Any]) -> None:
+        stats: dict[str, float | int | str | bool] = {}
+        for key in (
+            "transcript",
+            "partial",
+            "rms",
+            "in_speech",
+            "paused",
+            "latency_ms",
+            "latency_ms_last",
+            "engine",
+            "model",
+        ):
+            if key in payload and payload[key] is not None:
+                stats[key] = payload[key]  # type: ignore[assignment]
+        transcript = str(payload.get("transcript") or payload.get("partial") or "")
+        with self._stats_lock:
+            self._remote_stats.update(stats)
+            if transcript:
+                self._last_transcript = transcript
 
     def _record_stats(self, rms: float, transcript: str) -> None:
         now = time.monotonic()
@@ -148,11 +188,13 @@ class RemoteWakeClient:
                     self._connected = True
                     backoff = RECONNECT_BASE_S
                     logger.info("Remote wake client connected to %s", self._url)
+                    self._log_event("info", f"Connected to {self._url}")
                     await self._session(ws)
             except Exception as exc:
                 self._connected = False
                 if self._stop_event.is_set():
                     break
+                self._log_event("warn", f"Connection failed: {exc}")
                 logger.warning("Remote wake connection failed (%s); retrying in %.1fs", exc, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2.0, RECONNECT_MAX_S)
@@ -179,8 +221,10 @@ class RemoteWakeClient:
                     break
                 if control == "pause":
                     await ws.send(json.dumps(pause_message()))
+                    self._log_event("info", "Stream paused (BoBe awake)")
                 elif control == "resume":
                     await ws.send(json.dumps(resume_message()))
+                    self._log_event("info", "Stream resumed (BoBe asleep)")
 
             try:
                 frame = await loop.run_in_executor(
@@ -216,21 +260,30 @@ class RemoteWakeClient:
                 continue
             msg_type = payload.get("type")
             if msg_type == "ready":
+                engine = str(payload.get("engine") or "")
+                phrase = str(payload.get("phrase") or WAKE_PHRASE)
+                with self._stats_lock:
+                    self._daemon_engine = engine
+                self._log_event("info", f"Daemon ready ({engine})", phrase=phrase)
                 logger.info(
                     "Remote wake daemon ready (engine=%r, phrase=%r)",
                     payload.get("engine"),
                     payload.get("phrase"),
                 )
             elif msg_type == "stats":
-                transcript = str(payload.get("transcript") or payload.get("partial") or "")
-                if transcript:
-                    self._last_transcript = transcript
+                self._apply_remote_stats(payload)
             elif msg_type == "wake":
                 transcript = str(payload.get("transcript") or "")
-                self._last_transcript = transcript
+                latency_ms = payload.get("latency_ms")
+                self._apply_remote_stats(payload)
+                self._log_event(
+                    "wake",
+                    f"Wake detected: {transcript!r}",
+                    latency_ms=float(latency_ms) if latency_ms is not None else 0.0,
+                )
                 logger.info(
                     "Remote wake word detected (transcript=%r, latency_ms=%s)",
                     transcript,
-                    payload.get("latency_ms"),
+                    latency_ms,
                 )
                 self._on_wake()

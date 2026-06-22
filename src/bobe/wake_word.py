@@ -37,6 +37,8 @@ DEFAULT_OPENWAKEWORD_THRESHOLD = 0.28
 DEFAULT_WAKE_GAIN = 1.75  # digital boost for the quiet robot mic (detector path only)
 DEFAULT_WAKE_TIMEOUT_S = 300.0
 DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")
+# Common ASR mis-hearings for the English sleep phrase.
+_SLEEP_PHRASE_ASR_VARIANTS = ("got to sleep",)
 DEFAULT_BUFFER_SECONDS = 3.0
 DEFAULT_FLUSH_SECONDS = 1.6
 DEBUG_WINDOW_SECONDS = 10.0
@@ -103,7 +105,9 @@ def is_sleep_phrase(text: str, phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES)
     normalized = " ".join(text.strip().strip(" \t\n\r,.:;!?-").casefold().split())
     if not normalized:
         return False
-    return any(phrase.casefold() in normalized for phrase in phrases if phrase.strip())
+    if any(phrase.casefold() in normalized for phrase in phrases if phrase.strip()):
+        return True
+    return any(variant in normalized for variant in _SLEEP_PHRASE_ASR_VARIANTS)
 
 
 class AudioRingBuffer:

@@ -356,6 +356,33 @@ async def test_partial_transcript_sleep_phrase_closes_session() -> None:
     assert not handler.wake_session.awake
 
 
+@pytest.mark.asyncio
+async def test_sleep_phrase_detected_from_latest_partial_on_speech_stopped() -> None:
+    """Sleep can trigger from the last partial when VAD ends before final ASR."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler._latest_user_transcript = "go to sleep"
+    handler.connection = FakeGatingConnection()
+
+    assert await handler._maybe_sleep_from_transcript(handler._latest_user_transcript)
+
+    assert not handler.wake_session.awake
+    assert handler.connection.input_audio_buffer.cleared == 1
+
+
+@pytest.mark.asyncio
+async def test_sleep_phrase_detected_on_response_created_with_latest_partial() -> None:
+    """If server VAD starts a response, cancel sleep when partial already matched."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler._latest_user_transcript = "go to sleep"
+    handler.connection = FakeGatingConnection()
+
+    assert await handler._maybe_sleep_from_transcript(handler._latest_user_transcript)
+
+    assert not handler.wake_session.awake
+
+
 # ---- Stress test: response.create rejection + retry ----
 
 
@@ -745,3 +772,29 @@ def test_should_accept_server_vad_after_assistant_guard_elapsed() -> None:
     handler._response_done_event.set()
     handler._last_assistant_audio_at = time.monotonic() - rt_mod._ASSISTANT_VAD_GUARD_S - 0.1
     assert handler._should_ignore_server_vad() is False
+
+
+def test_sleep_cue_translates_head_on_y_axis() -> None:
+    """Going to sleep lowers the head ~3 cm on world Y; waking restores it."""
+    from reachy_mini.utils import create_head_pose
+
+    neutral = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True, mm=True)
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = neutral
+    robot.get_current_joint_positions.return_value = ((0.0,), (0.2, -0.2))
+
+    movement_manager = MagicMock()
+    deps = ToolDependencies(reachy_mini=robot, movement_manager=movement_manager)
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+
+    handler._queue_antenna_cue(awake=False)
+    sleep_move = movement_manager.queue_move.call_args[0][0]
+    assert sleep_move.target_head_pose[1, 3] == pytest.approx(-0.03)
+    assert sleep_move.target_antennas == (0.0, 0.0)
+
+    robot.get_current_head_pose.return_value = sleep_move.target_head_pose
+    movement_manager.reset_mock()
+    handler._queue_antenna_cue(awake=True)
+    wake_move = movement_manager.queue_move.call_args[0][0]
+    assert wake_move.target_head_pose[1, 3] == pytest.approx(0.0)
+    assert wake_move.target_antennas == (-0.5, 0.5)
