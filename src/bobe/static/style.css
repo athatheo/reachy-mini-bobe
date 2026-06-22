@@ -240,6 +240,17 @@ button.ghost:hover { border-color: rgba(94, 240, 193, 0.4); }
 .wake-log .log-wake { color: var(--ok); }
 .wake-log .log-warn { color: var(--warn); }
 .wake-log .log-info { color: var(--muted); }
+.wake-log .log-transcript { color: #d7e7ff; }
+.wake-stream-label {
+  margin: 8px 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.wake-transcript-stream {
+  max-height: 160px;
+}
 
 @media (max-width: 760px) {
   .hero h1 { font-size: 26px; }

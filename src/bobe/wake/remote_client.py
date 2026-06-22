@@ -111,7 +111,9 @@ class RemoteWakeClient:
             events = list(self._event_log)
             remote_stats = dict(self._remote_stats)
             daemon_engine = self._daemon_engine
+            transcript_stream = list(self._transcript_stream)
         rms_values = [rms for _, rms, _ in entries]
+        partial = str(remote_stats.get("partial") or "")
         return {
             "backend": "remote",
             "phrase": WAKE_PHRASE,
@@ -121,8 +123,8 @@ class RemoteWakeClient:
             "rms_peak": round(max(rms_values), 1) if rms_values else 0.0,
             "rms_last": round(rms_values[-1], 1) if rms_values else 0.0,
             "transcript_last": self._last_transcript,
-            "transcript_partial": self._remote_stats.get("partial", ""),
-            "transcript_stream": list(self._transcript_stream)[-12:],
+            "transcript_partial": partial,
+            "transcript_stream": transcript_stream[-12:],
             "connected": self._connected,
             "paused": self._paused,
             "thread_alive": self.is_running(),
