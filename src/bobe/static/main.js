@@ -145,25 +145,31 @@ function renderWakeDebug(st) {
     formatMetric("Whisper latency (ms)", latency),
   ].join("");
 
-  const stream = Array.isArray(debug.transcript_stream) ? debug.transcript_stream : [];
-  if (partial) {
-    streamEl.textContent = stream
-      .map((entry) => {
-        const text = entry.text || "";
-        return text ? `[final] ${text}` : "";
-      })
-      .filter(Boolean)
-      .concat(partial ? [`[live] ${partial}`] : [])
-      .join("\n");
-  } else if (stream.length === 0) {
-    streamEl.textContent = connected
-      ? "Listening... partial Whisper text will appear here while you speak."
-      : "Connect to the Mac wake daemon to see live Whisper transcripts.";
+  const stream = Array.isArray(debug.transcript_display)
+    ? debug.transcript_display
+    : Array.isArray(debug.transcript_stream)
+      ? debug.transcript_stream.map((entry) => {
+          const text = entry.text || "";
+          if (!text) return "";
+          return entry.partial ? `[live] ${text}` : `[final] ${text}`;
+        }).filter(Boolean)
+      : [];
+
+  if (paused && connected) {
+    streamEl.textContent =
+      "Mic stream paused while BoBe is awake. Say \"go to sleep\" to resume Whisper wake logging.";
+  } else if (stream.length > 0) {
+    streamEl.textContent = stream.join("\n");
+  } else if (partial) {
+    streamEl.textContent = `[live] ${partial}`;
+  } else if (transcript) {
+    streamEl.textContent = `[final] ${transcript}`;
+  } else if (remote.in_speech) {
+    streamEl.textContent = "[live] listening…";
   } else {
-    streamEl.textContent = stream
-      .map((entry) => `[final] ${entry.text || ""}`)
-      .filter((line) => line !== "[final] ")
-      .join("\n");
+    streamEl.textContent = connected
+      ? "Listening… speak near the robot while BoBe is asleep."
+      : "Not connected to the Mac wake daemon yet.";
   }
   streamEl.scrollTop = streamEl.scrollHeight;
 
@@ -208,7 +214,7 @@ function startWakeStatusPolling() {
     } catch (e) {}
   };
   poll();
-  setInterval(poll, 2000);
+  setInterval(poll, 1000);
 }
 
 function markError(input, flag) {

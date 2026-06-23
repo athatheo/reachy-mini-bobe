@@ -58,6 +58,7 @@ class RemoteWakeClient:
         self._last_transcript = ""
         self._last_partial_logged = ""
         self._transcript_stream: list[dict[str, float | int | str | bool]] = []
+        self._display_lines: list[str] = []
 
     @property
     def phrase(self) -> str:
@@ -112,6 +113,7 @@ class RemoteWakeClient:
             remote_stats = dict(self._remote_stats)
             daemon_engine = self._daemon_engine
             transcript_stream = list(self._transcript_stream)
+            display_lines = list(self._display_lines)
         rms_values = [rms for _, rms, _ in entries]
         partial = str(remote_stats.get("partial") or "")
         return {
@@ -125,6 +127,7 @@ class RemoteWakeClient:
             "transcript_last": self._last_transcript,
             "transcript_partial": partial,
             "transcript_stream": transcript_stream[-12:],
+            "transcript_display": display_lines[-20:],
             "connected": self._connected,
             "paused": self._paused,
             "thread_alive": self.is_running(),
@@ -167,13 +170,24 @@ class RemoteWakeClient:
                 self._transcript_stream = [entry for entry in stream if isinstance(entry, dict)][-12:]
             if partial:
                 self._last_transcript = partial
-                if partial != self._last_partial_logged:
-                    self._last_partial_logged = partial
-                    self._log_event("transcript", partial, partial=True)
+                line = f"[live] {partial}"
+                if not self._display_lines or self._display_lines[-1] != line:
+                    if self._display_lines and self._display_lines[-1].startswith("[live] "):
+                        self._display_lines[-1] = line
+                    else:
+                        self._display_lines.append(line)
+                    if len(self._display_lines) > 40:
+                        self._display_lines = self._display_lines[-40:]
             elif transcript:
                 self._last_transcript = transcript
+                line = f"[final] {transcript}"
+                if self._display_lines and self._display_lines[-1].startswith("[live] "):
+                    self._display_lines[-1] = line
+                elif not self._display_lines or self._display_lines[-1] != line:
+                    self._display_lines.append(line)
+                    if len(self._display_lines) > 40:
+                        self._display_lines = self._display_lines[-40:]
                 self._last_partial_logged = ""
-                self._log_event("transcript", transcript, partial=False)
 
     def _record_stats(self, rms: float, transcript: str) -> None:
         now = time.monotonic()

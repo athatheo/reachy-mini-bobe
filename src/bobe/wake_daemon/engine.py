@@ -16,7 +16,8 @@ from bobe.wake_daemon.config import WakeDaemonConfig
 logger = logging.getLogger(__name__)
 
 WAKE_SAMPLE_RATE = 16000
-PARTIAL_TRANSCRIBE_INTERVAL_S = 0.7
+PARTIAL_TRANSCRIBE_INTERVAL_S = 0.45
+STATS_PARTIAL_MIN_SAMPLES = int(0.35 * WAKE_SAMPLE_RATE)
 TRANSCRIPT_HISTORY_MAX = 30
 
 
@@ -57,6 +58,35 @@ class WhisperWakeEngine:
         self._in_speech = False
         self._speech_samples.clear()
         self._silence_samples = 0
+        self._partial_transcript = ""
+
+    def _set_partial(self, text: str) -> None:
+        """Track live Whisper text in the rolling stream shown by the UI."""
+        cleaned = text.strip()
+        self._partial_transcript = cleaned
+        if not cleaned:
+            if self._transcript_history and self._transcript_history[-1].get("partial"):
+                self._transcript_history.pop()
+            return
+        entry = {"text": cleaned, "partial": True, "ts": round(time.time(), 3)}
+        if self._transcript_history and self._transcript_history[-1].get("partial"):
+            self._transcript_history[-1] = entry
+        else:
+            self._transcript_history.append(entry)
+
+    def _append_final(self, text: str) -> None:
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        if self._transcript_history and self._transcript_history[-1].get("partial"):
+            self._transcript_history.pop()
+        self._transcript_history.append(
+            {
+                "text": cleaned,
+                "partial": False,
+                "ts": round(time.time(), 3),
+            }
+        )
 
     def debug_state(self) -> dict[str, float | int | str | bool]:
         return {
@@ -95,11 +125,11 @@ class WhisperWakeEngine:
 
         utterance_samples = sum(part.size for part in self._speech_samples)
         min_speech_samples = int(self.config.min_speech_ms * WAKE_SAMPLE_RATE / 1000)
-        if self._in_speech and utterance_samples >= min_speech_samples:
+        if self._in_speech and utterance_samples >= STATS_PARTIAL_MIN_SAMPLES:
             now = time.monotonic()
             if now - self._last_partial_at >= PARTIAL_TRANSCRIBE_INTERVAL_S:
                 partial = self._transcribe(np.concatenate(self._speech_samples))
-                self._partial_transcript = partial
+                self._set_partial(partial)
                 self._last_partial_at = now
 
         if not self._in_speech:
@@ -123,14 +153,7 @@ class WhisperWakeEngine:
         self._last_transcript = transcript
         self._partial_transcript = ""
         self._last_latency_ms = latency_ms
-        if transcript:
-            self._transcript_history.append(
-                {
-                    "text": transcript,
-                    "partial": False,
-                    "ts": round(time.time(), 3),
-                }
-            )
+        self._append_final(transcript)
 
         if not transcript:
             return None
