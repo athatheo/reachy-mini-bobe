@@ -27,7 +27,6 @@ from bobe.claude import DEFAULT_CLAUDE_MODEL
 from bobe.config import LOCKED_PROFILE, config
 from bobe.openai_realtime import OpenaiRealtimeHandler
 from bobe.headless_personality_ui import mount_personality_routes
-from bobe.wake_env import persist_wake_env
 
 
 try:
@@ -235,157 +234,15 @@ class LocalStream:
         return None
 
     def _init_settings_ui_if_needed(self) -> None:
-        """Attach minimal settings UI to the settings app.
-
-        Always mounts the UI when a settings_app is provided so that users
-        see a confirmation message even if the API key is already configured.
-        """
+        """Ensure settings routes are mounted on the Reachy settings app."""
         if self._settings_initialized:
             return
         if self._settings_app is None:
             return
+        from bobe.settings_server import bootstrap_settings_ui, get_settings_server
 
-        static_dir = Path(__file__).parent / "static"
-        index_file = static_dir / "index.html"
-
-        if hasattr(self._settings_app, "mount"):
-            try:
-                # Serve /static/* assets
-                self._settings_app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-            except Exception:
-                pass
-
-        class ApiSettingsPayload(BaseModel):
-            openai_api_key: str
-            anthropic_api_key: str
-            claude_model: str = DEFAULT_CLAUDE_MODEL
-
-        # GET / -> index.html
-        @self._settings_app.get("/")
-        def _root() -> FileResponse:
-            return FileResponse(str(index_file))
-
-        # GET /favicon.ico -> optional, avoid noisy 404s on some browsers
-        @self._settings_app.get("/favicon.ico")
-        def _favicon() -> Response:
-            return Response(status_code=204)
-
-        # GET /status -> required keys plus live wake/streaming state
-        @self._settings_app.get("/status")
-        def _status() -> JSONResponse:
-            openai_key = os.getenv("OPENAI_API_KEY") or str(config.OPENAI_API_KEY or "")
-            anthropic_key = os.getenv("ANTHROPIC_API_KEY") or ""
-            has_openai_key = _is_plausible_openai_key(openai_key)
-            has_anthropic_key = _is_plausible_anthropic_key(anthropic_key)
-
-            wake_config = getattr(self.handler, "wake_config", None)
-            wake_session = getattr(self.handler, "wake_session", None)
-            wake_enabled = wake_config is not None
-            awake = bool(wake_session and wake_session.awake)
-
-            wake_detector = getattr(self.handler, "_wake_detector", None)
-            wake_debug = wake_detector.debug_state() if wake_detector is not None else None
-            wake_remote_url = getattr(wake_config, "remote_url", None) if wake_config else None
-
-            return JSONResponse(
-                {
-                    "has_key": has_openai_key and has_anthropic_key,
-                    "has_openai_key": has_openai_key,
-                    "has_anthropic_key": has_anthropic_key,
-                    "claude_model": os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
-                    "wake_enabled": wake_enabled,
-                    "awake": awake,
-                    "wake_backend": wake_config.backend if wake_config else None,
-                    "wake_model": wake_config.model_name if wake_config else None,
-                    "wake_phrase": getattr(wake_detector, "phrase", None) if wake_detector is not None else None,
-                    "wake_remote_url": wake_remote_url,
-                    "wake_timeout_s": wake_config.timeout_s if wake_config else None,
-                    "wake_debug": wake_debug,
-                    "wake_test_mode": bool(getattr(self.handler, "wake_test_mode", False)),
-                    "wake_test_detections": int(getattr(self.handler, "wake_test_detections", 0)),
-                }
-            )
-
-        class WakeTestPayload(BaseModel):
-            enabled: bool
-
-        class WakeConfigPayload(BaseModel):
-            backend: str = "remote"
-            remote_url: str
-            token: str
-            gain: float = 1.75
-
-        # POST /wake-config -> persist remote wake settings for next restart
-        @self._settings_app.post("/wake-config")
-        def _wake_config(payload: WakeConfigPayload) -> JSONResponse:
-            remote_url = (payload.remote_url or "").strip()
-            token = (payload.token or "").strip()
-            backend = (payload.backend or "remote").strip().lower()
-            if backend != "remote":
-                return JSONResponse({"ok": False, "error": "unsupported_backend"}, status_code=400)
-            if not remote_url.startswith("ws://") and not remote_url.startswith("wss://"):
-                return JSONResponse({"ok": False, "error": "invalid_remote_url"}, status_code=400)
-            if not token:
-                return JSONResponse({"ok": False, "error": "missing_token"}, status_code=400)
-            if self._instance_path is None:
-                return JSONResponse({"ok": False, "error": "missing_instance_path"}, status_code=500)
-            try:
-                env_path = persist_wake_env(
-                    self._instance_path,
-                    backend=backend,
-                    remote_url=remote_url,
-                    token=token,
-                    gain=max(1.0, float(payload.gain)),
-                )
-            except Exception as exc:
-                logger.warning("Failed to persist wake config: %s", exc)
-                return JSONResponse({"ok": False, "error": "persist_failed"}, status_code=500)
-            return JSONResponse({"ok": True, "env_path": str(env_path), "restart_required": True})
-
-        # POST /wake-test -> toggle diagnostic mode (scores recorded, no waking/answers)
-        @self._settings_app.post("/wake-test")
-        def _wake_test(payload: WakeTestPayload) -> JSONResponse:
-            handler = self.handler
-            handler.wake_test_mode = payload.enabled
-            if payload.enabled:
-                handler.wake_test_detections = 0
-                wake_session = getattr(handler, "wake_session", None)
-                if wake_session is not None:
-                    wake_session.sleep()
-            return JSONResponse(
-                {
-                    "wake_test_mode": handler.wake_test_mode,
-                    "wake_test_detections": handler.wake_test_detections,
-                }
-            )
-
-        # GET /ready -> whether backend finished loading tools
-        @self._settings_app.get("/ready")
-        def _ready() -> JSONResponse:
-            try:
-                mod = sys.modules.get("bobe.tools.core_tools")
-                ready = bool(getattr(mod, "_TOOLS_INITIALIZED", False)) if mod else False
-            except Exception:
-                ready = False
-            return JSONResponse({"ready": ready})
-
-        # POST /api_keys -> set/persist explicit user-provided keys
-        @self._settings_app.post("/api_keys")
-        def _set_api_keys(payload: ApiSettingsPayload) -> JSONResponse:
-            openai_key = (payload.openai_api_key or "").strip()
-            anthropic_key = (payload.anthropic_api_key or "").strip()
-            claude_model = (payload.claude_model or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
-            if not _is_plausible_openai_key(openai_key):
-                return JSONResponse({"ok": False, "error": "invalid_openai_api_key"}, status_code=400)
-            if not _is_plausible_anthropic_key(anthropic_key):
-                return JSONResponse({"ok": False, "error": "invalid_anthropic_api_key"}, status_code=400)
-            self._persist_api_settings(
-                openai_api_key=openai_key,
-                anthropic_api_key=anthropic_key,
-                claude_model=claude_model,
-            )
-            return JSONResponse({"ok": True})
-
+        if get_settings_server() is None:
+            bootstrap_settings_ui(self._settings_app, self._instance_path, lambda: self.handler)
         self._settings_initialized = True
 
     def launch(self) -> None:
@@ -399,29 +256,25 @@ class LocalStream:
         # Try to load an existing instance .env first (covers subsequent runs)
         if self._instance_path:
             try:
-                from dotenv import load_dotenv
-
                 from bobe.config import set_custom_profile
+                from bobe.instance import load_instance_env
 
-                env_path = Path(self._instance_path) / ".env"
-                if env_path.exists():
-                    load_dotenv(dotenv_path=str(env_path), override=True)
-                    # Update config with newly loaded values
-                    new_key = os.getenv("OPENAI_API_KEY", "").strip()
-                    if new_key:
+                load_instance_env(self._instance_path)
+                new_key = os.getenv("OPENAI_API_KEY", "").strip()
+                if new_key:
+                    try:
+                        config.OPENAI_API_KEY = new_key
+                    except Exception:
+                        pass
+                if LOCKED_PROFILE is None:
+                    new_profile = os.getenv("REACHY_MINI_CUSTOM_PROFILE")
+                    if new_profile is not None:
                         try:
-                            config.OPENAI_API_KEY = new_key
+                            set_custom_profile(new_profile.strip() or None)
                         except Exception:
                             pass
-                    if LOCKED_PROFILE is None:
-                        new_profile = os.getenv("REACHY_MINI_CUSTOM_PROFILE")
-                        if new_profile is not None:
-                            try:
-                                set_custom_profile(new_profile.strip() or None)
-                            except Exception:
-                                pass  # Best-effort profile update
             except Exception:
-                pass  # Instance .env loading is optional; continue with defaults
+                pass
 
         # Always expose settings UI if a settings app is available.
         self._init_settings_ui_if_needed()

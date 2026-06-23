@@ -189,6 +189,8 @@ function renderWakeDebug(st) {
 }
 
 function startWakeStatusPolling() {
+  const loading = document.getElementById("loading");
+  const loadingText = document.querySelector("#loading p");
   const poll = async () => {
     try {
       const url = new URL("/status", window.location.origin);
@@ -199,6 +201,9 @@ function startWakeStatusPolling() {
         renderWakeStatus(st);
         renderWakeDebug(st);
         renderCredentials(st);
+        if (st.has_key) {
+          show(loading, false);
+        }
       }
     } catch (e) {}
   };
@@ -225,16 +230,20 @@ async function init() {
   show(formPanel, false);
   show(configuredPanel, false);
 
-  const st = (await waitForStatus()) || { has_key: false, claude_model: "claude-sonnet-4-6" };
-  modelInput.value = st.claude_model || "claude-sonnet-4-6";
+  const st = await waitForStatus();
+  modelInput.value = (st && st.claude_model) || "claude-sonnet-4-6";
 
-  if (st.has_key) {
-    show(configuredPanel, true);
-  } else {
-    show(formPanel, true);
+  if (!st) {
+    if (loadingText) loadingText.textContent = "BoBe is still starting…";
+    show(loading, true);
+    show(formPanel, false);
+    show(configuredPanel, false);
+    startWakeStatusPolling();
+    return;
   }
-  renderCredentials(st);
+
   show(loading, false);
+  renderCredentials(st);
   startWakeStatusPolling();
 
   changeKeyBtn.addEventListener("click", () => {

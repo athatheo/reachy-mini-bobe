@@ -15,6 +15,8 @@ from fastrtc import Stream
 from gradio.utils import get_space
 
 from reachy_mini import ReachyMini, ReachyMiniApp
+from bobe.instance import load_instance_env, resolve_instance_path
+from bobe.settings_server import bootstrap_settings_ui
 from bobe.utils import (
     parse_args,
     setup_logger,
@@ -41,6 +43,7 @@ def run(
     app_stop_event: Optional[threading.Event] = None,
     settings_app: Optional[FastAPI] = None,
     instance_path: Optional[str] = None,
+    handler_box: Optional[list] = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
@@ -131,19 +134,18 @@ def run(
 
     if instance_path:
         try:
-            from dotenv import load_dotenv
-
             from bobe.wake_env import merge_packaged_wake_defaults
 
             merge_packaged_wake_defaults(instance_path)
-            env_path = Path(instance_path) / ".env"
-            if env_path.exists():
-                load_dotenv(dotenv_path=str(env_path), override=True)
+            env_path = load_instance_env(instance_path)
+            if env_path is not None:
                 logger.info("Loaded instance configuration from %s", env_path)
         except Exception as exc:
             logger.warning("Could not load instance .env from %s: %s", instance_path, exc)
 
     handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+    if handler_box is not None:
+        handler_box[0] = handler
 
     stream_manager: gr.Blocks | LocalStream | None = None
 
@@ -248,17 +250,18 @@ class Bobe(ReachyMiniApp):  # type: ignore[misc]
         asyncio.set_event_loop(loop)
 
         args, _ = parse_args()
+        instance_path = resolve_instance_path()
+        load_instance_env(instance_path)
+        handler_box: list = [None]
+        bootstrap_settings_ui(self.settings_app, str(instance_path), lambda: handler_box[0])
 
-        # is_wireless = reachy_mini.client.get_status()["wireless_version"]
-        # args.head_tracker = None if is_wireless else "mediapipe"
-
-        instance_path = self._get_instance_path().parent
         run(
             args,
             robot=reachy_mini,
             app_stop_event=stop_event,
             settings_app=self.settings_app,
-            instance_path=instance_path,
+            instance_path=str(instance_path),
+            handler_box=handler_box,
         )
 
 
