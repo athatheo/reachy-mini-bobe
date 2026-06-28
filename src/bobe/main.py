@@ -197,8 +197,6 @@ def run(
     head_wobbler.start()
     if camera_worker:
         camera_worker.start()
-    if vision_manager:
-        vision_manager.start()
 
     def poll_stop_event() -> None:
         """Poll the stop event to allow graceful shutdown."""
@@ -223,8 +221,6 @@ def run(
         head_wobbler.stop()
         if camera_worker:
             camera_worker.stop()
-        if vision_manager:
-            vision_manager.stop()
 
         # Ensure media is explicitly closed before disconnecting
         try:

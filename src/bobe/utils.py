@@ -59,12 +59,12 @@ def handle_vision_stuff(args: argparse.Namespace, current_robot: ReachyMini) -> 
         # Initialize camera worker
         camera_worker = CameraWorker(current_robot, head_tracker)
 
-        # Initialize vision manager only if local vision is requested
+        # Initialize local vision only when requested (--local-vision).
         if args.local_vision:
             try:
-                from bobe.vision.processors import initialize_vision_manager
+                from bobe.vision.processors import initialize_local_vision
 
-                vision_manager = initialize_vision_manager(camera_worker)
+                vision_manager = initialize_local_vision(camera_worker)
             except ImportError as e:
                 raise ImportError(
                     "To use --local-vision, please install the extra dependencies: pip install '.[local_vision]'",

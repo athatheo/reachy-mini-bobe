@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from bobe.wake_env import merge_packaged_wake_defaults, persist_wake_env, upsert_wake_env_lines
+from bobe.wake_env import (
+    default_wake_allowed_hosts,
+    is_wake_remote_host_allowed,
+    merge_packaged_wake_defaults,
+    persist_wake_env,
+    upsert_wake_env_lines,
+    wake_allowed_hosts,
+)
 
 
 def test_upsert_wake_env_lines():
@@ -42,8 +49,32 @@ def test_merge_packaged_wake_defaults(tmp_path: Path, monkeypatch):
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr("bobe.wake_env.Path", lambda *parts: example if parts[-1] == ".env.example" else Path(*parts))
+
+    real_path = Path
+
+    def fake_path(*parts: str) -> Path:
+        if parts and parts[-1] == ".env.example":
+            return example
+        return real_path(*parts)
+
+    monkeypatch.setattr("bobe.wake_env.Path", fake_path)
     changed = merge_packaged_wake_defaults(tmp_path)
     assert changed is True
     env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "BOBE_WAKE_BACKEND=remote" in env
+
+
+def test_default_wake_allowed_hosts_from_packaged_example():
+    hosts = default_wake_allowed_hosts()
+    assert "mac.local" in hosts
+
+
+def test_wake_allowed_hosts_env_override(monkeypatch):
+    monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "Mac.local, robot.local")
+    assert wake_allowed_hosts() == frozenset({"mac.local", "robot.local"})
+
+
+def test_is_wake_remote_host_allowed(monkeypatch):
+    monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "192.168.1.114")
+    assert is_wake_remote_host_allowed("192.168.1.114")
+    assert not is_wake_remote_host_allowed("evil.example")

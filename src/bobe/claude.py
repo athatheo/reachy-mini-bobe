@@ -5,6 +5,8 @@ import os
 from typing import Any, Mapping, Protocol, cast
 from dataclasses import dataclass
 
+from bobe.prompts import get_claude_system_prompt
+
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 1024  # search tool-use blocks count toward output tokens
@@ -49,18 +51,6 @@ def load_claude_settings(env: Mapping[str, str] | None = None) -> ClaudeSettings
     )
 
 
-def build_claude_system_prompt() -> str:
-    """Return BoBe's system prompt for Claude-backed answers."""
-    return (
-        "You are BoBe, a helpful personal assistant speaking through a Reachy Mini robot. "
-        "Answer naturally, briefly, and in first person. Prefer responses that are easy to speak aloud. "
-        "Use the web_search tool when the question needs current information such as weather, news, or prices. "
-        "Only speak English or Greek. Use Greek when the user asks in Greek, otherwise use English. "
-        "When useful, suggest an emotion label such as happy, thinking, curious, sad, or surprised, "
-        "but do not include private implementation details."
-    )
-
-
 def extract_message_text(message: Any) -> str:
     """Extract plain text from an Anthropic message response."""
     parts: list[str] = []
@@ -101,7 +91,7 @@ async def ask_claude(
     request: dict[str, Any] = {
         "model": active_settings.model,
         "max_tokens": active_settings.max_tokens,
-        "system": build_claude_system_prompt(),
+        "system": get_claude_system_prompt(),
         "messages": [{"role": "user", "content": question}],
     }
     if active_settings.web_search:

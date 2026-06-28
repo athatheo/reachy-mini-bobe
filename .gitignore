@@ -58,6 +58,6 @@ cache/
 .Trash-*
 .nfs*
 
-# Heed wake-word training artifacts (exported model ships in src/bobe/wake_models/)
+# Wake-word training artifacts (local experiments only)
 wake_training/
 .heed/

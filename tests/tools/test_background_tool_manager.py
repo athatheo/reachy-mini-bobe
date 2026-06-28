@@ -93,7 +93,6 @@ class TestToolNotification:
         n = ToolNotification(
             id="abc",
             tool_name="my_tool",
-            is_idle_tool_call=False,
             status=ToolState.COMPLETED,
             result={"data": 1},
         )
@@ -111,7 +110,6 @@ class TestBackgroundTool:
         t = BackgroundTool(
             id="123",
             tool_name="weather",
-            is_idle_tool_call=False,
             status=ToolState.RUNNING,
         )
         assert t.tool_id == f"weather-123-{t.started_at}"
@@ -121,7 +119,6 @@ class TestBackgroundTool:
         t = BackgroundTool(
             id="1",
             tool_name="t",
-            is_idle_tool_call=True,
             status=ToolState.COMPLETED,
             result={"x": 1},
             error=None,
@@ -130,7 +127,6 @@ class TestBackgroundTool:
         assert isinstance(n, ToolNotification)
         assert n.id == "1"
         assert n.tool_name == "t"
-        assert n.is_idle_tool_call is True
         assert n.status == ToolState.COMPLETED
         assert n.result == {"x": 1}
 
@@ -180,7 +176,6 @@ class TestStartTool:
         bg = await manager.start_tool(
             call_id="c1",
             tool_call_routine=routine,
-            is_idle_tool_call=False,
         )
         assert bg.tool_name == "greet"
         assert bg.id == "c1"
@@ -197,7 +192,6 @@ class TestStartTool:
         bg = await manager.start_tool(
             call_id="c2",
             tool_call_routine=routine,
-            is_idle_tool_call=True,
             with_progress=True,
         )
         assert bg.progress is not None
@@ -212,7 +206,7 @@ class TestRunToolLifecycle:
     async def test_successful_completion(self, manager: BackgroundToolManager) -> None:
         """Complete a tool and verify result, status, and notification."""
         routine = _make_routine("ok_tool", result={"answer": 42})
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
 
         # Wait for the task to finish
         await asyncio.sleep(0.05)
@@ -230,7 +224,7 @@ class TestRunToolLifecycle:
     async def test_tool_failure(self, manager: BackgroundToolManager) -> None:
         """Mark a tool as FAILED when it raises an exception."""
         routine = _make_routine("bad_tool", error=ValueError("boom"))
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
 
         await asyncio.sleep(0.05)
 
@@ -245,7 +239,7 @@ class TestRunToolLifecycle:
     async def test_tool_cancellation(self, manager: BackgroundToolManager) -> None:
         """Cancel a running tool and verify CANCELLED status."""
         routine = _make_routine("long_tool", delay=10.0)
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
 
         # Give the task a moment to start, then cancel
         await asyncio.sleep(0.02)
@@ -267,7 +261,7 @@ class TestUpdateProgress:
     async def test_update_progress_success(self, manager: BackgroundToolManager) -> None:
         """Update progress value and message on a tracked tool."""
         routine = _make_routine("prog", delay=0.5)
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False, with_progress=True)
+        bg = await manager.start_tool("c1", routine, with_progress=True)
 
         ok = await manager.update_progress(bg.tool_id, 0.5, "half done")
         assert ok is True
@@ -283,7 +277,7 @@ class TestUpdateProgress:
     async def test_update_progress_clamps(self, manager: BackgroundToolManager) -> None:
         """Clamp out-of-range progress values to [0, 1]."""
         routine = _make_routine("prog", delay=0.5)
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False, with_progress=True)
+        bg = await manager.start_tool("c1", routine, with_progress=True)
 
         await manager.update_progress(bg.tool_id, 1.5)
         assert bg.progress is not None
@@ -305,7 +299,7 @@ class TestUpdateProgress:
     async def test_update_progress_no_tracking(self, manager: BackgroundToolManager) -> None:
         """Return False when progress tracking is disabled."""
         routine = _make_routine("fast", delay=0.5)
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False, with_progress=False)
+        bg = await manager.start_tool("c1", routine, with_progress=False)
 
         ok = await manager.update_progress(bg.tool_id, 0.5)
         assert ok is False
@@ -327,7 +321,7 @@ class TestCancelTool:
     async def test_cancel_already_completed(self, manager: BackgroundToolManager) -> None:
         """Return True when cancelling an already-completed tool."""
         routine = _make_routine("done")
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
         await asyncio.sleep(0.05)  # let it finish
         assert bg.status == ToolState.COMPLETED
 
@@ -346,7 +340,7 @@ class TestTimeoutTools:
         manager._max_tool_duration_seconds = 0.01
 
         routine = _make_routine("slow", delay=10.0)
-        await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await manager.start_tool("c1", routine)
 
         # Wait longer than the timeout
         await asyncio.sleep(0.05)
@@ -362,7 +356,7 @@ class TestTimeoutTools:
         manager._max_tool_duration_seconds = 9999
 
         routine = _make_routine("fast", delay=10.0)
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
 
         count = await manager.timeout_tools()
         assert count == 0
@@ -380,7 +374,7 @@ class TestCleanupTools:
         manager._max_tool_memory_seconds = 0.01
 
         routine = _make_routine("old")
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
         await asyncio.sleep(0.05)
         assert bg.status == ToolState.COMPLETED
 
@@ -397,7 +391,7 @@ class TestCleanupTools:
         manager._max_tool_memory_seconds = 9999
 
         routine = _make_routine("recent")
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
         await asyncio.sleep(0.05)
 
         removed = await manager.cleanup_tools()
@@ -410,7 +404,7 @@ class TestCleanupTools:
         manager._max_tool_memory_seconds = 0.0  # immediate expiry
 
         routine = _make_routine("still_going", delay=10.0)
-        bg = await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("c1", routine)
 
         removed = await manager.cleanup_tools()
         assert removed == 0
@@ -428,7 +422,7 @@ class TestGetters:
         assert manager.get_tool("nope") is None
 
         routine = _make_routine("x")
-        bg = await manager.start_tool("1", routine, is_idle_tool_call=False)
+        bg = await manager.start_tool("1", routine)
         assert manager.get_tool(bg.tool_id) is bg
         await asyncio.sleep(0.05)
 
@@ -439,9 +433,9 @@ class TestGetters:
         r2 = _make_routine("b", delay=10.0)
         r3 = _make_routine("c")  # finishes immediately
 
-        bg1 = await manager.start_tool("1", r1, is_idle_tool_call=False)
-        bg2 = await manager.start_tool("2", r2, is_idle_tool_call=False)
-        await manager.start_tool("3", r3, is_idle_tool_call=False)
+        bg1 = await manager.start_tool("1", r1)
+        bg2 = await manager.start_tool("2", r2)
+        await manager.start_tool("3", r3)
         await asyncio.sleep(0.05)  # let r3 finish
 
         running = manager.get_running_tools()
@@ -460,9 +454,9 @@ class TestGetters:
         r1 = _make_routine("first")
         r2 = _make_routine("second")
 
-        await manager.start_tool("1", r1, is_idle_tool_call=False)
+        await manager.start_tool("1", r1)
         await asyncio.sleep(0.02)  # ensure different started_at
-        await manager.start_tool("2", r2, is_idle_tool_call=False)
+        await manager.start_tool("2", r2)
 
         await asyncio.sleep(0.05)
 
@@ -476,7 +470,7 @@ class TestGetters:
         """Respect the limit parameter on get_all_tools."""
         for i in range(5):
             r = _make_routine(f"t{i}")
-            await manager.start_tool(str(i), r, is_idle_tool_call=False)
+            await manager.start_tool(str(i), r)
 
         await asyncio.sleep(0.05)
 
@@ -495,7 +489,7 @@ class TestStartUp:
 
         # Start a tool and let it complete — the listener should invoke the callback
         routine = _make_routine("ping")
-        await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await manager.start_tool("c1", routine)
         await asyncio.sleep(0.1)
 
         assert callback.call_count == 1
@@ -511,7 +505,7 @@ class TestStartUp:
         manager.start_up(tool_callbacks=[cb1, cb2])
 
         routine = _make_routine("multi")
-        await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await manager.start_tool("c1", routine)
         await asyncio.sleep(0.1)
 
         assert cb1.call_count == 1
@@ -525,7 +519,7 @@ class TestNotificationQueue:
     async def test_notifications_queued_on_completion(self, manager: BackgroundToolManager) -> None:
         """Queue a COMPLETED notification with the tool result."""
         routine = _make_routine("notif", result={"v": 1})
-        await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await manager.start_tool("c1", routine)
         await asyncio.sleep(0.05)
 
         n = manager._notification_queue.get_nowait()
@@ -537,7 +531,7 @@ class TestNotificationQueue:
     async def test_notifications_queued_on_failure(self, manager: BackgroundToolManager) -> None:
         """Queue a FAILED notification with the error message."""
         routine = _make_routine("fail", error=RuntimeError("oops"))
-        await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await manager.start_tool("c1", routine)
         await asyncio.sleep(0.05)
 
         n = manager._notification_queue.get_nowait()

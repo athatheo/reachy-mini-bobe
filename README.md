@@ -17,17 +17,17 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 
 ## Current milestone
 
-- Local wake word: say `Hey Jarvis` to wake BoBe (openWakeWord, fully on-device).
+- Remote wake word: say `Hey Jarvis` to wake BoBe (Mac-side Whisper daemon; robot streams PCM while asleep).
 - Voice input/output uses the official Reachy Mini conversation app pipeline.
 - Normal assistant answers are routed through Claude with the `ask_claude` profile tool.
 - Expressive robot responses use the existing Reachy Mini motion tools, including `play_emotion`, `move_head`, and `sweep_look`.
 
 ## Privacy model
 
-- While asleep, microphone audio never leaves the robot: frames go to a local openWakeWord detector and a short in-memory ring buffer that is continuously discarded.
+- While asleep, microphone PCM streams from the robot to a Mac-side wake daemon over WebSocket. A short in-memory ring buffer on the robot is continuously discarded; nothing goes to OpenAI until wake.
 - Saying `Hey Jarvis` opens a streaming window (chime + antennas up). During that window audio streams to OpenAI Realtime for transcription and speech, like any cloud voice assistant.
 - The window closes (chime + antennas relaxed) when you say `go to sleep` (or Greek `κοιμήσου`) or after `BOBE_WAKE_TIMEOUT_S` (default 300s) without session activity.
-- Tune with `BOBE_WAKE_MODEL`, `BOBE_WAKE_THRESHOLD`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_SLEEP_PHRASE`. Wake-word gating is always on: say the wake phrase to stream, `go to sleep` to stop.
+- Tune with `BOBE_WAKE_REMOTE_URL`, `BOBE_WAKE_TOKEN`, `BOBE_WAKE_GAIN`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_SLEEP_PHRASE`. Wake-word gating is always on: say the wake phrase to stream, `go to sleep` to stop.
 
 Claude Code session launching is intentionally not enabled yet. That needs a later authorization and shell-safety layer before voice commands can start local coding sessions safely.
 
@@ -39,11 +39,55 @@ Copy `.env.example` to `.env` for local development and set the keys you need:
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 CLAUDE_MODEL="claude-sonnet-4-6"
-BOBE_WAKE_BACKEND=heed
-BOBE_WAKE_MODEL="hey_jarvis"
+BOBE_WAKE_BACKEND=remote
+BOBE_WAKE_REMOTE_URL=ws://Mac.local:8765/v1/stream
+BOBE_WAKE_TOKEN=
 ```
 
 The OpenAI key is used by the inherited realtime speech bridge. The Anthropic key is used by BoBe's `ask_claude` tool for Claude-backed answers.
+
+## Remote wake runbook (Mac + robot)
+
+BoBe wake detection runs on a Mac host. The robot streams microphone PCM over WebSocket while asleep; the Mac runs Whisper and sends a wake event when it hears `Hey Jarvis`.
+
+### 1. Mac: start the wake daemon
+
+On the Mac that will listen for the wake phrase (same LAN as the robot):
+
+```bash
+uv sync --extra wake-daemon
+export BOBE_WAKE_TOKEN="$(openssl rand -hex 16)"   # pick a shared secret
+echo "BOBE_WAKE_TOKEN=$BOBE_WAKE_TOKEN" >> .env
+uv run bobe-wake-daemon
+```
+
+Defaults: WebSocket on port **8765**, path `/v1/stream`, Whisper model `base.en`. Optional tuning: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `VAD_*` (see `.env.example`).
+
+Note the Mac hostname or IP (e.g. `Mac.local` or `192.168.1.114`).
+
+### 2. Robot: configure wake settings
+
+Set these in the robot app instance `.env` (Reachy settings UI or instance file):
+
+```env
+BOBE_WAKE_BACKEND=remote
+BOBE_WAKE_REMOTE_URL=ws://Mac.local:8765/v1/stream
+BOBE_WAKE_TOKEN=<same secret as Mac>
+BOBE_WAKE_GAIN=1.75
+```
+
+Restart the BoBe app after saving. The settings page at `/wake-config` can persist the same values when running headless.
+
+### 3. Verify pairing
+
+1. Daemon running on Mac; firewall allows inbound **8765** from the robot.
+2. Start BoBe on the robot; check `/status`: `wake_enabled`, `wake_backend=remote`, `wake_debug.connected=true`.
+3. Say **Hey Jarvis** → chime + antennas up; Realtime session opens.
+4. Say **go to sleep** (or wait for `BOBE_WAKE_TIMEOUT_S`) → session closes.
+
+### 4. Optional: deploy script
+
+If you use the robot apps API, `scripts/deploy_robot_wake.py` can install/update BoBe and push wake env vars in one step (requires robot API on port 8000 and a local `.env` with `BOBE_WAKE_TOKEN`).
 
 ## Development with uv
 

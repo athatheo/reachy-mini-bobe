@@ -11,7 +11,6 @@ file when available.
 """
 
 import os
-import sys
 import time
 import asyncio
 import logging
@@ -23,39 +22,18 @@ from scipy.signal import resample
 
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
-from bobe.claude import DEFAULT_CLAUDE_MODEL
-from bobe.config import LOCKED_PROFILE, config
+from bobe.config import config
+from bobe.env_file import is_plausible_openai_key, is_plausible_anthropic_key
 from bobe.openai_realtime import OpenaiRealtimeHandler
-from bobe.headless_personality_ui import mount_personality_routes
 
 
 try:
-    # FastAPI is provided by the Reachy Mini Apps runtime
-    from fastapi import FastAPI, Response
-    from pydantic import BaseModel
-    from fastapi.responses import FileResponse, JSONResponse
-    from starlette.staticfiles import StaticFiles
+    from fastapi import FastAPI
 except Exception:  # pragma: no cover - only loaded when settings_app is used
     FastAPI = object  # type: ignore
-    FileResponse = object  # type: ignore
-    JSONResponse = object  # type: ignore
-    StaticFiles = object  # type: ignore
-    BaseModel = object  # type: ignore
 
 
 logger = logging.getLogger(__name__)
-
-
-def _is_plausible_openai_key(value: str | None) -> bool:
-    """Return whether a value looks like an OpenAI API key."""
-    key = (value or "").strip()
-    return key.startswith("sk-") and len(key) >= 20
-
-
-def _is_plausible_anthropic_key(value: str | None) -> bool:
-    """Return whether a value looks like an Anthropic API key."""
-    key = (value or "").strip()
-    return key.startswith("sk-ant-") and len(key) >= 20
 
 
 class LocalStream:
@@ -86,152 +64,11 @@ class LocalStream:
         self._asyncio_loop = None
 
     # ---- Settings UI (only when API key is missing) ----
-    def _read_env_lines(self, env_path: Path) -> list[str]:
-        """Load env file contents or a template as a list of lines."""
-        inst = env_path.parent
-        try:
-            if env_path.exists():
-                try:
-                    return env_path.read_text(encoding="utf-8").splitlines()
-                except Exception:
-                    return []
-            template_text = None
-            ex = inst / ".env.example"
-            if ex.exists():
-                try:
-                    template_text = ex.read_text(encoding="utf-8")
-                except Exception:
-                    template_text = None
-            if template_text is None:
-                try:
-                    cwd_example = Path.cwd() / ".env.example"
-                    if cwd_example.exists():
-                        template_text = cwd_example.read_text(encoding="utf-8")
-                except Exception:
-                    template_text = None
-            if template_text is None:
-                packaged = Path(__file__).parent / ".env.example"
-                if packaged.exists():
-                    try:
-                        template_text = packaged.read_text(encoding="utf-8")
-                    except Exception:
-                        template_text = None
-            return template_text.splitlines() if template_text else []
-        except Exception:
-            return []
-
     def _required_api_keys_configured(self) -> bool:
         """Return whether all explicit user-provided keys are configured."""
-        return _is_plausible_openai_key(str(config.OPENAI_API_KEY or "")) and _is_plausible_anthropic_key(
+        return is_plausible_openai_key(str(config.OPENAI_API_KEY or "")) and is_plausible_anthropic_key(
             os.getenv("ANTHROPIC_API_KEY")
         )
-
-    def _persist_api_settings(
-        self,
-        *,
-        openai_api_key: str,
-        anthropic_api_key: str,
-        claude_model: str,
-    ) -> None:
-        """Persist explicit API settings to environment and instance ``.env``."""
-        values = {
-            "OPENAI_API_KEY": openai_api_key.strip(),
-            "ANTHROPIC_API_KEY": anthropic_api_key.strip(),
-            "CLAUDE_MODEL": (claude_model or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL,
-        }
-        if not values["OPENAI_API_KEY"] or not values["ANTHROPIC_API_KEY"]:
-            return
-
-        os.environ.update(values)
-        try:
-            config.OPENAI_API_KEY = values["OPENAI_API_KEY"]
-        except Exception:
-            pass
-
-        if not self._instance_path:
-            return
-
-        try:
-            env_path = Path(self._instance_path) / ".env"
-            lines = self._read_env_lines(env_path)
-            for key, value in values.items():
-                replacement = f"{key}={value}"
-                for index, line in enumerate(lines):
-                    if line.strip().startswith(f"{key}="):
-                        lines[index] = replacement
-                        break
-                else:
-                    lines.append(replacement)
-
-            env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            logger.info("Persisted explicit API settings to %s", env_path)
-
-            try:
-                from dotenv import load_dotenv
-
-                load_dotenv(dotenv_path=str(env_path), override=True)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning("Failed to persist explicit API settings: %s", e)
-
-    def _persist_personality(self, profile: Optional[str]) -> None:
-        """Persist the startup personality to the instance .env and config."""
-        if LOCKED_PROFILE is not None:
-            return
-        selection = (profile or "").strip() or None
-        try:
-            from bobe.config import set_custom_profile
-
-            set_custom_profile(selection)
-        except Exception:
-            pass
-
-        if not self._instance_path:
-            return
-        try:
-            env_path = Path(self._instance_path) / ".env"
-            lines = self._read_env_lines(env_path)
-            replaced = False
-            for i, ln in enumerate(list(lines)):
-                if ln.strip().startswith("REACHY_MINI_CUSTOM_PROFILE="):
-                    if selection:
-                        lines[i] = f"REACHY_MINI_CUSTOM_PROFILE={selection}"
-                    else:
-                        lines.pop(i)
-                    replaced = True
-                    break
-            if selection and not replaced:
-                lines.append(f"REACHY_MINI_CUSTOM_PROFILE={selection}")
-            if selection is None and not env_path.exists():
-                return
-            final_text = "\n".join(lines) + "\n"
-            env_path.write_text(final_text, encoding="utf-8")
-            logger.info("Persisted startup personality to %s", env_path)
-            try:
-                from dotenv import load_dotenv
-
-                load_dotenv(dotenv_path=str(env_path), override=True)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning("Failed to persist REACHY_MINI_CUSTOM_PROFILE: %s", e)
-
-    def _read_persisted_personality(self) -> Optional[str]:
-        """Read persisted startup personality from instance .env (if any)."""
-        if not self._instance_path:
-            return None
-        env_path = Path(self._instance_path) / ".env"
-        try:
-            if env_path.exists():
-                for ln in env_path.read_text(encoding="utf-8").splitlines():
-                    if ln.strip().startswith("REACHY_MINI_CUSTOM_PROFILE="):
-                        _, _, val = ln.partition("=")
-                        v = val.strip()
-                        return v or None
-        except Exception:
-            pass
-        return None
 
     def _init_settings_ui_if_needed(self) -> None:
         """Ensure settings routes are mounted on the Reachy settings app."""
@@ -239,7 +76,7 @@ class LocalStream:
             return
         if self._settings_app is None:
             return
-        from bobe.settings_server import bootstrap_settings_ui, get_settings_server
+        from bobe.settings_server import get_settings_server, bootstrap_settings_ui
 
         if get_settings_server() is None:
             bootstrap_settings_ui(self._settings_app, self._instance_path, lambda: self.handler)
@@ -256,7 +93,6 @@ class LocalStream:
         # Try to load an existing instance .env first (covers subsequent runs)
         if self._instance_path:
             try:
-                from bobe.config import set_custom_profile
                 from bobe.instance import load_instance_env
 
                 load_instance_env(self._instance_path)
@@ -266,13 +102,6 @@ class LocalStream:
                         config.OPENAI_API_KEY = new_key
                     except Exception:
                         pass
-                if LOCKED_PROFILE is None:
-                    new_profile = os.getenv("REACHY_MINI_CUSTOM_PROFILE")
-                    if new_profile is not None:
-                        try:
-                            set_custom_profile(new_profile.strip() or None)
-                        except Exception:
-                            pass
             except Exception:
                 pass
 
@@ -295,21 +124,7 @@ class LocalStream:
         time.sleep(1)  # give some time to the pipelines to start
 
         async def runner() -> None:
-            # Capture loop for cross-thread personality actions
-            loop = asyncio.get_running_loop()
-            self._asyncio_loop = loop  # type: ignore[assignment]
-            # Mount personality routes now that loop and handler are available
-            try:
-                if self._settings_app is not None:
-                    mount_personality_routes(
-                        self._settings_app,
-                        self.handler,
-                        lambda: self._asyncio_loop,
-                        persist_personality=self._persist_personality,
-                        get_persisted_personality=self._read_persisted_personality,
-                    )
-            except Exception:
-                pass
+            self._asyncio_loop = asyncio.get_running_loop()  # type: ignore[assignment]
             self._tasks = [
                 asyncio.create_task(self.handler.start_up(), name="openai-handler"),
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),

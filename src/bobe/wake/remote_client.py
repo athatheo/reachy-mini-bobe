@@ -1,26 +1,27 @@
 """Remote wake-word client that streams PCM to a Mac-side daemon."""
 
-from __future__ import annotations
+# ruff: noqa: D102,D107
 
-import asyncio
+from __future__ import annotations
 import json
-import logging
-import queue
-import threading
 import time
-from collections import deque
+import queue
+import asyncio
+import logging
+import threading
 from typing import Any
+from collections import deque
 
 import numpy as np
 from numpy.typing import NDArray
 
-from bobe.wake.phrases import WAKE_PHRASE
-from bobe.wake.protocol import hello_message, pause_message, resume_message
+from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, WAKE_PHRASE, matches_sleep_phrase, matches_wake_phrase
+from bobe.wake.protocol import hello_message, listen_message
+from bobe.wake.constants import WAKE_SAMPLE_RATE
 
 
 logger = logging.getLogger(__name__)
 
-WAKE_SAMPLE_RATE = 16000
 DEBUG_WINDOW_SECONDS = 10.0
 
 RECONNECT_BASE_S = 0.5
@@ -38,16 +39,20 @@ class RemoteWakeClient:
         token: str | None = None,
         gain: float = 1.0,
         sample_rate: int = WAKE_SAMPLE_RATE,
+        on_sleep: Any | None = None,
+        sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
     ) -> None:
         self._on_wake = on_wake
+        self._on_sleep = on_sleep
+        self._sleep_phrases = sleep_phrases
         self._url = url
         self._token = (token or "").strip() or None
         self._gain = gain
         self._sample_rate = sample_rate
         self._audio_queue: queue.Queue[NDArray[np.int16] | None] = queue.Queue(maxsize=128)
-        self._control_queue: queue.Queue[str] = queue.Queue(maxsize=8)
+        self._control_queue: queue.Queue[tuple[str, dict[str, object]]] = queue.Queue(maxsize=8)
         self._stop_event = threading.Event()
-        self._paused = False
+        self._listen_mode = "wake"
         self._thread: threading.Thread | None = None
         self._stats_lock = threading.Lock()
         self._recent_stats: deque[tuple[float, float, str]] = deque()
@@ -56,7 +61,6 @@ class RemoteWakeClient:
         self._daemon_engine = ""
         self._connected = False
         self._last_transcript = ""
-        self._last_partial_logged = ""
         self._transcript_stream: list[dict[str, float | int | str | bool]] = []
         self._display_lines: list[str] = []
 
@@ -69,8 +73,9 @@ class RemoteWakeClient:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        if self.is_running():
             return
+        self._thread = None
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, name="remote-wake-client", daemon=True)
         self._thread.start()
@@ -81,27 +86,44 @@ class RemoteWakeClient:
             self._audio_queue.put_nowait(None)
         except queue.Full:
             pass
-        if self._thread is not None:
-            self._thread.join(timeout=3.0)
-            self._thread = None
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=3.0)
+            if not thread.is_alive():
+                self._thread = None
+            else:
+                logger.warning("Remote wake client thread did not stop within timeout")
 
     def feed(self, frame: NDArray[np.int16]) -> None:
-        if self._paused:
-            return
         try:
             self._audio_queue.put_nowait(frame.reshape(-1).astype(np.int16, copy=False))
         except queue.Full:
             pass
 
+    def listen_for_sleep(self) -> None:
+        """Listen for sleep phrases while BoBe is awake."""
+        self._listen_mode = "sleep"
+        self._queue_listen_mode("sleep")
+
+    def listen_for_wake(self) -> None:
+        """Listen for wake phrases while BoBe is asleep."""
+        self._listen_mode = "wake"
+        self._queue_listen_mode("wake")
+
     def pause(self) -> None:
-        """Pause upstream streaming while BoBe is awake."""
-        self._paused = True
-        self._control_queue.put("pause")
+        """Legacy alias for listen_for_sleep()."""
+        self.listen_for_sleep()
 
     def resume(self) -> None:
-        """Resume upstream streaming after BoBe goes back to sleep."""
-        self._paused = False
-        self._control_queue.put("resume")
+        """Legacy alias for listen_for_wake()."""
+        self.listen_for_wake()
+
+    def _queue_listen_mode(self, mode: str) -> None:
+        payload = listen_message(mode=mode, sleep_phrases=self._sleep_phrases if mode == "sleep" else None)
+        try:
+            self._control_queue.put_nowait((mode, payload))
+        except queue.Full:
+            pass
 
     def debug_state(self) -> dict[str, float | int | str | bool | list[dict[str, float | int | str | bool]] | dict[str, float | int | str | bool]]:
         now = time.monotonic()
@@ -129,7 +151,8 @@ class RemoteWakeClient:
             "transcript_stream": transcript_stream[-12:],
             "transcript_display": display_lines[-20:],
             "connected": self._connected,
-            "paused": self._paused,
+            "listen_mode": self._listen_mode,
+            "paused": self._listen_mode == "sleep",
             "thread_alive": self.is_running(),
             "daemon_engine": daemon_engine,
             "remote_stats": remote_stats,
@@ -187,7 +210,6 @@ class RemoteWakeClient:
                     self._display_lines.append(line)
                     if len(self._display_lines) > 40:
                         self._display_lines = self._display_lines[-40:]
-                self._last_partial_logged = ""
 
     def _record_stats(self, rms: float, transcript: str) -> None:
         now = time.monotonic()
@@ -247,15 +269,14 @@ class RemoteWakeClient:
         while not self._stop_event.is_set():
             while True:
                 try:
-                    control = self._control_queue.get_nowait()
+                    _mode, payload = self._control_queue.get_nowait()
                 except queue.Empty:
                     break
-                if control == "pause":
-                    await ws.send(json.dumps(pause_message()))
-                    self._log_event("info", "Stream paused (BoBe awake)")
-                elif control == "resume":
-                    await ws.send(json.dumps(resume_message()))
-                    self._log_event("info", "Stream resumed (BoBe asleep)")
+                await ws.send(json.dumps(payload))
+                if _mode == "sleep":
+                    self._log_event("info", "Listening for sleep phrases (BoBe awake)")
+                else:
+                    self._log_event("info", "Listening for wake phrase (BoBe asleep)")
 
             try:
                 frame = await loop.run_in_executor(
@@ -267,8 +288,6 @@ class RemoteWakeClient:
                 continue
             if frame is None or self._stop_event.is_set():
                 break
-            if self._paused:
-                continue
             if self._gain != 1.0:
                 boosted = np.clip(frame.astype(np.int32) * self._gain, -32768, 32767).astype(np.int16)
             else:
@@ -276,6 +295,61 @@ class RemoteWakeClient:
             rms = float(np.sqrt(np.mean(boosted.astype(np.float64) ** 2)))
             self._record_stats(rms, self._last_transcript)
             await ws.send(boosted.tobytes())
+
+    def _handle_wake_payload(self, payload: dict[str, Any]) -> None:
+        transcript = str(payload.get("transcript") or "")
+        latency_ms = payload.get("latency_ms")
+        self._apply_remote_stats(payload)
+        if not matches_wake_phrase(transcript, phrase=self.phrase):
+            self._log_event(
+                "warn",
+                f"Ignored wake without phrase match: {transcript!r}",
+                latency_ms=float(latency_ms) if latency_ms is not None else 0.0,
+            )
+            logger.warning(
+                "Ignored remote wake event without phrase match (transcript=%r)",
+                transcript,
+            )
+            return
+        self._log_event(
+            "wake",
+            f"Wake detected: {transcript!r}",
+            latency_ms=float(latency_ms) if latency_ms is not None else 0.0,
+        )
+        logger.info(
+            "Remote wake word detected (transcript=%r, latency_ms=%s)",
+            transcript,
+            latency_ms,
+        )
+        self._on_wake()
+
+    def _handle_sleep_payload(self, payload: dict[str, Any]) -> None:
+        transcript = str(payload.get("transcript") or "")
+        latency_ms = payload.get("latency_ms")
+        self._apply_remote_stats(payload)
+        if not matches_sleep_phrase(transcript, self._sleep_phrases):
+            self._log_event(
+                "warn",
+                f"Ignored sleep without phrase match: {transcript!r}",
+                latency_ms=float(latency_ms) if latency_ms is not None else 0.0,
+            )
+            logger.warning(
+                "Ignored remote sleep event without phrase match (transcript=%r)",
+                transcript,
+            )
+            return
+        self._log_event(
+            "sleep",
+            f"Sleep detected: {transcript!r}",
+            latency_ms=float(latency_ms) if latency_ms is not None else 0.0,
+        )
+        logger.info(
+            "Remote sleep phrase detected (transcript=%r, latency_ms=%s)",
+            transcript,
+            latency_ms,
+        )
+        if self._on_sleep is not None:
+            self._on_sleep()
 
     async def _recv_loop(self, ws: Any) -> None:
         async for message in ws:
@@ -304,17 +378,6 @@ class RemoteWakeClient:
             elif msg_type == "stats":
                 self._apply_remote_stats(payload)
             elif msg_type == "wake":
-                transcript = str(payload.get("transcript") or "")
-                latency_ms = payload.get("latency_ms")
-                self._apply_remote_stats(payload)
-                self._log_event(
-                    "wake",
-                    f"Wake detected: {transcript!r}",
-                    latency_ms=float(latency_ms) if latency_ms is not None else 0.0,
-                )
-                logger.info(
-                    "Remote wake word detected (transcript=%r, latency_ms=%s)",
-                    transcript,
-                    latency_ms,
-                )
-                self._on_wake()
+                self._handle_wake_payload(payload)
+            elif msg_type == "sleep":
+                self._handle_sleep_payload(payload)

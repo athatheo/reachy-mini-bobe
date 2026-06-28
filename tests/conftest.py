@@ -24,7 +24,7 @@ os.environ.pop("REACHY_MINI_EXTERNAL_TOOLS_DIRECTORY", None)
 
 @pytest.fixture(autouse=True)
 def _stub_wake_detector_unless_real(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
-    """Avoid spinning up ONNX/openWakeWord detectors in handler tests."""
+    """Avoid spinning up ONNX wake detectors in handler tests."""
     if request.node.get_closest_marker("wake_detector"):
         return
     monkeypatch.setattr("bobe.openai_realtime.create_wake_detector", lambda *args, **kwargs: None)

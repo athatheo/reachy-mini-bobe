@@ -16,3 +16,4 @@ src/bobe/.env
 *.log
 tmp/
 .heed/
+src/bobe/wake_models/

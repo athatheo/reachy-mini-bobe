@@ -16,9 +16,10 @@ class AskClaude(Tool):
 
     name = "ask_claude"
     description = (
-        "Ask Claude online for a concise answer to the user's question. "
-        "Claude can search the web, so use this for anything needing current information "
-        "such as weather, news, or prices, as well as normal BoBe assistant answers."
+        "Required before answering any user question or informational request. "
+        "Ask Claude online for a concise answer; Claude can search the web for current "
+        "information such as weather, news, or prices. Never answer factual questions "
+        "from your own knowledge without calling this tool first."
     )
     parameters_schema = {
         "type": "object",

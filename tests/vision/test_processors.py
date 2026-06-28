@@ -8,17 +8,16 @@ import numpy as np
 import pytest
 
 from bobe.vision.processors import (
+    LocalVision,
     VisionConfig,
-    VisionManager,
     VisionProcessor,
-    initialize_vision_manager,
+    initialize_local_vision,
 )
 
 
 def test_vision_config_defaults() -> None:
     """Test VisionConfig has sensible defaults."""
     config = VisionConfig()
-    assert config.vision_interval == 5.0
     assert config.max_new_tokens == 64
     assert config.jpeg_quality == 85
     assert config.max_retries == 3
@@ -30,7 +29,6 @@ def test_vision_config_custom_values() -> None:
     """Test VisionConfig accepts custom values."""
     config = VisionConfig(
         model_path="/custom/path",
-        vision_interval=10.0,
         max_new_tokens=128,
         jpeg_quality=95,
         max_retries=5,
@@ -38,7 +36,6 @@ def test_vision_config_custom_values() -> None:
         device_preference="cpu",
     )
     assert config.model_path == "/custom/path"
-    assert config.vision_interval == 10.0
     assert config.max_new_tokens == 128
     assert config.jpeg_quality == 95
     assert config.max_retries == 5
@@ -275,125 +272,8 @@ def mock_camera() -> Mock:
     return camera
 
 
-def test_vision_manager_initialization(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager initializes successfully."""
-    config = VisionConfig(vision_interval=2.0)
-    manager = VisionManager(mock_camera, config)
-
-    assert manager.vision_interval == 2.0
-    assert manager.processor._initialized
-
-
-def test_vision_manager_initialization_failure(mock_torch: Any, mock_camera: Mock) -> None:
-    """Test VisionManager raises error when processor initialization fails."""
-    with patch("bobe.vision.processors.AutoProcessor") as mock_proc:
-        mock_proc.from_pretrained.side_effect = Exception("Model not found")
-
-        with pytest.raises(RuntimeError, match="Vision processor initialization failed"):
-            VisionManager(mock_camera, VisionConfig())
-
-
-def test_vision_manager_start_stop(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager can start and stop."""
-    manager = VisionManager(mock_camera, VisionConfig())
-
-    manager.start()
-    assert manager._thread is not None
-    assert manager._thread.is_alive()
-    assert not manager._stop_event.is_set()
-
-    time.sleep(0.1)  # Let thread run briefly
-
-    manager.stop()
-    assert manager._stop_event.is_set()
-    assert not manager._thread.is_alive()
-
-
-def test_vision_manager_processes_frames(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager processes frames at intervals."""
-    with patch("bobe.vision.processors.cv2") as mock_cv2:
-        mock_cv2.imencode.return_value = (True, np.array([1, 2, 3], dtype=np.uint8))
-        mock_cv2.IMWRITE_JPEG_QUALITY = 1
-
-        config = VisionConfig(vision_interval=0.1)  # Fast interval for testing
-        manager = VisionManager(mock_camera, config)
-
-        manager.start()
-        time.sleep(0.3)  # Wait for at least 2 processing cycles
-        manager.stop()
-
-        # Camera should have been called at least once
-        assert mock_camera.get_latest_frame.call_count >= 1
-
-
-def test_vision_manager_handles_none_frame(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager handles None frame gracefully."""
-    mock_camera.get_latest_frame.return_value = None
-
-    config = VisionConfig(vision_interval=0.1)
-    manager = VisionManager(mock_camera, config)
-
-    manager.start()
-    time.sleep(0.2)
-    manager.stop()
-
-    # Verify camera was called but no crashes occurred
-    assert mock_camera.get_latest_frame.called
-
-
-def test_vision_manager_handles_processing_error(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager handles processing errors gracefully."""
-    with patch("bobe.vision.processors.cv2") as mock_cv2:
-        mock_cv2.imencode.side_effect = Exception("Processing error")
-        mock_cv2.IMWRITE_JPEG_QUALITY = 1
-
-        config = VisionConfig(vision_interval=0.1)
-        manager = VisionManager(mock_camera, config)
-
-        manager.start()
-        time.sleep(0.2)
-        manager.stop()
-
-        # Verify thread stopped gracefully despite errors
-        assert manager._stop_event.is_set()
-
-
-def test_vision_manager_get_status(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager get_status returns correct information."""
-    manager = VisionManager(mock_camera, VisionConfig(vision_interval=5.0))
-
-    status = manager.get_status()
-
-    assert "last_processed" in status
-    assert "processor_info" in status
-    assert "config" in status
-    assert status["config"]["interval"] == 5.0
-
-
-def test_vision_manager_skips_invalid_responses(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager doesn't update timestamp for invalid responses."""
-    with patch("bobe.vision.processors.cv2") as mock_cv2:
-        mock_cv2.imencode.return_value = (True, np.array([1, 2, 3], dtype=np.uint8))
-        mock_cv2.IMWRITE_JPEG_QUALITY = 1
-
-        # Make processor return invalid response
-        config = VisionConfig(vision_interval=0.1)
-        manager = VisionManager(mock_camera, config)
-
-        # Mock the processor's process_image method to return invalid response
-        with patch.object(manager.processor, 'process_image', return_value="Vision model not initialized"):
-            initial_time = manager._last_processed_time
-
-            manager.start()
-            time.sleep(0.2)
-            manager.stop()
-
-            # Last processed time should not have been updated
-            assert manager._last_processed_time == initial_time
-
-
-def test_initialize_vision_manager_success(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test initialize_vision_manager creates VisionManager successfully."""
+def test_initialize_local_vision_success(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
+    """Test initialize_local_vision creates LocalVision successfully."""
     with patch("bobe.vision.processors.snapshot_download") as mock_download, \
          patch("bobe.vision.processors.os.makedirs"), \
          patch("bobe.vision.processors.config") as mock_config:
@@ -401,15 +281,16 @@ def test_initialize_vision_manager_success(mock_torch: Any, mock_transformers: A
         mock_config.LOCAL_VISION_MODEL = "test/model"
         mock_config.HF_HOME = "/tmp/hf_cache"
 
-        result = initialize_vision_manager(mock_camera)
+        result = initialize_local_vision(mock_camera)
 
         assert result is not None
-        assert isinstance(result, VisionManager)
+        assert isinstance(result, LocalVision)
+        assert result.processor._initialized
         mock_download.assert_called_once()
 
 
-def test_initialize_vision_manager_download_failure(mock_torch: Any, mock_camera: Mock) -> None:
-    """Test initialize_vision_manager handles download failure."""
+def test_initialize_local_vision_download_failure(mock_torch: Any, mock_camera: Mock) -> None:
+    """Test initialize_local_vision handles download failure."""
     with patch("bobe.vision.processors.snapshot_download") as mock_download, \
          patch("bobe.vision.processors.os.makedirs"), \
          patch("bobe.vision.processors.config") as mock_config:
@@ -418,13 +299,13 @@ def test_initialize_vision_manager_download_failure(mock_torch: Any, mock_camera
         mock_config.HF_HOME = "/tmp/hf_cache"
         mock_download.side_effect = Exception("Network error")
 
-        result = initialize_vision_manager(mock_camera)
+        result = initialize_local_vision(mock_camera)
 
         assert result is None
 
 
-def test_initialize_vision_manager_processor_failure(mock_torch: Any, mock_camera: Mock) -> None:
-    """Test initialize_vision_manager handles processor initialization failure."""
+def test_initialize_local_vision_processor_failure(mock_torch: Any, mock_camera: Mock) -> None:
+    """Test initialize_local_vision handles processor initialization failure."""
     with patch("bobe.vision.processors.snapshot_download"), \
          patch("bobe.vision.processors.os.makedirs"), \
          patch("bobe.vision.processors.config") as mock_config, \
@@ -434,7 +315,7 @@ def test_initialize_vision_manager_processor_failure(mock_torch: Any, mock_camer
         mock_config.HF_HOME = "/tmp/hf_cache"
         mock_proc.from_pretrained.side_effect = Exception("Model load error")
 
-        result = initialize_vision_manager(mock_camera)
+        result = initialize_local_vision(mock_camera)
 
         assert result is None
 
@@ -477,22 +358,3 @@ def test_vision_processor_cache_cleanup_mps(mock_torch: Any, mock_transformers: 
         # Should call mps empty_cache
         mock_torch.mps.empty_cache.assert_called()
 
-
-def test_vision_manager_thread_safety(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
-    """Test VisionManager thread safety with multiple start/stop cycles."""
-    with patch("bobe.vision.processors.cv2") as mock_cv2:
-        mock_cv2.imencode.return_value = (True, np.array([1, 2, 3], dtype=np.uint8))
-        mock_cv2.IMWRITE_JPEG_QUALITY = 1
-
-        config = VisionConfig(vision_interval=0.05)
-        manager = VisionManager(mock_camera, config)
-
-        # Multiple start/stop cycles
-        for _ in range(3):
-            manager.start()
-            time.sleep(0.1)
-            manager.stop()
-            time.sleep(0.05)
-
-        # Should not crash or leave dangling threads
-        assert manager._stop_event.is_set()

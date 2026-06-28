@@ -3,7 +3,7 @@ import sys
 import logging
 from pathlib import Path
 
-from bobe.config import DEFAULT_PROFILES_DIRECTORY, config
+from bobe.config import LOCKED_PROFILE, DEFAULT_PROFILES_DIRECTORY, config
 
 
 logger = logging.getLogger(__name__)
@@ -24,9 +24,7 @@ def _expand_prompt_includes(content: str) -> str:
         Expanded content with placeholders replaced by file contents
 
     """
-    # Pattern to match [<name>] where name is a valid file stem (alphanumeric, underscores, hyphens)
-    # pattern = re.compile(r'^\[([a-zA-Z0-9_-]+)\]$')
-    # Allow slashes for subdirectories
+    # Allow slashes for subdirectories in template names.
     pattern = re.compile(r'^\[([a-zA-Z0-9/_-]+)\]$')
 
     lines = content.split('\n')
@@ -89,6 +87,32 @@ def get_session_instructions() -> str:
     except Exception as e:
         logger.error(f"Failed to load instructions from profile '{profile}': {e}")
         sys.exit(1)
+
+
+REALTIME_LOCKED_ROUTING_SUFFIX = (
+    "\n\nStrict routing:\n"
+    "- Do not answer factual, informational, or assistant questions from your own knowledge.\n"
+    "- Always call ask_claude first for those requests and speak from its answer.\n"
+    "- Never invent facts, numbers, dates, or current events without ask_claude.\n"
+    "- You may still handle wake/sleep acknowledgments and brief tool-start phrases yourself."
+)
+
+
+def _read_prompt_file(name: str) -> str:
+    return (PROMPTS_LIBRARY_DIRECTORY / name).read_text(encoding="utf-8").strip()
+
+
+def get_claude_system_prompt() -> str:
+    """Return Claude's system prompt from shared BoBe prompt fragments."""
+    return f"{_read_prompt_file('bobe_core.txt')}\n\n{_read_prompt_file('claude_task.txt')}"
+
+
+def get_realtime_session_instructions() -> str:
+    """Return Realtime session instructions, including locked-profile routing rules."""
+    instructions = get_session_instructions()
+    if LOCKED_PROFILE:
+        instructions += REALTIME_LOCKED_ROUTING_SUFFIX
+    return instructions
 
 
 def get_session_voice(default: str = "cedar") -> str:

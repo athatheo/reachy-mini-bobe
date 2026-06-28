@@ -1,47 +1,38 @@
-"""Local wake-word detection and session gating for BoBe.
+"""Wake-word session gating for BoBe.
 
-While asleep, microphone audio stays on the robot: frames are fed to a local
-wake-word model (Heed by default) and a short ring buffer, and nothing is sent
-upstream. After the wake phrase is detected, audio streams to the realtime
-backend until the inactivity timeout or the sleep phrase puts BoBe back to sleep.
+While asleep, microphone audio stays on the robot and is streamed to the Mac
+wake daemon (Whisper), which listens for the wake phrase. Nothing is sent to
+OpenAI until wake. After wake, audio streams to the realtime backend and the
+daemon switches to sleep-phrase detection until timeout, local sleep, or the
+OpenAI transcript fallback.
 """
 
 from __future__ import annotations
+
 import os
 import time
-import queue
 import logging
 import threading
 from typing import Mapping, Callable
-from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
 
-from bobe.heed_wake import HeedWakeWordDetector, default_heed_model_dir
+from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake.remote_client import RemoteWakeClient
 
 
 logger = logging.getLogger(__name__)
 
-
-WAKE_SAMPLE_RATE = 16000
-DETECTOR_FRAME_SAMPLES = 1280  # 80 ms at 16 kHz, openWakeWord's native frame size
-
-DEFAULT_WAKE_BACKEND = "heed"
-DEFAULT_WAKE_MODEL = "hey_jarvis"
-DEFAULT_WAKE_THRESHOLD: float | None = None  # None => model default (Heed) or openWakeWord fallback
-DEFAULT_OPENWAKEWORD_THRESHOLD = 0.28
-DEFAULT_WAKE_GAIN = 1.75  # digital boost for the quiet robot mic (detector path only)
+DEFAULT_WAKE_BACKEND = "remote"
+DEFAULT_WAKE_GAIN = 1.75
 DEFAULT_WAKE_TIMEOUT_S = 300.0
-DEFAULT_SLEEP_PHRASES = ("go to sleep", "κοιμήσου")
-# Common ASR mis-hearings for the English sleep phrase.
-_SLEEP_PHRASE_ASR_VARIANTS = ("got to sleep",)
+from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_sleep_phrase
 DEFAULT_BUFFER_SECONDS = 3.0
 DEFAULT_FLUSH_SECONDS = 1.6
-DEBUG_WINDOW_SECONDS = 10.0
+_DEPRECATED_BACKENDS = frozenset({"heed", "openwakeword"})
 
 
 @dataclass(frozen=True)
@@ -49,24 +40,11 @@ class WakeConfig:
     """Environment-driven configuration for wake-word gating."""
 
     backend: str = DEFAULT_WAKE_BACKEND
-    model_name: str = DEFAULT_WAKE_MODEL
-    model_dir: str | None = None
-    threshold: float | None = DEFAULT_WAKE_THRESHOLD
     gain: float = DEFAULT_WAKE_GAIN
     timeout_s: float = DEFAULT_WAKE_TIMEOUT_S
     sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES
     remote_url: str | None = None
     remote_token: str | None = None
-
-
-def _optional_float(source: Mapping[str, str], name: str) -> float | None:
-    raw = source.get(name)
-    if raw is None or str(raw).strip() == "":
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
 
 
 def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
@@ -85,13 +63,9 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
         sleep_phrases.insert(0, custom_phrase)
 
     backend = (source.get("BOBE_WAKE_BACKEND") or DEFAULT_WAKE_BACKEND).strip().lower()
-    model_dir = (source.get("BOBE_WAKE_MODEL_DIR") or "").strip() or None
 
     return WakeConfig(
         backend=backend,
-        model_name=(source.get("BOBE_WAKE_MODEL") or DEFAULT_WAKE_MODEL).strip() or DEFAULT_WAKE_MODEL,
-        model_dir=model_dir,
-        threshold=_optional_float(source, "BOBE_WAKE_THRESHOLD"),
         gain=max(1.0, _float("BOBE_WAKE_GAIN", DEFAULT_WAKE_GAIN)),
         timeout_s=max(1.0, _float("BOBE_WAKE_TIMEOUT_S", DEFAULT_WAKE_TIMEOUT_S)),
         sleep_phrases=tuple(sleep_phrases),
@@ -102,12 +76,7 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
 
 def is_sleep_phrase(text: str, phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES) -> bool:
     """Return whether a transcript asks BoBe to go back to sleep."""
-    normalized = " ".join(text.strip().strip(" \t\n\r,.:;!?-").casefold().split())
-    if not normalized:
-        return False
-    if any(phrase.casefold() in normalized for phrase in phrases if phrase.strip()):
-        return True
-    return any(variant in normalized for variant in _SLEEP_PHRASE_ASR_VARIANTS)
+    return matches_sleep_phrase(text, phrases)
 
 
 class AudioRingBuffer:
@@ -160,6 +129,7 @@ class WakeSession:
         self._awake = False
         self._last_activity = clock()
         self._wake_requested = False
+        self._sleep_requested = False
 
     @property
     def awake(self) -> bool:
@@ -179,6 +149,18 @@ class WakeSession:
             self._wake_requested = False
             return requested
 
+    def request_sleep(self) -> None:
+        """Flag a sleep request from the detector thread."""
+        with self._lock:
+            self._sleep_requested = True
+
+    def consume_sleep_request(self) -> bool:
+        """Return True once per pending sleep request while awake."""
+        with self._lock:
+            requested = self._sleep_requested and self._awake
+            self._sleep_requested = False
+            return requested
+
     def wake(self) -> None:
         """Enter the awake state and reset the inactivity timer."""
         with self._lock:
@@ -190,6 +172,7 @@ class WakeSession:
         with self._lock:
             self._awake = False
             self._wake_requested = False
+            self._sleep_requested = False
 
     def touch(self) -> None:
         """Record session activity, resetting the inactivity timer."""
@@ -202,195 +185,41 @@ class WakeSession:
             return self._awake and (self._clock() - self._last_activity) >= self._timeout_s
 
 
-class WakeWordDetector:
-    """Background thread running openWakeWord on locally buffered mic frames."""
+WakeDetector = RemoteWakeClient
 
-    def __init__(
-        self,
-        on_wake: Callable[[], None],
-        *,
-        model_name: str = DEFAULT_WAKE_MODEL,
-        threshold: float | None = DEFAULT_OPENWAKEWORD_THRESHOLD,
-        gain: float = DEFAULT_WAKE_GAIN,
-    ) -> None:
-        """Initialize the detector; the model loads lazily in its own thread."""
-        self._on_wake = on_wake
-        self._model_name = model_name
-        self._threshold = threshold if threshold is not None else DEFAULT_OPENWAKEWORD_THRESHOLD
-        self._gain = gain
-        self._queue: queue.Queue[NDArray[np.int16]] = queue.Queue(maxsize=64)
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        # Rolling (timestamp, score, pre-gain RMS) samples for live diagnostics.
-        self._stats_lock = threading.Lock()
-        self._recent_stats: deque[tuple[float, float, float]] = deque()
 
-    def is_running(self) -> bool:
-        """Return whether the background detection thread is alive."""
-        return self._thread is not None and self._thread.is_alive()
-
-    def start(self) -> None:
-        """Start the detection thread (idempotent)."""
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, name="wake-word-detector", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Stop the detection thread."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-    def feed(self, frame: NDArray[np.int16]) -> None:
-        """Queue a 16kHz mono int16 frame; drops frames when backlogged."""
-        try:
-            self._queue.put_nowait(frame)
-        except queue.Full:
-            pass
-
-    def debug_state(self) -> dict[str, float | int]:
-        """Return peak score and mic level over the last few seconds."""
-        now = time.monotonic()
-        with self._stats_lock:
-            while self._recent_stats and now - self._recent_stats[0][0] > DEBUG_WINDOW_SECONDS:
-                self._recent_stats.popleft()
-            entries = list(self._recent_stats)
-        scores = [score for _, score, _ in entries]
-        levels = [rms for _, _, rms in entries]
-        return {
-            "threshold": self._threshold,
-            "gain": self._gain,
-            "frames_window": len(entries),
-            "score_last": round(scores[-1], 4) if scores else 0.0,
-            "score_peak": round(max(scores), 4) if scores else 0.0,
-            "rms_peak": round(max(levels), 1) if levels else 0.0,
-            "rms_last": round(levels[-1], 1) if levels else 0.0,
-            "thread_alive": self.is_running(),
-        }
-
-    def _record_stats(self, score: float, rms: float) -> None:
-        now = time.monotonic()
-        with self._stats_lock:
-            self._recent_stats.append((now, score, rms))
-            while self._recent_stats and now - self._recent_stats[0][0] > DEBUG_WINDOW_SECONDS:
-                self._recent_stats.popleft()
-
-    def _load_model(self) -> object | None:
-        try:
-            from openwakeword.model import Model
-        except Exception:
-            logger.exception("openwakeword is not available; wake-word detection disabled")
-            return None
-
-        try:
-            model: object = Model(wakeword_models=[self._model_name])
-            return model
-        except Exception:
-            logger.info("Wake model %r missing, downloading openWakeWord models...", self._model_name)
-            try:
-                import openwakeword
-
-                openwakeword.utils.download_models()
-                model = Model(wakeword_models=[self._model_name])
-                return model
-            except Exception:
-                logger.exception("Failed to load wake model %r; wake-word detection disabled", self._model_name)
-                return None
-
-    def _run(self) -> None:
-        model = self._load_model()
-        if model is None:
-            return
-        logger.info(
-            "Wake-word detector listening for %r (threshold=%.2f, gain=%.1fx)",
-            self._model_name,
-            self._threshold,
-            self._gain,
+def wake_detector_error(config: WakeConfig) -> str | None:
+    """Return a user-visible error when wake detection cannot start."""
+    backend = config.backend
+    if backend in _DEPRECATED_BACKENDS:
+        return (
+            f"BOBE_WAKE_BACKEND={backend!r} is no longer supported; "
+            "use remote with BOBE_WAKE_REMOTE_URL"
         )
-
-        pending = np.zeros(0, dtype=np.int16)
-        while not self._stop_event.is_set():
-            try:
-                frame = self._queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            pending = np.concatenate([pending, frame.reshape(-1)])
-            while pending.size >= DETECTOR_FRAME_SAMPLES:
-                chunk = pending[:DETECTOR_FRAME_SAMPLES]
-                pending = pending[DETECTOR_FRAME_SAMPLES:]
-                rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2)))
-                if self._gain != 1.0:
-                    chunk = np.clip(chunk.astype(np.int32) * self._gain, -32768, 32767).astype(np.int16)
-                try:
-                    scores = model.predict(chunk)  # type: ignore[attr-defined]
-                except Exception:
-                    logger.exception("Wake-word inference failed; stopping detector")
-                    return
-                # openWakeWord returns numpy scalars; cast so scores stay JSON-serializable.
-                score = float(max(scores.values())) if scores else 0.0
-                self._record_stats(score, rms)
-                if score >= self._threshold:
-                    logger.info("Wake word detected (score=%.2f)", score)
-                    self._reset_model(model)
-                    pending = np.zeros(0, dtype=np.int16)
-                    self._drain_queue()
-                    self._on_wake()
-                    break
-
-    def _reset_model(self, model: object) -> None:
-        try:
-            model.reset()  # type: ignore[attr-defined]
-        except Exception:
-            logger.debug("Wake model reset unavailable", exc_info=True)
-
-    def _drain_queue(self) -> None:
-        while True:
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                return
-
-
-WakeDetector = WakeWordDetector | HeedWakeWordDetector | RemoteWakeClient
-
-
-def resolve_heed_model_dir(config: WakeConfig) -> Path:
-    """Resolve the Heed export directory from config or bundled defaults."""
-    if config.model_dir:
-        return Path(config.model_dir).expanduser()
-    if config.model_name == DEFAULT_WAKE_MODEL:
-        return default_heed_model_dir()
-    return default_heed_model_dir().parent / config.model_name
-
-
-def create_wake_detector(on_wake: Callable[[], None], config: WakeConfig) -> WakeDetector | None:
-    """Instantiate the configured wake-word backend."""
-    if config.backend == "heed":
-        return HeedWakeWordDetector(
-            on_wake,
-            model_dir=resolve_heed_model_dir(config),
-            threshold=config.threshold,
-            gain=config.gain,
-        )
-    if config.backend == "openwakeword":
-        return WakeWordDetector(
-            on_wake,
-            model_name=config.model_name,
-            threshold=config.threshold,
-            gain=config.gain,
-        )
-    if config.backend == "remote":
+    if backend == "remote":
         if not config.remote_url:
-            logger.error("BOBE_WAKE_REMOTE_URL is required when BOBE_WAKE_BACKEND=remote")
-            return None
-        return RemoteWakeClient(
-            on_wake,
-            url=config.remote_url,
-            token=config.remote_token,
-            gain=config.gain,
-        )
-    logger.error("Unknown wake backend %r; wake-word detection disabled", config.backend)
-    return None
+            return "BOBE_WAKE_REMOTE_URL is required when BOBE_WAKE_BACKEND=remote"
+        return None
+    return f"Unknown wake backend {backend!r}; wake-word detection disabled"
+
+
+def create_wake_detector(
+    on_wake: Callable[[], None],
+    config: WakeConfig,
+    *,
+    on_sleep: Callable[[], None] | None = None,
+) -> WakeDetector | None:
+    """Instantiate the configured wake-word backend."""
+    error = wake_detector_error(config)
+    if error is not None:
+        logger.error(error)
+        return None
+
+    return RemoteWakeClient(
+        on_wake,
+        url=config.remote_url,
+        token=config.remote_token,
+        gain=config.gain,
+        on_sleep=on_sleep,
+        sleep_phrases=config.sleep_phrases,
+    )

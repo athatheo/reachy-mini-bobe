@@ -10,6 +10,7 @@ from bobe.claude import (
     extract_message_text,
     load_claude_settings,
 )
+from bobe.prompts import REALTIME_LOCKED_ROUTING_SUFFIX, get_claude_system_prompt, get_realtime_session_instructions
 
 
 class FakeMessages:
@@ -60,6 +61,33 @@ def test_extract_message_text_handles_objects_and_dicts():
     message = SimpleNamespace(content=[SimpleNamespace(text="Hello "), {"text": "there"}, {"type": "tool_use"}])
 
     assert extract_message_text(message) == "Hello there"
+
+
+def test_get_claude_system_prompt_uses_shared_fragments():
+    prompt = get_claude_system_prompt()
+
+    assert "You are BoBe" in prompt
+    assert "web_search" in prompt
+    assert "English or Greek" in prompt
+    assert "suggest an emotion" not in prompt.lower()
+
+
+def test_get_realtime_session_instructions_adds_locked_routing_suffix(monkeypatch):
+    monkeypatch.setattr("bobe.prompts.LOCKED_PROFILE", "_bobe_locked_profile")
+    monkeypatch.setattr("bobe.prompts.get_session_instructions", lambda: "base instructions")
+
+    instructions = get_realtime_session_instructions()
+
+    assert instructions == f"base instructions{REALTIME_LOCKED_ROUTING_SUFFIX}"
+    assert "ask_claude" in instructions
+    assert "Never invent facts" in instructions
+
+
+def test_get_realtime_session_instructions_skips_suffix_when_unlocked(monkeypatch):
+    monkeypatch.setattr("bobe.prompts.LOCKED_PROFILE", None)
+    monkeypatch.setattr("bobe.prompts.get_session_instructions", lambda: "base instructions")
+
+    assert get_realtime_session_instructions() == "base instructions"
 
 
 @pytest.mark.asyncio

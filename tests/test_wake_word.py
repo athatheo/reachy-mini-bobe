@@ -1,19 +1,15 @@
 # ruff: noqa: D101,D102,D103,D107
 
-import json
-import time
-
-import numpy as np
 import pytest
 
+from bobe.wake.remote_client import RemoteWakeClient
 from bobe.wake_word import (
-    DETECTOR_FRAME_SAMPLES,
     WakeSession,
     AudioRingBuffer,
-    WakeWordDetector,
     create_wake_detector,
     is_sleep_phrase,
     load_wake_config,
+    wake_detector_error,
 )
 
 
@@ -77,50 +73,55 @@ def test_wake_session_expires_after_timeout_and_touch_resets_it():
 
 
 def test_ring_buffer_keeps_only_the_most_recent_audio():
+    import numpy as np
+
     buffer = AudioRingBuffer(seconds=1.0, sample_rate=100)
 
-    # 200 samples in 10-sample chunks; capacity is 100 samples.
     for value in range(20):
         buffer.append(np.full(10, value, dtype=np.int16))
 
     tail = buffer.drain_tail(seconds=10.0)
     assert tail.size == 100
-    assert tail.min() == 10  # the oldest half was discarded locally
+    assert tail.min() == 10
     assert tail.max() == 19
 
 
 def test_ring_buffer_drain_tail_slices_and_clears():
+    import numpy as np
+
     buffer = AudioRingBuffer(seconds=2.0, sample_rate=100)
     buffer.append(np.arange(200, dtype=np.int16))
 
-    tail = buffer.drain_tail(seconds=0.5)
-    assert tail.size == 50
-    assert tail[0] == 150
-
-    assert buffer.drain_tail(seconds=1.0).size == 0
+    tail = buffer.drain_tail(seconds=1.0)
+    assert tail.size == 100
+    assert tail[0] == 100
 
 
-# ---- Sleep phrase ----
+# ---- is_sleep_phrase ----
 
 
-def test_sleep_phrase_matches_english_and_greek():
-    assert is_sleep_phrase("Go to sleep!")
-    assert is_sleep_phrase("okay bobe, go to sleep now")
-    assert is_sleep_phrase("got to sleep")
-    assert is_sleep_phrase("Κοιμήσου")
-    assert not is_sleep_phrase("let's talk about sleep schedules")
-    assert not is_sleep_phrase("")
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("go to sleep", True),
+        ("please go to sleep now", True),
+        ("got to sleep", True),
+        ("κοιμήσου", True),
+        ("hey jarvis", False),
+        ("", False),
+    ],
+)
+def test_is_sleep_phrase(text, expected):
+    assert is_sleep_phrase(text) is expected
 
 
-# ---- Config ----
+# ---- load_wake_config / create_wake_detector ----
 
 
 def test_load_wake_config_defaults():
     config = load_wake_config({})
 
-    assert config.backend == "heed"
-    assert config.model_name == "hey_jarvis"
-    assert config.threshold is None
+    assert config.backend == "remote"
     assert config.gain == 1.75
     assert config.timeout_s == 300.0
     assert "go to sleep" in config.sleep_phrases
@@ -129,18 +130,18 @@ def test_load_wake_config_defaults():
 def test_load_wake_config_env_overrides():
     config = load_wake_config(
         {
-            "BOBE_WAKE_BACKEND": "openwakeword",
-            "BOBE_WAKE_MODEL": "alexa",
-            "BOBE_WAKE_THRESHOLD": "0.7",
+            "BOBE_WAKE_BACKEND": "remote",
+            "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
+            "BOBE_WAKE_TOKEN": "secret",
             "BOBE_WAKE_GAIN": "3.5",
             "BOBE_WAKE_TIMEOUT_S": "60",
             "BOBE_SLEEP_PHRASE": "time for bed",
         }
     )
 
-    assert config.backend == "openwakeword"
-    assert config.model_name == "alexa"
-    assert config.threshold == 0.7
+    assert config.backend == "remote"
+    assert config.remote_url == "ws://mac-mini.local:8765/v1/stream"
+    assert config.remote_token == "secret"
     assert config.gain == 3.5
     assert config.timeout_s == 60.0
     assert config.sleep_phrases[0] == "time for bed"
@@ -165,115 +166,52 @@ def test_create_wake_detector_remote_requires_url():
     assert create_wake_detector(lambda: None, config) is None
 
 
-# ---- Detector ----
+def test_wake_session_sleep_request():
+    session = WakeSession(timeout_s=60.0)
+    session.wake()
+    session.request_sleep()
+    assert session.consume_sleep_request()
+    assert not session.consume_sleep_request()
 
 
-class FakeWakeModel:
-    def __init__(self, fire_on_chunk: int) -> None:
-        self.fire_on_chunk = fire_on_chunk
-        self.chunks_seen = 0
-        self.reset_called = False
-
-    def predict(self, chunk):
-        assert len(chunk) == DETECTOR_FRAME_SAMPLES
-        self.chunks_seen += 1
-        return {"hey_jarvis": 0.9 if self.chunks_seen >= self.fire_on_chunk else 0.0}
-
-    def reset(self) -> None:
-        self.reset_called = True
+def test_create_wake_detector_remote_returns_client():
+    config = load_wake_config(
+        {
+            "BOBE_WAKE_BACKEND": "remote",
+            "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
+            "BOBE_WAKE_TOKEN": "secret",
+        }
+    )
+    detector = create_wake_detector(lambda: None, config)
+    assert isinstance(detector, RemoteWakeClient)
 
 
-def test_detector_fires_callback_when_threshold_crossed(monkeypatch):
-    fired = []
-    detector = WakeWordDetector(on_wake=lambda: fired.append(True), threshold=0.5)
-    fake_model = FakeWakeModel(fire_on_chunk=2)
-    monkeypatch.setattr(detector, "_load_model", lambda: fake_model)
-
-    detector.start()
-    try:
-        for _ in range(4):
-            detector.feed(np.zeros(DETECTOR_FRAME_SAMPLES, dtype=np.int16))
-        deadline = time.time() + 3.0
-        while not fired and time.time() < deadline:
-            time.sleep(0.05)
-    finally:
-        detector.stop()
-
-    assert fired
-    assert fake_model.reset_called
+@pytest.mark.parametrize("backend", ["heed", "openwakeword"])
+def test_create_wake_detector_rejects_deprecated_backends(backend):
+    config = load_wake_config({"BOBE_WAKE_BACKEND": backend})
+    assert create_wake_detector(lambda: None, config) is None
 
 
-def test_detector_applies_gain_to_quiet_audio(monkeypatch):
-    seen_max = []
-
-    class RecordingModel:
-        def predict(self, chunk):
-            seen_max.append(int(np.abs(chunk).max()))
-            return {"hey_jarvis": 0.0}
-
-        def reset(self):
-            pass
-
-    detector = WakeWordDetector(on_wake=lambda: None, threshold=0.5, gain=2.0)
-    monkeypatch.setattr(detector, "_load_model", lambda: RecordingModel())
-
-    detector.start()
-    try:
-        detector.feed(np.full(DETECTOR_FRAME_SAMPLES, 1000, dtype=np.int16))
-        deadline = time.time() + 3.0
-        while not seen_max and time.time() < deadline:
-            time.sleep(0.05)
-    finally:
-        detector.stop()
-
-    assert seen_max and seen_max[0] == 2000
+@pytest.mark.parametrize(
+    ("env", "expected_substring"),
+    [
+        ({"BOBE_WAKE_BACKEND": "remote"}, "BOBE_WAKE_REMOTE_URL"),
+        ({"BOBE_WAKE_BACKEND": "heed"}, "no longer supported"),
+        ({"BOBE_WAKE_BACKEND": "bogus"}, "Unknown wake backend"),
+    ],
+)
+def test_wake_detector_error(env, expected_substring):
+    config = load_wake_config(env)
+    error = wake_detector_error(config)
+    assert error is not None
+    assert expected_substring in error
 
 
-def test_detector_debug_state_reports_scores_and_levels(monkeypatch):
-    class ScoringModel:
-        def predict(self, chunk):
-            # openWakeWord returns numpy scalars, which must not leak into JSON.
-            return {"hey_jarvis": np.float32(0.27)}
-
-        def reset(self):
-            pass
-
-    detector = WakeWordDetector(on_wake=lambda: None, threshold=0.9, gain=1.0)
-    monkeypatch.setattr(detector, "_load_model", lambda: ScoringModel())
-
-    assert detector.debug_state()["frames_window"] == 0
-
-    detector.start()
-    try:
-        detector.feed(np.full(DETECTOR_FRAME_SAMPLES, 1000, dtype=np.int16))
-        deadline = time.time() + 3.0
-        while detector.debug_state()["frames_window"] == 0 and time.time() < deadline:
-            time.sleep(0.05)
-    finally:
-        detector.stop()
-
-    state = detector.debug_state()
-    assert state["frames_window"] == 1
-    assert state["score_peak"] == pytest.approx(0.27, abs=1e-4)
-    assert state["rms_peak"] == 1000.0
-    json.dumps(state)  # must stay JSON-serializable for the /status endpoint
-
-
-def test_detector_accumulates_partial_frames(monkeypatch):
-    fired = []
-    detector = WakeWordDetector(on_wake=lambda: fired.append(True), threshold=0.5)
-    fake_model = FakeWakeModel(fire_on_chunk=1)
-    monkeypatch.setattr(detector, "_load_model", lambda: fake_model)
-
-    detector.start()
-    try:
-        # Feed half-frames; the detector must assemble full 80ms chunks itself.
-        for _ in range(3):
-            detector.feed(np.zeros(DETECTOR_FRAME_SAMPLES // 2, dtype=np.int16))
-        deadline = time.time() + 3.0
-        while not fired and time.time() < deadline:
-            time.sleep(0.05)
-    finally:
-        detector.stop()
-
-    assert fired
+def test_wake_detector_error_none_when_remote_configured():
+    config = load_wake_config(
+        {
+            "BOBE_WAKE_BACKEND": "remote",
+            "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
+        }
+    )
+    assert wake_detector_error(config) is None

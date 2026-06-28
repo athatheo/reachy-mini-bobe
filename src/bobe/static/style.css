@@ -134,6 +134,11 @@ body {
   color: var(--ok);
   border-color: rgba(76, 224, 179, 0.4);
 }
+.chip-warn {
+  background: rgba(255, 181, 71, 0.15);
+  color: var(--warn);
+  border-color: rgba(255, 181, 71, 0.4);
+}
 
 .hidden { display: none; }
 label {
@@ -240,7 +245,6 @@ button.ghost:hover { border-color: rgba(94, 240, 193, 0.4); }
 .wake-log .log-wake { color: var(--ok); }
 .wake-log .log-warn { color: var(--warn); }
 .wake-log .log-info { color: var(--muted); }
-.wake-log .log-transcript { color: #d7e7ff; }
 .wake-stream-label {
   margin: 8px 0 6px;
   color: var(--muted);

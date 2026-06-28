@@ -40,8 +40,11 @@ def _wait_job(robot_host: str, job_id: str, timeout_s: float = 600.0) -> dict:
     while time.time() < deadline:
         last = _request("GET", f"http://{robot_host}:8000/api/apps/job-status/{job_id}")
         status = last.get("status")
-        if status in {"completed", "failed"}:
-            return last
+        if status in {"completed", "failed", "done"}:
+            if status == "failed":
+                return last
+            if status in {"completed", "done"}:
+                return {**last, "status": "completed"}
         time.sleep(5)
     raise TimeoutError(f"job {job_id} did not finish within {timeout_s}s: {last.get('status')}")
 

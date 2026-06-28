@@ -2,7 +2,6 @@ import os
 import time
 import base64
 import logging
-import threading
 from typing import Any, Dict
 from dataclasses import dataclass
 
@@ -50,7 +49,6 @@ class VisionConfig:
     """Configuration for vision processing."""
 
     model_path: str = config.LOCAL_VISION_MODEL
-    vision_interval: float = 5.0
     max_new_tokens: int = 64
     jpeg_quality: int = 85
     max_retries: int = 3
@@ -193,17 +191,18 @@ class VisionProcessor:
 
                 return response.replace(chr(10), " ").strip()
 
-            except torch.cuda.OutOfMemoryError as e:
-                logger.error(f"CUDA OOM on attempt {attempt + 1}: {e}")
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
-                if attempt < self.vision_config.max_retries - 1:
-                    time.sleep(self.vision_config.retry_delay * (attempt + 1))
-                else:
-                    return "GPU out of memory - vision processing failed"
-
             except Exception as e:
-                logger.error(f"Vision processing failed (attempt {attempt + 1}): {e}")
+                if _is_cuda_oom(e):
+                    logger.error("CUDA OOM on attempt %d: %s", attempt + 1, e)
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    if attempt < self.vision_config.max_retries - 1:
+                        time.sleep(self.vision_config.retry_delay * (attempt + 1))
+                    else:
+                        return "GPU out of memory - vision processing failed"
+                    continue
+
+                logger.error("Vision processing failed (attempt %d): %s", attempt + 1, e)
                 if attempt < self.vision_config.max_retries - 1:
                     time.sleep(self.vision_config.retry_delay)
                 else:
@@ -237,128 +236,52 @@ class VisionProcessor:
         }
 
 
-class VisionManager:
-    """Manages periodic vision processing and scene understanding."""
+@dataclass
+class LocalVision:
+    """Lazy-loaded local SmolVLM processor for the camera tool."""
 
-    def __init__(self, camera: Any, vision_config: VisionConfig | None = None):
-        """Initialize vision manager with camera and configuration."""
-        self.camera = camera
-        self.vision_config = vision_config or VisionConfig()
-        self.vision_interval = self.vision_config.vision_interval
-        self.processor = VisionProcessor(self.vision_config)
-
-        self._last_processed_time = 0.0
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-        # Initialize processor
-        if not self.processor.initialize():
-            logger.error("Failed to initialize vision processor")
-            raise RuntimeError("Vision processor initialization failed")
-
-    def start(self) -> None:
-        """Start the vision processing loop in a thread."""
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._working_loop, daemon=True)
-        self._thread.start()
-        logger.info("Local vision processing started")
-
-    def stop(self) -> None:
-        """Stop the vision processing loop."""
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join()
-        logger.info("Local vision processing stopped")
-
-    def _working_loop(self) -> None:
-        """Vision processing loop (runs in separate thread)."""
-        while not self._stop_event.is_set():
-            try:
-                current_time = time.time()
-
-                if current_time - self._last_processed_time >= self.vision_interval:
-                    frame = self.camera.get_latest_frame()
-                    if frame is not None:
-                        description = self.processor.process_image(
-                            frame,
-                            "Briefly describe what you see in one sentence.",
-                        )
-
-                        # Only update if we got a valid response
-                        if description and not description.startswith(("Vision", "Failed", "Error")):
-                            self._last_processed_time = current_time
-                            logger.debug(f"Vision update: {description}")
-                        else:
-                            logger.warning(f"Invalid vision response: {description}")
-
-                time.sleep(1.0)  # Check every second
-
-            except Exception:
-                logger.exception("Vision processing loop error")
-                time.sleep(5.0)  # Longer sleep on error
-
-        logger.info("Vision loop finished")
-
-    def get_status(self) -> Dict[str, Any]:
-        """Get comprehensive status information."""
-        return {
-            "last_processed": self._last_processed_time,
-            "processor_info": self.processor.get_model_info(),
-            "config": {
-                "interval": self.vision_interval,
-            },
-        }
+    processor: VisionProcessor
 
 
-def initialize_vision_manager(camera_worker: Any) -> VisionManager | None:
-    """Initialize vision manager with model download and configuration.
-
-    Args:
-        camera_worker: CameraWorker instance for frame capture
-    Returns:
-        VisionManager instance or None if initialization fails
-
-    """
+def initialize_local_vision(camera_worker: Any) -> LocalVision | None:
+    """Download and initialize the local vision model for on-demand camera tool use."""
+    _ = camera_worker  # retained for call-site compatibility
     try:
         model_id = config.LOCAL_VISION_MODEL
         cache_dir = os.path.expanduser(config.HF_HOME)
 
-        # Prepare cache directory
         os.makedirs(cache_dir, exist_ok=True)
         os.environ["HF_HOME"] = cache_dir
         logger.info("HF_HOME set to %s", cache_dir)
 
-        # Download model to cache
-        logger.info(f"Downloading vision model {model_id} to cache...")
+        logger.info("Downloading vision model %s to cache...", model_id)
         snapshot_download(
             repo_id=model_id,
             repo_type="model",
             cache_dir=cache_dir,
         )
-        logger.info(f"Model {model_id} downloaded to {cache_dir}")
+        logger.info("Model %s downloaded to %s", model_id, cache_dir)
 
-        # Configure vision processing
         vision_config = VisionConfig(
             model_path=model_id,
-            vision_interval=5.0,
             max_new_tokens=64,
             jpeg_quality=85,
             max_retries=3,
             retry_delay=1.0,
             device_preference="auto",
         )
+        processor = VisionProcessor(vision_config)
+        if not processor.initialize():
+            return None
 
-        # Initialize vision manager
-        vision_manager = VisionManager(camera_worker, vision_config)
-
-        # Log device info
-        device_info = vision_manager.processor.get_model_info()
+        device_info = processor.get_model_info()
         logger.info(
-            f"Vision processing enabled: {device_info.get('model_path')} on {device_info.get('device')}",
+            "Local vision enabled: %s on %s",
+            device_info.get("model_path"),
+            device_info.get("device"),
         )
-
-        return vision_manager
+        return LocalVision(processor=processor)
 
     except Exception as e:
-        logger.error(f"Failed to initialize vision manager: {e}")
+        logger.error("Failed to initialize local vision: %s", e)
         return None

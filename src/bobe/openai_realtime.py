@@ -1,6 +1,6 @@
 import json
-import uuid
 import time
+import uuid
 import base64
 import random
 import asyncio
@@ -18,7 +18,7 @@ from scipy.signal import resample
 from websockets.exceptions import ConnectionClosedError
 
 from bobe.config import config
-from bobe.prompts import get_session_voice, get_session_instructions
+from bobe.prompts import get_session_voice, get_realtime_session_instructions
 from bobe.wake_word import (
     WAKE_SAMPLE_RATE,
     DEFAULT_FLUSH_SECONDS,
@@ -27,6 +27,7 @@ from bobe.wake_word import (
     is_sleep_phrase,
     load_wake_config,
     create_wake_detector,
+    wake_detector_error,
 )
 from bobe.tools.core_tools import (
     ToolDependencies,
@@ -56,6 +57,50 @@ _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
 _ASSISTANT_VAD_GUARD_S: Final[float] = 0.4
 # World-frame head translation applied when falling asleep (millimeters, vertical).
 _SLEEP_HEAD_Z_OFFSET_MM: Final[float] = 30.0
+
+
+class RealtimeSessionError(Exception):
+    """Retryable failure while establishing or updating a realtime session."""
+
+
+class PartialTranscriptDebouncer:
+    """Debounce partial ASR transcripts before emitting them to the UI."""
+
+    # ruff: noqa: D102, D107
+
+    def __init__(
+        self,
+        output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]",
+        delay: float = 0.5,
+    ) -> None:
+        self._output_queue = output_queue
+        self._delay = delay
+        self._task: asyncio.Task[None] | None = None
+        self._sequence = 0
+
+    async def cancel(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def schedule(self, transcript: str) -> None:
+        await self.cancel()
+        self._sequence += 1
+        sequence = self._sequence
+        self._task = asyncio.create_task(self._emit(transcript, sequence))
+
+    async def _emit(self, transcript: str, sequence: int) -> None:
+        try:
+            await asyncio.sleep(self._delay)
+            if self._sequence == sequence:
+                await self._output_queue.put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
+                logger.debug(f"Debounced partial emitted: {transcript}")
+        except asyncio.CancelledError:
+            logger.debug("Debounced partial cancelled")
+            raise
 
 
 def _compute_response_cost(usage: Any) -> float:
@@ -103,13 +148,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._key_source: Literal["env", "textbox"] = "env"
         self._provided_api_key: str | None = None
 
-        # Debouncing for partial transcripts
-        self.partial_transcript_task: asyncio.Task[None] | None = None
-        self.partial_transcript_sequence: int = 0  # sequence counter to prevent stale emissions
-        self.partial_debounce_delay = 0.5  # seconds
+        self._partial_debouncer = PartialTranscriptDebouncer(self.output_queue)
 
-        # Internal lifecycle flags
-        self._shutdown_requested: bool = False
         self._connected_event: asyncio.Event = asyncio.Event()
 
         # Background tool manager
@@ -126,7 +166,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._response_done_event.set()
         self._last_response_rejected: bool = False
         self._last_assistant_audio_at: float = 0.0
+        self._last_reconnect_attempt_at: float = 0.0
         self._latest_user_transcript: str = ""
+        self._sleep_pending: bool = False
+        self._realtime_session_task: asyncio.Task[None] | None = None
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         self.wake_config = load_wake_config()
@@ -138,7 +181,25 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._wake_detector = create_wake_detector(
             on_wake=self.wake_session.request_wake,
             config=self.wake_config,
+            on_sleep=self.wake_session.request_sleep,
         )
+        self.wake_gating_enabled = self._wake_detector is not None
+        if self.wake_gating_enabled:
+            self.wake_error = None
+        else:
+            self.wake_error = wake_detector_error(self.wake_config) or "Wake-word detector unavailable"
+            logger.error("Wake-word gating disabled: %s", self.wake_error)
+            # Fallback: without a detector, stay in an always-on session so mic + replies work.
+            self.wake_session.wake()
+            logger.warning(
+                "Wake-word detection unavailable; running in always-on mode until wake is configured"
+            )
+
+    def _session_accepts_responses(self) -> bool:
+        """Return whether assistant responses should play (wake gating or always-on fallback)."""
+        if not self.wake_gating_enabled:
+            return not self._sleep_pending
+        return self.wake_session.awake and not self._sleep_pending
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -170,7 +231,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             )
 
             try:
-                instructions = get_session_instructions()
+                instructions = get_realtime_session_instructions()
                 voice = get_session_voice()
             except BaseException as e:  # catch SystemExit from prompt loader without crashing
                 logger.error("Failed to resolve personality content: %s", e)
@@ -207,18 +268,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.error("Error applying personality '%s': %s", profile, e)
             return f"Failed to apply personality: {e}"
 
-    async def _emit_debounced_partial(self, transcript: str, sequence: int) -> None:
-        """Emit partial transcript after debounce delay."""
-        try:
-            await asyncio.sleep(self.partial_debounce_delay)
-            # Only emit if this is still the latest partial (by sequence number)
-            if self.partial_transcript_sequence == sequence:
-                await self.output_queue.put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
-                logger.debug(f"Debounced partial emitted: {transcript}")
-        except asyncio.CancelledError:
-            logger.debug("Debounced partial cancelled")
-            raise
-
     async def start_up(self) -> None:
         """Start the handler with minimal retries on unexpected websocket closure."""
         openai_api_key = config.OPENAI_API_KEY
@@ -249,11 +298,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
-                await self._run_realtime_session()
+                self._realtime_session_task = asyncio.create_task(
+                    self._run_realtime_session(),
+                    name="openai-realtime-session",
+                )
+                await self._realtime_session_task
                 # Normal exit from the session, stop retrying
                 return
-            except ConnectionClosedError as e:
-                # Abrupt close (e.g., "no close frame received or sent") → retry
+            except (ConnectionClosedError, RealtimeSessionError) as e:
+                # Abrupt close or session setup failure → retry
                 logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
                 if attempt < max_attempts:
                     # exponential backoff with jitter
@@ -272,31 +325,90 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 except Exception:
                     pass
 
+    async def _ensure_openai_connection(self, timeout: float = 5.0) -> bool:
+        """Wait for an active Realtime connection, restarting the session if needed."""
+        if self.connection is not None:
+            return True
+        if getattr(self, "client", None) is None:
+            logger.warning("OpenAI client not initialized; cannot connect")
+            return False
+
+        try:
+            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        if self.connection is not None:
+            return True
+
+        logger.warning("No OpenAI Realtime connection; restarting session")
+        await self._restart_session()
+        if self.connection is not None:
+            return True
+
+        try:
+            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.error("OpenAI Realtime connection unavailable after restart")
+            return False
+        return self.connection is not None
+
+    async def _await_or_cancel_session_task(self, *, timeout: float = 2.0) -> None:
+        """Wait for the current session task to finish, or cancel it if it stalls."""
+        task = self._realtime_session_task
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Cancelling stale realtime session task after timeout")
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _invalidate_realtime_connection(self) -> None:
+        """Drop the active connection so the session task can exit and restart."""
+        conn = self.connection
+        self.connection = None
+        try:
+            self._connected_event.clear()
+        except Exception:
+            pass
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+        await self._await_or_cancel_session_task()
+
     async def _restart_session(self) -> None:
         """Force-close the current session and start a fresh one in background.
 
         Does not block the caller while the new session is establishing.
         """
         try:
-            if self.connection is not None:
-                try:
-                    await self.connection.close()
-                except Exception:
-                    pass
-                finally:
-                    self.connection = None
+            await self._invalidate_realtime_connection()
 
             # Ensure we have a client (start_up must have run once)
             if getattr(self, "client", None) is None:
                 logger.warning("Cannot restart: OpenAI client not initialized yet.")
                 return
 
-            # Fire-and-forget new session and wait briefly for connection
-            try:
-                self._connected_event.clear()
-            except Exception:
-                pass
-            asyncio.create_task(self._run_realtime_session(), name="openai-realtime-restart")
+            if self._realtime_session_task is not None and not self._realtime_session_task.done():
+                try:
+                    await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
+                    logger.info("Realtime session reconnected by existing task.")
+                except asyncio.TimeoutError:
+                    logger.warning("Existing realtime session task did not reconnect in time.")
+                    await self._await_or_cancel_session_task()
+                if self.connection is not None:
+                    return
+
+            self._realtime_session_task = asyncio.create_task(
+                self._run_realtime_session(),
+                name="openai-realtime-restart",
+            )
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
                 logger.info("Realtime session restarted and connected.")
@@ -472,12 +584,34 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self._response_done_event.set()
 
 
+    def _transcript_requests_sleep(self, transcript: str | None) -> bool:
+        """Return True when a transcript contains a configured sleep phrase."""
+        return bool(
+            transcript
+            and is_sleep_phrase(transcript, self.wake_config.sleep_phrases),
+        )
+
+    async def _preempt_sleep_response(self) -> None:
+        """Cancel an in-flight or imminent server VAD response for a sleep command."""
+        self._sleep_pending = True
+        if not self.connection:
+            return
+        try:
+            await self.connection.response.cancel()
+        except Exception:
+            pass
+        try:
+            await self.connection.input_audio_buffer.clear()
+        except Exception:
+            pass
+
     async def _maybe_sleep_from_transcript(self, transcript: str | None) -> bool:
         """Return True after transitioning to sleep on a sleep phrase."""
-        if not self.wake_session.awake:
+        if self.wake_gating_enabled and not self.wake_session.awake:
             return False
-        if not transcript or not is_sleep_phrase(transcript, self.wake_config.sleep_phrases):
+        if not self._transcript_requests_sleep(transcript):
             return False
+        await self._preempt_sleep_response()
         await self._transition_to_sleep("sleep phrase")
         return True
 
@@ -485,22 +619,26 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Track the latest user transcript for early sleep detection."""
         if transcript:
             self._latest_user_transcript = transcript
+            if (
+                self.wake_session.awake
+                and self._transcript_requests_sleep(transcript)
+            ):
+                self._sleep_pending = True
 
     async def _handle_completed_user_transcript(self, transcript: str) -> None:
         """Record a completed user transcript and watch for the sleep phrase.
 
         Responses are created automatically by server VAD; creating another one
-        here would answer the same question twice.
+        here would answer the same question twice. Local Whisper sleep detection
+        is primary; this path is a fallback when the daemon misses the phrase.
         """
-        if not self.wake_session.awake:
+        if self.wake_gating_enabled and not self.wake_session.awake:
             logger.debug("Ignoring transcript while asleep: %r", transcript)
             return
 
-        if await self._maybe_sleep_from_transcript(transcript):
-            await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
-            return
-
         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
+        if await self._maybe_sleep_from_transcript(transcript):
+            return
         self.wake_session.touch()
 
     async def _run_realtime_session(self) -> None:
@@ -510,7 +648,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 await conn.session.update(
                     session={
                         "type": "realtime",
-                        "instructions": get_session_instructions(),
+                        "instructions": get_realtime_session_instructions(),
                         "audio": {
                             "input": {
                                 "format": {
@@ -544,8 +682,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 # Persist the key to a newly created .env (copied from .env.example) if needed.
                 self._persist_api_key_if_needed()
             except Exception:
-                logger.exception("Realtime session.update failed; aborting startup")
-                return
+                logger.exception("Realtime session.update failed; retrying session")
+                raise RealtimeSessionError("session.update failed")
 
             logger.info("Realtime session updated successfully")
 
@@ -574,6 +712,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             logger.debug("Ignoring speech_started during assistant output")
                         else:
                             self._latest_user_transcript = ""
+                            self._sleep_pending = False
                             if hasattr(self, "_clear_queue") and callable(self._clear_queue):
                                 self._clear_queue()
                             if self.deps.head_wobbler is not None:
@@ -598,7 +737,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         logger.debug("response completed")
 
                     if event.type == "response.created":
-                        if await self._maybe_sleep_from_transcript(self._latest_user_transcript):
+                        if (
+                            not self._session_accepts_responses()
+                            or await self._maybe_sleep_from_transcript(self._latest_user_transcript)
+                        ):
+                            if self.connection:
+                                try:
+                                    await self.connection.response.cancel()
+                                except Exception:
+                                    pass
                             continue
                         self._response_done_event.clear()
                         logger.debug("Response created (active)")
@@ -620,55 +767,39 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     # Handle partial transcription (user speaking in real-time)
                     if event.type == "conversation.item.input_audio_transcription.partial":
                         logger.debug(f"User partial transcript: {event.transcript}")
-                        self._record_user_transcript(getattr(event, "transcript", None))
+                        transcript = getattr(event, "transcript", None)
+                        self._record_user_transcript(transcript)
+                        if self._sleep_pending and self.wake_session.awake:
+                            await self._preempt_sleep_response()
 
-                        if await self._maybe_sleep_from_transcript(event.transcript):
+                        if await self._maybe_sleep_from_transcript(transcript):
                             continue
 
-                        # Increment sequence
-                        self.partial_transcript_sequence += 1
-                        current_sequence = self.partial_transcript_sequence
-
-                        # Cancel previous debounce task if it exists
-                        if self.partial_transcript_task and not self.partial_transcript_task.done():
-                            self.partial_transcript_task.cancel()
-                            try:
-                                await self.partial_transcript_task
-                            except asyncio.CancelledError:
-                                pass
-
-                        # Start new debounce timer with sequence number
-                        self.partial_transcript_task = asyncio.create_task(
-                            self._emit_debounced_partial(event.transcript, current_sequence)
-                        )
+                        await self._partial_debouncer.schedule(transcript)
 
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
                         logger.debug(f"User transcript: {event.transcript}")
                         self._record_user_transcript(getattr(event, "transcript", None))
 
-                        # Cancel any pending partial emission
-                        if self.partial_transcript_task and not self.partial_transcript_task.done():
-                            self.partial_transcript_task.cancel()
-                            try:
-                                await self.partial_transcript_task
-                            except asyncio.CancelledError:
-                                pass
-
+                        await self._partial_debouncer.cancel()
                         await self._handle_completed_user_transcript(event.transcript)
 
                     # Handle assistant transcription
                     if event.type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
+                        if not self._session_accepts_responses():
+                            continue
                         logger.debug(f"Assistant transcript: {event.transcript}")
                         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
 
                     # Handle audio delta
                     if event.type in ("response.audio.delta", "response.output_audio.delta"):
+                        if not self._session_accepts_responses():
+                            continue
                         self._last_assistant_audio_at = time.monotonic()
                         if self.deps.head_wobbler is not None:
                             self.deps.head_wobbler.feed(event.delta)
-                        if self.wake_session.awake:
-                            self.wake_session.touch()
+                        self.wake_session.touch()
                         delta_audio = np.frombuffer(base64.b64decode(event.delta), dtype=np.int16)
                         await self.output_queue.put(
                             (
@@ -704,8 +835,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 args_json_str=args_json_str,
                                 deps=self.deps,
                             ),
-                            # The idle-prompt feature was removed; tools only run from user turns.
-                            is_idle_tool_call=False,
                         )
 
                         await self.output_queue.put(
@@ -750,7 +879,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     except asyncio.CancelledError:
                         pass
 
-                # Stop background tool manager tasks (listener + cleanup) in all patus.
+                # Stop background tool manager tasks (listener + cleanup) in all paths.
                 await self.tool_manager.shutdown()
 
     def _to_wake_rate(self, audio_frame: NDArray[Any], input_sample_rate: int) -> NDArray[np.int16]:
@@ -796,9 +925,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     def _queue_antenna_cue(self, *, awake: bool) -> None:
         """Raise antennas while streaming; relax them and nod head down when asleep."""
         try:
-            from bobe.dance_emotion_moves import GotoQueueMove
             from reachy_mini.utils import create_head_pose
             from reachy_mini.utils.interpolation import compose_world_offset
+            from bobe.dance_emotion_moves import GotoQueueMove
 
             robot = self.deps.reachy_mini
             head_pose = robot.get_current_head_pose()
@@ -821,9 +950,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         except Exception:
             logger.debug("Antenna cue skipped", exc_info=True)
 
-    async def _transition_to_awake(self) -> None:
+    async def _transition_to_awake(self) -> bool:
         """Open the streaming window after a local wake-word detection."""
-        self._pause_wake_detector()
+        if not await self._ensure_openai_connection():
+            logger.error("Wake ignored: OpenAI Realtime unavailable")
+            return False
+
+        # Clear any stale in-flight response state so server VAD is not suppressed.
+        self._response_done_event.set()
+        self._last_assistant_audio_at = 0.0
+
+        self._sleep_pending = False
+        self._listen_for_sleep_detector()
         self.wake_session.wake()
         logger.info("Wake word heard: streaming audio to OpenAI until timeout or sleep phrase")
         await self._play_chime(ascending=True)
@@ -838,11 +976,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     audio=base64.b64encode(tail.tobytes()).decode("utf-8")
                 )
             except Exception as e:
-                logger.debug("Could not flush pre-wake audio: %s", e)
+                logger.warning("Could not flush pre-wake audio: %s", e)
+        return True
 
     async def _transition_to_sleep(self, reason: str) -> None:
         """Close the streaming window; audio stays on the robot again."""
         self.wake_session.sleep()
+        self._sleep_pending = False
         logger.info("Going to sleep (%s): audio stays local until the wake word", reason)
 
         # Stop any in-flight answer (e.g. the auto-response to "go to sleep").
@@ -860,22 +1000,28 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         await self._play_chime(ascending=False)
         self._queue_antenna_cue(awake=False)
-        self._resume_wake_detector()
+        self._listen_for_wake_detector()
 
-    def _pause_wake_detector(self) -> None:
+    def _listen_for_sleep_detector(self) -> None:
         detector = self._wake_detector
-        if detector is not None and hasattr(detector, "pause"):
-            detector.pause()
+        if detector is not None and hasattr(detector, "listen_for_sleep"):
+            detector.listen_for_sleep()
 
-    def _resume_wake_detector(self) -> None:
+    def _listen_for_wake_detector(self) -> None:
         detector = self._wake_detector
         if detector is None:
             return
-        if hasattr(detector, "resume"):
-            detector.resume()
+        if hasattr(detector, "listen_for_wake"):
+            detector.listen_for_wake()
         if not detector.is_running():
             logger.warning("Wake detector thread not running; restarting")
             detector.start()
+
+    def _pause_wake_detector(self) -> None:
+        self._listen_for_sleep_detector()
+
+    def _resume_wake_detector(self) -> None:
+        self._listen_for_wake_detector()
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive a mic frame; keep it local while asleep, otherwise send upstream.
@@ -913,25 +1059,52 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self._feed_wake_detector(audio_frame, input_sample_rate)
             return
 
-        if self.wake_session.consume_wake_request():
-            await self._transition_to_awake()
-        elif self.wake_session.expired():
-            await self._transition_to_sleep("inactivity timeout")
+        if self.wake_gating_enabled:
+            if self.wake_session.consume_wake_request():
+                if not await self._transition_to_awake():
+                    self.wake_session.request_wake()
+            elif self.wake_session.consume_sleep_request():
+                await self._transition_to_sleep("local sleep phrase")
+            elif self.wake_session.expired():
+                await self._transition_to_sleep("inactivity timeout")
 
-        if not self.wake_session.awake:
-            self._wake_buffer.append(upstream_frame.reshape(-1))
+            if not self.wake_session.awake:
+                self._wake_buffer.append(upstream_frame.reshape(-1))
+                self._feed_wake_detector(audio_frame, input_sample_rate)
+                return
+
             self._feed_wake_detector(audio_frame, input_sample_rate)
-            return
 
         if not self.connection:
-            return
+            now = time.monotonic()
+            if now - self._last_reconnect_attempt_at >= 2.0:
+                self._last_reconnect_attempt_at = now
+                logger.warning("Awake without OpenAI connection; attempting reconnect")
+                await self._ensure_openai_connection(timeout=2.0)
+            if not self.connection:
+                return
 
         # Send to OpenAI (guard against races during reconnect)
         try:
             audio_message = base64.b64encode(upstream_frame.tobytes()).decode("utf-8")
             await self.connection.input_audio_buffer.append(audio=audio_message)
         except Exception as e:
-            logger.debug("Dropping audio frame: connection not ready (%s)", e)
+            logger.warning("Failed to send audio frame; will retry reconnect (%s)", e)
+            conn = self.connection
+            self.connection = None
+            try:
+                self._connected_event.clear()
+            except Exception:
+                pass
+            if conn is not None:
+                try:
+                    await conn.close()
+                except Exception:
+                    pass
+            now = time.monotonic()
+            if now - self._last_reconnect_attempt_at >= 2.0:
+                self._last_reconnect_attempt_at = now
+                await self._restart_session()
             return
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
@@ -942,8 +1115,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
-        self._shutdown_requested = True
-
         # Stop the local wake-word detector thread
         if self._wake_detector is not None:
             self._wake_detector.stop()
@@ -954,13 +1125,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()
 
-        # Cancel any pending debounce task
-        if self.partial_transcript_task and not self.partial_transcript_task.done():
-            self.partial_transcript_task.cancel()
-            try:
-                await self.partial_transcript_task
-            except asyncio.CancelledError:
-                pass
+        await self._partial_debouncer.cancel()
 
         if self.connection:
             try:

@@ -6,10 +6,11 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 
-from bobe.wake.phrases import matches_wake_phrase
+from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_sleep_phrase, matches_wake_phrase
 from bobe.wake_daemon.config import WakeDaemonConfig
 
 
@@ -19,19 +20,85 @@ WAKE_SAMPLE_RATE = 16000
 PARTIAL_TRANSCRIBE_INTERVAL_S = 0.45
 STATS_PARTIAL_MIN_SAMPLES = int(0.35 * WAKE_SAMPLE_RATE)
 TRANSCRIPT_HISTORY_MAX = 30
+ListenMode = Literal["wake", "sleep"]
+
+
+def whisper_engine_key(config: WakeDaemonConfig) -> tuple[str, str, str, str | None, str | None]:
+    """Hashable key for sharing one loaded Whisper model across connections."""
+    return (
+        config.whisper_model,
+        config.whisper_device,
+        config.whisper_compute_type,
+        config.whisper_initial_prompt,
+        config.whisper_hotwords,
+    )
 
 
 @dataclass
 class WhisperWakeEngine:
-    """Segment speech with simple RMS VAD and confirm wake phrases via Whisper."""
+    """Shared faster-whisper model holder; use sessions for per-connection state."""
 
     config: WakeDaemonConfig
     _model: object | None = field(default=None, init=False, repr=False)
-    _paused: bool = field(default=False, init=False)
+
+    def session(self, config: WakeDaemonConfig | None = None) -> WhisperWakeSession:
+        """Create an isolated VAD/transcript session backed by this shared model."""
+        return WhisperWakeSession(engine=self, config=config or self.config)
+
+    def transcribe(self, pcm_i16: np.ndarray, *, config: WakeDaemonConfig | None = None) -> str:
+        """Run Whisper on PCM audio using prompt settings from config."""
+        runtime = config or self.config
+        model = self._load_model()
+        audio = pcm_i16.astype(np.float32) / 32768.0
+        segments, _info = model.transcribe(  # type: ignore[attr-defined]
+            audio,
+            language="en",
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            initial_prompt=runtime.whisper_initial_prompt or None,
+            hotwords=runtime.whisper_hotwords or None,
+        )
+        parts = [segment.text.strip() for segment in segments if segment.text.strip()]
+        return " ".join(parts).strip()
+
+    def _load_model(self) -> object:
+        if self._model is not None:
+            return self._model
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError("faster-whisper is not installed; install with: uv sync --extra wake-daemon") from exc
+
+        logger.info(
+            "Loading Whisper model %r (device=%r, compute_type=%r)",
+            self.config.whisper_model,
+            self.config.whisper_device,
+            self.config.whisper_compute_type,
+        )
+        self._model = WhisperModel(
+            self.config.whisper_model,
+            device=self.config.whisper_device,
+            compute_type=self.config.whisper_compute_type,
+        )
+        return self._model
+
+
+@dataclass
+class WhisperWakeSession:
+    """Per-connection speech buffer and phrase detection state."""
+
+    engine: WhisperWakeEngine
+    config: WakeDaemonConfig
+    _listen_mode: ListenMode = field(default="wake", init=False)
+    _sleep_phrases: tuple[str, ...] = field(default=DEFAULT_SLEEP_PHRASES, init=False)
     _in_speech: bool = field(default=False, init=False)
     _speech_samples: list[np.ndarray] = field(default_factory=list, init=False)
     _silence_samples: int = field(default=0, init=False)
     _last_wake_at: float = field(default=-1e9, init=False)
+    _last_sleep_at: float = field(default=-1e9, init=False)
     _last_transcript: str = field(default="", init=False)
     _partial_transcript: str = field(default="", init=False)
     _last_partial_at: float = field(default=0.0, init=False)
@@ -46,13 +113,25 @@ class WhisperWakeEngine:
     def phrase(self) -> str:
         return self.config.phrase
 
-    def pause(self) -> None:
-        self._paused = True
+    def set_listen_mode(
+        self,
+        mode: ListenMode,
+        *,
+        sleep_phrases: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
+        """Switch between wake-phrase and sleep-phrase detection."""
+        self._listen_mode = mode
+        if sleep_phrases:
+            self._sleep_phrases = tuple(sleep_phrases)
         self.reset()
 
+    def pause(self) -> None:
+        """Legacy alias: listen for sleep phrases while BoBe is awake."""
+        self.set_listen_mode("sleep", sleep_phrases=self._sleep_phrases)
+
     def resume(self) -> None:
-        self._paused = False
-        self.reset()
+        """Legacy alias: listen for wake phrases while BoBe is asleep."""
+        self.set_listen_mode("wake")
 
     def reset(self) -> None:
         self._in_speech = False
@@ -93,7 +172,8 @@ class WhisperWakeEngine:
             "engine": "faster-whisper",
             "model": self.config.whisper_model,
             "phrase": self.config.phrase,
-            "paused": self._paused,
+            "listen_mode": self._listen_mode,
+            "paused": self._listen_mode == "sleep",
             "in_speech": self._in_speech,
             "transcript_last": self._last_transcript,
             "transcript_partial": self._partial_transcript,
@@ -102,11 +182,39 @@ class WhisperWakeEngine:
             "rms_last": round(self._last_rms, 1),
         }
 
-    def feed(self, pcm_i16: np.ndarray) -> dict[str, object] | None:
-        """Consume PCM samples and return a wake event dict when detected."""
-        if self._paused:
+    def _maybe_emit_sleep(self, transcript: str, *, latency_ms: float) -> dict[str, object] | None:
+        if self._listen_mode != "sleep":
             return None
+        if not matches_sleep_phrase(transcript, self._sleep_phrases):
+            return None
+        if time.monotonic() - self._last_sleep_at < self.config.refractory_s:
+            return None
+        self._last_sleep_at = time.monotonic()
+        logger.info("Sleep phrase detected (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
+        return {
+            "type": "sleep",
+            "transcript": transcript,
+            "latency_ms": latency_ms,
+        }
 
+    def _maybe_emit_wake(self, transcript: str, *, latency_ms: float) -> dict[str, object] | None:
+        if self._listen_mode != "wake":
+            return None
+        if time.monotonic() - self._last_wake_at < self.config.refractory_s:
+            return None
+        if not matches_wake_phrase(transcript, phrase=self.config.phrase):
+            return None
+        self._last_wake_at = time.monotonic()
+        logger.info("Wake phrase detected (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
+        return {
+            "type": "wake",
+            "phrase": self.config.phrase,
+            "transcript": transcript,
+            "latency_ms": latency_ms,
+        }
+
+    def feed(self, pcm_i16: np.ndarray) -> dict[str, object] | None:
+        """Consume PCM samples and return a wake/sleep event when detected."""
         chunk = pcm_i16.reshape(-1).astype(np.int16, copy=False)
         if chunk.size == 0:
             return None
@@ -128,9 +236,16 @@ class WhisperWakeEngine:
         if self._in_speech and utterance_samples >= STATS_PARTIAL_MIN_SAMPLES:
             now = time.monotonic()
             if now - self._last_partial_at >= PARTIAL_TRANSCRIBE_INTERVAL_S:
-                partial = self._transcribe(np.concatenate(self._speech_samples))
+                started = time.monotonic()
+                partial = self.engine.transcribe(np.concatenate(self._speech_samples), config=self.config)
+                latency_ms = (time.monotonic() - started) * 1000.0
                 self._set_partial(partial)
                 self._last_partial_at = now
+                if partial and self._listen_mode == "sleep":
+                    event = self._maybe_emit_sleep(partial, latency_ms=latency_ms)
+                    if event is not None:
+                        self.reset()
+                        return event
 
         if not self._in_speech:
             return None
@@ -148,7 +263,7 @@ class WhisperWakeEngine:
             return None
 
         started = time.monotonic()
-        transcript = self._transcribe(utterance)
+        transcript = self.engine.transcribe(utterance, config=self.config)
         latency_ms = (time.monotonic() - started) * 1000.0
         self._last_transcript = transcript
         self._partial_transcript = ""
@@ -157,52 +272,6 @@ class WhisperWakeEngine:
 
         if not transcript:
             return None
-        if time.monotonic() - self._last_wake_at < self.config.refractory_s:
-            return None
-        if not matches_wake_phrase(transcript, phrase=self.config.phrase):
-            return None
-
-        self._last_wake_at = time.monotonic()
-        logger.info("Wake phrase detected (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
-        return {
-            "type": "wake",
-            "phrase": self.config.phrase,
-            "transcript": transcript,
-            "latency_ms": latency_ms,
-        }
-
-    def _load_model(self) -> object:
-        if self._model is not None:
-            return self._model
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise RuntimeError("faster-whisper is not installed; install with: uv sync --extra wake-daemon") from exc
-
-        logger.info(
-            "Loading Whisper model %r (device=%r, compute_type=%r)",
-            self.config.whisper_model,
-            self.config.whisper_device,
-            self.config.whisper_compute_type,
-        )
-        self._model = WhisperModel(
-            self.config.whisper_model,
-            device=self.config.whisper_device,
-            compute_type=self.config.whisper_compute_type,
-        )
-        return self._model
-
-    def _transcribe(self, pcm_i16: np.ndarray) -> str:
-        model = self._load_model()
-        audio = pcm_i16.astype(np.float32) / 32768.0
-        segments, _info = model.transcribe(  # type: ignore[attr-defined]
-            audio,
-            language="en",
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        parts = [segment.text.strip() for segment in segments if segment.text.strip()]
-        return " ".join(parts).strip()
+        if self._listen_mode == "sleep":
+            return self._maybe_emit_sleep(transcript, latency_ms=latency_ms)
+        return self._maybe_emit_wake(transcript, latency_ms=latency_ms)

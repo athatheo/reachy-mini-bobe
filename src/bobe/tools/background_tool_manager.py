@@ -66,9 +66,6 @@ class ToolNotification(BaseModel):
     """the name of the tool"""
     tool_name: str
 
-    """whether the tool call was triggered by an idle signal"""
-    is_idle_tool_call: bool
-
     """the status of the tool"""
     status: ToolState
 
@@ -104,7 +101,6 @@ class BackgroundTool(ToolNotification):
         return ToolNotification(
             id=self.id,
             tool_name=self.tool_name,
-            is_idle_tool_call=self.is_idle_tool_call,
             status=self.status,
             result=self.result,
             error=self.error,
@@ -163,7 +159,6 @@ class BackgroundToolManager(BaseModel):
         self,
         call_id: str,
         tool_call_routine: ToolCallRoutine,
-        is_idle_tool_call: bool,
         with_progress: bool = False,
     ) -> BackgroundTool:
         """Start a new background tool.
@@ -172,7 +167,6 @@ class BackgroundToolManager(BaseModel):
             call_id: The ID of the tool
             tool_call_routine: The ToolCallRoutine containing the callable and its arguments
             with_progress: Whether to track progress (0.0-1.0)
-            is_idle_tool_call: Whether the tool call was triggered by an idle signal
 
         Returns:
             BackgroundTool object with tool ID
@@ -183,7 +177,6 @@ class BackgroundToolManager(BaseModel):
         bg_tool = BackgroundTool(
             id=id,
             tool_name=tool_name,
-            is_idle_tool_call=is_idle_tool_call,
             progress=ToolProgress(progress=0.0) if with_progress else None,
             status=ToolState.RUNNING,
         )

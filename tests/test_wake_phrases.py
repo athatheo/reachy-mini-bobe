@@ -1,5 +1,5 @@
 # ruff: noqa: D103
-from bobe.wake.phrases import matches_wake_phrase, normalize_transcript
+from bobe.wake.phrases import matches_sleep_phrase, matches_wake_phrase, normalize_transcript
 
 
 def test_normalize_transcript():
@@ -21,3 +21,16 @@ def test_matches_wake_phrase_jarvis_prefix():
 def test_rejects_unrelated_speech():
     assert not matches_wake_phrase("good morning")
     assert not matches_wake_phrase("hey there")
+
+
+def test_rejects_false_wake_homophones():
+    assert not matches_wake_phrase("hey service")
+    assert not matches_wake_phrase("hey service please")
+    assert not matches_wake_phrase("customer service desk")
+
+
+def test_matches_sleep_phrase():
+    assert matches_sleep_phrase("go to sleep")
+    assert matches_sleep_phrase("please go to sleep now")
+    assert matches_sleep_phrase("got to sleep")
+    assert not matches_sleep_phrase("hey jarvis")

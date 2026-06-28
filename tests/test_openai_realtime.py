@@ -99,6 +99,213 @@ async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -
     warnings = [r for r in caplog.records if r.levelname == "WARNING" and "closed unexpectedly" in r.msg]
     assert len(warnings) == 1
 
+
+@pytest.mark.asyncio
+async def test_start_up_retries_on_session_update_failure(monkeypatch: Any, caplog: Any) -> None:
+    """session.update failure raises RealtimeSessionError and retries without TypeError."""
+    caplog.set_level(logging.WARNING)
+
+    _real_sleep = asyncio.sleep
+    async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
+        await _real_sleep(0)
+    monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
+
+    attempt_counter = {"n": 0}
+
+    class FakeSession:
+        async def update(self, **_kw: Any) -> None:
+            attempt_counter["n"] += 1
+            if attempt_counter["n"] == 1:
+                raise RuntimeError("session.update failed (simulated)")
+
+    class FakeConn:
+        def __init__(self) -> None:
+            self.session = FakeSession()
+
+            class _InputAudioBuffer:
+                async def append(self, **_kw: Any) -> None:
+                    return None
+            self.input_audio_buffer = _InputAudioBuffer()
+
+            class _Item:
+                async def create(self, **_kw: Any) -> None:
+                    return None
+
+            class _Conversation:
+                item = _Item()
+            self.conversation = _Conversation()
+
+            class _Response:
+                async def create(self, **_kw: Any) -> None:
+                    return None
+                async def cancel(self, **_kw: Any) -> None:
+                    return None
+            self.response = _Response()
+
+        async def __aenter__(self) -> "FakeConn":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        async def close(self) -> None:
+            return None
+
+        def __aiter__(self) -> "FakeConn":
+            return self
+
+        async def __anext__(self) -> None:
+            raise StopAsyncIteration
+
+    class FakeRealtime:
+        def connect(self, **_kw: Any) -> FakeConn:
+            return FakeConn()
+
+    class FakeClient:
+        def __init__(self, **_kw: Any) -> None:
+            self.realtime = FakeRealtime()
+
+    monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
+    monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
+    monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
+    monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
+
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+
+    await handler.start_up()
+
+    assert attempt_counter["n"] == 2
+    assert handler.connection is None
+
+    retry_logs = [
+        r for r in caplog.records
+        if "closed unexpectedly" in getattr(r, "msg", "")
+    ]
+    assert len(retry_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None:
+    """Append failure while awake closes the session and starts a fresh connection."""
+    _real_sleep = asyncio.sleep
+    async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
+        await _real_sleep(0)
+    monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
+    monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
+    monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
+    monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
+
+    session_attempts = {"n": 0}
+    restart_calls = {"n": 0}
+    original_restart = rt_mod.OpenaiRealtimeHandler._restart_session
+
+    async def _counting_restart(self: Any) -> None:
+        restart_calls["n"] += 1
+        await original_restart(self)
+
+    monkeypatch.setattr(rt_mod.OpenaiRealtimeHandler, "_restart_session", _counting_restart)
+
+    class FakeInputAudioBuffer:
+        def __init__(self, *, fail_append: bool) -> None:
+            self.fail_append = fail_append
+            self.appended: list[str] = []
+
+        async def append(self, *, audio: str) -> None:
+            if self.fail_append:
+                raise RuntimeError("append failed (simulated)")
+            self.appended.append(audio)
+
+        async def clear(self) -> None:
+            return None
+
+    class FakeSession:
+        async def update(self, **_kw: Any) -> None:
+            return None
+
+    class FakeConn:
+        def __init__(self, *, fail_append: bool) -> None:
+            self.session = FakeSession()
+            self.input_audio_buffer = FakeInputAudioBuffer(fail_append=fail_append)
+            self._closed = False
+            self._iter_wait = asyncio.Event()
+
+            class _Item:
+                async def create(self, **_kw: Any) -> None:
+                    return None
+
+            class _Conversation:
+                item = _Item()
+            self.conversation = _Conversation()
+
+            class _Response:
+                async def create(self, **_kw: Any) -> None:
+                    return None
+                async def cancel(self, **_kw: Any) -> None:
+                    return None
+            self.response = _Response()
+
+        async def __aenter__(self) -> "FakeConn":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        async def close(self) -> None:
+            self._closed = True
+            self._iter_wait.set()
+
+        def __aiter__(self) -> "FakeConn":
+            return self
+
+        async def __anext__(self) -> None:
+            if self._closed:
+                raise StopAsyncIteration
+            await self._iter_wait.wait()
+            raise StopAsyncIteration
+
+    class FakeRealtime:
+        def connect(self, **_kw: Any) -> FakeConn:
+            session_attempts["n"] += 1
+            return FakeConn(fail_append=session_attempts["n"] == 1)
+
+    class FakeClient:
+        def __init__(self, **_kw: Any) -> None:
+            self.realtime = FakeRealtime()
+
+    monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
+
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = _build_wake_enabled_handler()
+    handler.client = FakeClient()
+    handler._wake_detector = None
+    handler.wake_session.wake()
+    session_task: asyncio.Task[None] | None = None
+
+    try:
+        session_task = asyncio.create_task(handler._run_realtime_session())
+        handler._realtime_session_task = session_task
+        await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
+
+        await handler.receive(_mic_frame())
+
+        assert restart_calls["n"] >= 1
+        await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
+        assert handler.connection is not None
+        assert not handler.connection.input_audio_buffer.fail_append
+
+        await handler.receive(_mic_frame())
+        assert len(handler.connection.input_audio_buffer.appended) == 1
+    finally:
+        for task in {session_task, handler._realtime_session_task}:
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        await handler.shutdown()
+
 # ---- Cost calculation tests ----
 
 
@@ -190,6 +397,8 @@ def _build_wake_enabled_handler() -> rt_mod.OpenaiRealtimeHandler:
     handler.wake_config = WakeConfig()
     handler.wake_session = WakeSession()
     handler._wake_detector = None
+    handler.wake_gating_enabled = True
+    handler.wake_error = None
     return handler
 
 
@@ -197,6 +406,35 @@ def _mic_frame(samples: int = 2400) -> tuple[int, Any]:
     import numpy as np
 
     return (24000, np.ones(samples, dtype=np.int16))
+
+
+@pytest.mark.asyncio
+async def test_receive_bypasses_wake_gating_when_detector_missing(caplog: Any) -> None:
+    """Misconfigured wake must not silently drop mic audio."""
+    caplog.set_level(logging.ERROR)
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler.connection = FakeGatingConnection()
+
+    assert handler.wake_error is not None
+    assert not handler.wake_gating_enabled
+    assert handler.wake_session.awake
+
+    await handler.receive(_mic_frame())
+
+    assert handler.connection.input_audio_buffer.appended
+    assert any("Wake-word gating disabled" in r.message for r in caplog.records)
+
+
+def test_handler_exposes_wake_error_when_gating_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOBE_WAKE_BACKEND", "remote")
+    monkeypatch.delenv("BOBE_WAKE_REMOTE_URL", raising=False)
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+
+    assert not handler.wake_gating_enabled
+    assert handler.wake_error is not None
+    assert "BOBE_WAKE_REMOTE_URL" in handler.wake_error
 
 
 @pytest.mark.asyncio
@@ -239,6 +477,36 @@ async def test_receive_flushes_buffer_and_streams_after_wake() -> None:
     appended = handler.connection.input_audio_buffer.appended
     assert len(appended) == 2  # buffer tail flush + live frame
     assert handler.wake_session.awake
+
+
+@pytest.mark.asyncio
+async def test_wake_ignored_when_openai_unavailable(monkeypatch: Any) -> None:
+    """A wake request must not open the streaming window without a Realtime connection."""
+    handler = _build_wake_enabled_handler()
+    handler.connection = None
+
+    async def _unavailable(_self: Any, timeout: float = 5.0) -> bool:
+        return False
+
+    monkeypatch.setattr(rt_mod.OpenaiRealtimeHandler, "_ensure_openai_connection", _unavailable)
+
+    handler.wake_session.request_wake()
+    await handler.receive(_mic_frame())
+
+    assert not handler.wake_session.awake
+
+
+@pytest.mark.asyncio
+async def test_transition_to_awake_resets_response_guard() -> None:
+    """Waking clears a stuck in-flight response guard so server VAD is not suppressed."""
+    handler = _build_wake_enabled_handler()
+    handler.connection = FakeGatingConnection()
+    handler._response_done_event.clear()
+
+    await handler._transition_to_awake()
+
+    assert handler.wake_session.awake
+    assert handler._response_done_event.is_set()
 
 
 @pytest.mark.asyncio
@@ -367,7 +635,7 @@ async def test_sleep_phrase_detected_from_latest_partial_on_speech_stopped() -> 
     assert await handler._maybe_sleep_from_transcript(handler._latest_user_transcript)
 
     assert not handler.wake_session.awake
-    assert handler.connection.input_audio_buffer.cleared == 1
+    assert handler.connection.input_audio_buffer.cleared == 2
 
 
 @pytest.mark.asyncio
@@ -383,6 +651,75 @@ async def test_sleep_phrase_detected_on_response_created_with_latest_partial() -
     assert not handler.wake_session.awake
 
 
+@pytest.mark.asyncio
+async def test_record_user_transcript_sets_sleep_pending_on_partial_match() -> None:
+    """Partial ASR can flag sleep before the async transition runs."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+
+    handler._record_user_transcript("please go to sleep")
+
+    assert handler._sleep_pending
+
+
+@pytest.mark.asyncio
+async def test_response_created_after_sleep_cancels_and_blocks_audio() -> None:
+    """Late response.created after sleep must not play assistant audio."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler.connection = FakeGatingConnection()
+    cancel_count = 0
+
+    class TrackingResponse:
+        async def cancel(self) -> None:
+            nonlocal cancel_count
+            cancel_count += 1
+
+    handler.connection.response = TrackingResponse()
+
+    await handler._transition_to_sleep("test")
+
+    # Simulate server VAD creating a response after we already slept.
+    if (
+        not handler.wake_session.awake
+        or handler._sleep_pending
+        or await handler._maybe_sleep_from_transcript("go to sleep")
+    ):
+        if handler.connection:
+            try:
+                await handler.connection.response.cancel()
+            except Exception:
+                pass
+
+    assert cancel_count == 2  # once in transition_to_sleep, once for late response.created
+    assert not handler.wake_session.awake
+
+    handler._sleep_pending = True
+    assert not handler.wake_session.awake or handler._sleep_pending
+
+
+@pytest.mark.asyncio
+async def test_preempt_sleep_response_cancels_active_response() -> None:
+    """Sleep preemption cancels server responses and clears the input buffer."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler.connection = FakeGatingConnection()
+    cancel_count = 0
+
+    class TrackingResponse:
+        async def cancel(self) -> None:
+            nonlocal cancel_count
+            cancel_count += 1
+
+    handler.connection.response = TrackingResponse()
+
+    await handler._preempt_sleep_response()
+
+    assert handler._sleep_pending
+    assert cancel_count == 1
+    assert handler.connection.input_audio_buffer.cleared == 1
+
+
 # ---- Stress test: response.create rejection + retry ----
 
 
@@ -390,7 +727,7 @@ async def test_sleep_phrase_detected_on_response_created_with_latest_partial() -
 async def test_response_sender_retries_on_active_response_rejection(monkeypatch: Any, caplog: Any) -> None:
     """Stress test: response.create rejection + retry via real event processing.
 
-    Tool results (is_idle_tool_call=False) queue response.create calls via
+    Tool results () queue response.create calls via
     _safe_response_create.  When the server rejects some with
     ``conversation_already_has_active_response``, the error event flows through
     the event handler and _response_sender_loop retries the rejected request.
@@ -403,7 +740,7 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     FakeCCE = type("FakeCCE", (Exception,), {})
     monkeypatch.setattr(rt_mod, "ConnectionClosedError", FakeCCE)
-    monkeypatch.setattr(rt_mod, "get_session_instructions", lambda: "test")
+    monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
     monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
     monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
 
@@ -587,7 +924,6 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
                 args_json_str=f'{{"index": {i}}}',
                 deps=deps,
             ),
-            is_idle_tool_call=False,
         )
 
     # Yield so spawned tool tasks, the listener, and the sender can drain.
