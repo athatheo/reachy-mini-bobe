@@ -5,11 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from bobe.wake.phrases import (
-    DEFAULT_SLEEP_PHRASES,
-    WAKE_PHRASE,
-    matches_sleep_phrase,
-)
+from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, WAKE_PHRASE
 
 
 def hello_message(*, sample_rate: int, token: str | None) -> dict[str, Any]:

@@ -14,6 +14,7 @@ import os
 import time
 import asyncio
 import logging
+import threading
 from typing import List, Optional
 from pathlib import Path
 
@@ -46,6 +47,7 @@ class LocalStream:
         *,
         settings_app: Optional[FastAPI] = None,
         instance_path: Optional[str] = None,
+        app_stop_event: Optional[threading.Event] = None,
     ):
         """Initialize the stream with an OpenAI realtime handler and pipelines.
 
@@ -60,6 +62,7 @@ class LocalStream:
         self.handler._clear_queue = self.clear_audio_queue
         self._settings_app: Optional[FastAPI] = settings_app
         self._instance_path: Optional[str] = instance_path
+        self._app_stop_event = app_stop_event
         self._settings_initialized = False
         self._asyncio_loop = None
 
@@ -110,9 +113,20 @@ class LocalStream:
 
         # Never auto-download shared/demo keys. Wait for explicit user-provided keys.
         if not self._required_api_keys_configured():
-            logger.warning("Required API keys missing. Open the app settings page to enter OpenAI and Anthropic keys.")
+            logger.warning(
+                "Required API keys missing. Open the app settings page to enter OpenAI and Anthropic keys."
+            )
+            warned_at = time.monotonic()
             try:
                 while not self._required_api_keys_configured():
+                    if self._app_stop_event is not None and self._app_stop_event.is_set():
+                        logger.info("Stop requested while waiting for API keys.")
+                        return
+                    if time.monotonic() - warned_at >= 30.0:
+                        logger.warning(
+                            "Still waiting for OpenAI and Anthropic API keys in settings (http://<robot>:7860/)."
+                        )
+                        warned_at = time.monotonic()
                     time.sleep(0.2)
             except KeyboardInterrupt:
                 logger.info("Interrupted while waiting for API keys.")

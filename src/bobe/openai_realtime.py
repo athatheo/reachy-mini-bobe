@@ -316,7 +316,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     logger.info("Retrying in %.1f seconds...", delay)
                     await asyncio.sleep(delay)
                     continue
-                raise
+                logger.error(
+                    "Realtime session unavailable after %d attempts; keeping settings UI alive until stop",
+                    max_attempts,
+                )
+                try:
+                    while True:
+                        await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    return
+                return
             finally:
                 # never keep a stale reference
                 self.connection = None
@@ -1118,6 +1127,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Stop the local wake-word detector thread
         if self._wake_detector is not None:
             self._wake_detector.stop()
+
+        session_task = self._realtime_session_task
+        if session_task is not None and not session_task.done():
+            session_task.cancel()
+            try:
+                await session_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._realtime_session_task = None
 
         # Unblock the response sender worker so it can exit
         self._response_done_event.set()

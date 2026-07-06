@@ -190,6 +190,7 @@ def run(
             robot,
             settings_app=settings_app,
             instance_path=instance_path,
+            app_stop_event=app_stop_event,
         )
 
     # Each async service → its own thread/loop
