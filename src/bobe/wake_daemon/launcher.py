@@ -5,6 +5,7 @@ import os
 import time
 import shlex
 import shutil
+import tempfile
 import subprocess
 from typing import Any, Callable
 from pathlib import Path
@@ -54,25 +55,15 @@ class ClaudeCodeLauncher:
             return {"ok": False, "error": "invalid_config", "message": str(exc)}
 
         workdir.mkdir(parents=True, exist_ok=True)
-        command = f"cd {shlex.quote(str(workdir))} && exec {shlex.quote(binary)}"
+        script_path = create_terminal_command_script(workdir=workdir, binary=binary)
 
         try:
             self._runner(
                 [
-                    "osascript",
-                    "-e",
-                    "on run argv",
-                    "-e",
-                    'tell application "Terminal"',
-                    "-e",
-                    "do script item 1 of argv",
-                    "-e",
-                    "activate",
-                    "-e",
-                    "end tell",
-                    "-e",
-                    "end run",
-                    command,
+                    "open",
+                    "-a",
+                    "Terminal",
+                    str(script_path),
                 ],
                 check=True,
                 capture_output=True,
@@ -80,11 +71,14 @@ class ClaudeCodeLauncher:
                 timeout=10,
             )
         except FileNotFoundError:
-            return {"ok": False, "error": "osascript_not_found"}
+            _remove_script(script_path)
+            return {"ok": False, "error": "open_not_found"}
         except subprocess.CalledProcessError as exc:
+            _remove_script(script_path)
             stderr = (exc.stderr or "").strip()
             return {"ok": False, "error": "launch_failed", "message": stderr or str(exc)}
         except subprocess.TimeoutExpired:
+            _remove_script(script_path)
             return {"ok": False, "error": "launch_timeout"}
 
         self._last_launch_at = now
@@ -93,6 +87,17 @@ class ClaudeCodeLauncher:
             "workdir": str(workdir),
             "binary": binary,
         }
+
+
+def create_terminal_command_script(*, workdir: Path, binary: str) -> Path:
+    """Create a temporary Terminal script for the allowlisted launch command."""
+    fd, raw_path = tempfile.mkstemp(prefix="bobe-claude-code-", suffix=".command")
+    script_path = Path(raw_path)
+    script = f'#!/bin/zsh\nrm -f "$0"\ncd {shlex.quote(str(workdir))} || exit 1\nexec {shlex.quote(binary)}\n'
+    with os.fdopen(fd, "w") as handle:
+        handle.write(script)
+    script_path.chmod(0o700)
+    return script_path
 
 
 def resolve_workdir(raw_workdir: str | None) -> Path:
@@ -141,3 +146,7 @@ def resolve_binary(raw_binary: str | None) -> str:
     if resolved_binary is None:
         raise ClaudeCodeLaunchError(f"Claude Code binary not found on PATH: {binary}")
     return str(Path(resolved_binary).resolve(strict=False))
+
+
+def _remove_script(script_path: Path) -> None:
+    script_path.unlink(missing_ok=True)

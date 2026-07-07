@@ -1,6 +1,7 @@
 # ruff: noqa: D103
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -53,9 +54,14 @@ def test_launcher_opens_terminal_with_valid_command(tmp_path, monkeypatch):
     assert result["workdir"] == str(tmp_path / "repos" / "voice-work")
     assert calls
     args, kwargs = calls[0]
-    assert args[0] == "osascript"
-    assert "cd" in args[-1]
-    assert "voice-work" in args[-1]
+    assert args[:3] == ["open", "-a", "Terminal"]
+    script_path = Path(args[-1])
+    script = script_path.read_text()
+    assert "cd" in script
+    assert "voice-work" in script
+    assert "exec /usr/bin/claude" in script
+    script_path.unlink()
+    assert result["binary"] == "/usr/bin/claude"
     assert kwargs["check"] is True
 
 
@@ -69,11 +75,12 @@ def test_launcher_enforces_cooldown(tmp_path, monkeypatch):
         claude_code_launch_enabled=True,
         claude_code_launch_cooldown_s=30.0,
     )
-    launcher = ClaudeCodeLauncher(
-        config,
-        clock=lambda: now["value"],
-        runner=lambda args, **kwargs: subprocess.CompletedProcess(args=args, returncode=0),
-    )
+
+    def fake_runner(args, **kwargs):
+        Path(args[-1]).unlink()
+        return subprocess.CompletedProcess(args=args, returncode=0)
+
+    launcher = ClaudeCodeLauncher(config, clock=lambda: now["value"], runner=fake_runner)
 
     assert launcher.launch()["ok"] is True
     now["value"] = 20.0
