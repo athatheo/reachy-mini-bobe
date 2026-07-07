@@ -1,7 +1,7 @@
+import time
 import random
 import asyncio
 import logging
-import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -12,6 +12,11 @@ import bobe.tools.background_tool_manager as btm_mod
 from bobe.wake_word import WakeConfig, WakeSession
 from bobe.openai_realtime import _compute_response_cost
 from bobe.tools.core_tools import ToolDependencies
+from bobe.claude_code_launch import (
+    ClaudeCodeLaunchSettings,
+    ClaudeCodeLaunchController,
+    reset_claude_code_launch_controller,
+)
 from bobe.tools.background_tool_manager import ToolCallRoutine
 
 
@@ -30,7 +35,10 @@ async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -
 
     # Make asyncio.sleep return immediately (for backoff)
     _real_sleep = asyncio.sleep
-    async def _mock_sleep(*_a: Any, **_kw: Any) -> None: await _real_sleep(0)
+
+    async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
+        await _real_sleep(0)
+
     monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
 
     attempt_counter = {"n": 0}
@@ -42,31 +50,48 @@ async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -
             self._mode = mode
 
             class _Session:
-                async def update(self, **_kw: Any) -> None: return None
+                async def update(self, **_kw: Any) -> None:
+                    return None
+
             self.session = _Session()
 
             class _InputAudioBuffer:
-                async def append(self, **_kw: Any) -> None: return None
+                async def append(self, **_kw: Any) -> None:
+                    return None
+
             self.input_audio_buffer = _InputAudioBuffer()
 
             class _Item:
-                async def create(self, **_kw: Any) -> None: return None
+                async def create(self, **_kw: Any) -> None:
+                    return None
 
             class _Conversation:
                 item = _Item()
+
             self.conversation = _Conversation()
 
             class _Response:
-                async def create(self, **_kw: Any) -> None: return None
-                async def cancel(self, **_kw: Any) -> None: return None
+                async def create(self, **_kw: Any) -> None:
+                    return None
+
+                async def cancel(self, **_kw: Any) -> None:
+                    return None
+
             self.response = _Response()
 
-        async def __aenter__(self) -> "FakeConn": return self
-        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool: return False
-        async def close(self) -> None: return None
+        async def __aenter__(self) -> "FakeConn":
+            return self
+
+        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        async def close(self) -> None:
+            return None
 
         # Async iterator protocol
-        def __aiter__(self) -> "FakeConn": return self
+        def __aiter__(self) -> "FakeConn":
+            return self
+
         async def __anext__(self) -> None:
             if self._mode == "raise_on_iter":
                 raise FakeCCE("abrupt close (simulated)")
@@ -79,7 +104,8 @@ async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -
             return FakeConn(mode)
 
     class FakeClient:
-        def __init__(self, **_kw: Any) -> None: self.realtime = FakeRealtime()
+        def __init__(self, **_kw: Any) -> None:
+            self.realtime = FakeRealtime()
 
     # Patch the OpenAI client used by the handler
     monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
@@ -106,8 +132,10 @@ async def test_start_up_retries_on_session_update_failure(monkeypatch: Any, capl
     caplog.set_level(logging.WARNING)
 
     _real_sleep = asyncio.sleep
+
     async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
         await _real_sleep(0)
+
     monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
 
     attempt_counter = {"n": 0}
@@ -125,6 +153,7 @@ async def test_start_up_retries_on_session_update_failure(monkeypatch: Any, capl
             class _InputAudioBuffer:
                 async def append(self, **_kw: Any) -> None:
                     return None
+
             self.input_audio_buffer = _InputAudioBuffer()
 
             class _Item:
@@ -133,13 +162,16 @@ async def test_start_up_retries_on_session_update_failure(monkeypatch: Any, capl
 
             class _Conversation:
                 item = _Item()
+
             self.conversation = _Conversation()
 
             class _Response:
                 async def create(self, **_kw: Any) -> None:
                     return None
+
                 async def cancel(self, **_kw: Any) -> None:
                     return None
+
             self.response = _Response()
 
         async def __aenter__(self) -> "FakeConn":
@@ -178,10 +210,7 @@ async def test_start_up_retries_on_session_update_failure(monkeypatch: Any, capl
     assert attempt_counter["n"] == 2
     assert handler.connection is None
 
-    retry_logs = [
-        r for r in caplog.records
-        if "closed unexpectedly" in getattr(r, "msg", "")
-    ]
+    retry_logs = [r for r in caplog.records if "closed unexpectedly" in getattr(r, "msg", "")]
     assert len(retry_logs) == 1
 
 
@@ -189,8 +218,10 @@ async def test_start_up_retries_on_session_update_failure(monkeypatch: Any, capl
 async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None:
     """Append failure while awake closes the session and starts a fresh connection."""
     _real_sleep = asyncio.sleep
+
     async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
         await _real_sleep(0)
+
     monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
     monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
     monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
@@ -236,13 +267,16 @@ async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None
 
             class _Conversation:
                 item = _Item()
+
             self.conversation = _Conversation()
 
             class _Response:
                 async def create(self, **_kw: Any) -> None:
                     return None
+
                 async def cancel(self, **_kw: Any) -> None:
                     return None
+
             self.response = _Response()
 
         async def __aenter__(self) -> "FakeConn":
@@ -275,7 +309,6 @@ async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None
 
     monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
 
-    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = _build_wake_enabled_handler()
     handler.client = FakeClient()
     handler._wake_detector = None
@@ -305,6 +338,7 @@ async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None
                 except (asyncio.CancelledError, Exception):
                     pass
         await handler.shutdown()
+
 
 # ---- Cost calculation tests ----
 
@@ -427,6 +461,7 @@ async def test_receive_bypasses_wake_gating_when_detector_missing(caplog: Any) -
 
 
 def test_handler_exposes_wake_error_when_gating_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remote wake misconfiguration is exposed on the handler."""
     monkeypatch.setenv("BOBE_WAKE_BACKEND", "remote")
     monkeypatch.delenv("BOBE_WAKE_REMOTE_URL", raising=False)
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
@@ -584,6 +619,102 @@ async def test_completed_user_transcript_sleep_phrase_closes_session() -> None:
 
     assert not handler.wake_session.awake
     assert handler._pending_responses.empty()
+
+
+@pytest.mark.asyncio
+async def test_completed_confirmation_phrase_launches_claude_code() -> None:
+    """Only a completed exact confirmation transcript triggers the local launch gate."""
+    calls = []
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b'{"ok": true}'
+
+    def fake_opener(request: Any, *, timeout: float) -> FakeResponse:
+        calls.append((request, timeout))
+        return FakeResponse()
+
+    controller = ClaudeCodeLaunchController(
+        settings_loader=lambda: ClaudeCodeLaunchSettings(
+            launch_url="http://mac.local:8765/v1/launch/claude-code",
+            launch_token="launch-token",
+        ),
+        opener=fake_opener,
+    )
+    reset_claude_code_launch_controller(controller)
+    try:
+        controller.request()
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        await handler._handle_completed_user_transcript("confirm launch Claude Code")
+
+        user_output = await handler.output_queue.get()
+        assistant_output = await handler.output_queue.get()
+        assert user_output.args[0] == {"role": "user", "content": "confirm launch Claude Code"}
+        assert assistant_output.args[0]["role"] == "assistant"
+        assert "launching" in assistant_output.args[0]["content"]
+        assert len(calls) == 1
+    finally:
+        reset_claude_code_launch_controller()
+
+
+@pytest.mark.asyncio
+async def test_near_miss_confirmation_transcript_does_not_launch_claude_code() -> None:
+    """Extra words around the confirmation phrase must not trigger the launch gate."""
+    calls = []
+    controller = ClaudeCodeLaunchController(
+        settings_loader=lambda: ClaudeCodeLaunchSettings(
+            launch_url="http://mac.local:8765/v1/launch/claude-code",
+            launch_token="launch-token",
+        ),
+        opener=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    reset_claude_code_launch_controller(controller)
+    try:
+        controller.request()
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        await handler._handle_completed_user_transcript("please confirm launch Claude Code")
+
+        assert calls == []
+        assert controller.has_pending() is True
+        user_output = await handler.output_queue.get()
+        assert user_output.args[0] == {"role": "user", "content": "please confirm launch Claude Code"}
+        assert handler.output_queue.empty()
+    finally:
+        reset_claude_code_launch_controller()
+
+
+def test_partial_confirmation_transcript_does_not_launch_claude_code() -> None:
+    """Partial transcript tracking alone does not invoke the launch gate."""
+    calls = []
+    controller = ClaudeCodeLaunchController(
+        settings_loader=lambda: ClaudeCodeLaunchSettings(
+            launch_url="http://mac.local:8765/v1/launch/claude-code",
+            launch_token="launch-token",
+        ),
+        opener=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    reset_claude_code_launch_controller(controller)
+    try:
+        controller.request()
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        handler._record_user_transcript("confirm launch Claude Code")
+
+        assert calls == []
+        assert controller.has_pending() is True
+    finally:
+        reset_claude_code_launch_controller()
 
 
 @pytest.mark.asyncio
@@ -812,9 +943,7 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
                     )
                 )
                 await asyncio.sleep(0)
-                await event_queue.put(
-                    FakeEvent("response.done", response=MagicMock())
-                )
+                await event_queue.put(FakeEvent("response.done", response=MagicMock()))
                 return
 
             # Intentional rejections (simulating a race where another
@@ -837,10 +966,7 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
             else:
                 await event_queue.put(FakeEvent("response.created"))
 
-            await event_queue.put(
-                FakeEvent("response.done", response=MagicMock())
-            )
-
+            await event_queue.put(FakeEvent("response.done", response=MagicMock()))
 
         async def cancel(self, **_kw: Any) -> None:
             pass
@@ -897,9 +1023,7 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
     monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
 
     # Patch dispatch_tool_call so tools complete with a result.
-    async def _fake_dispatch(
-        tool_name: str, args_json: str, deps: Any, **_kw: Any
-    ) -> dict[str, Any]:
+    async def _fake_dispatch(tool_name: str, args_json: str, deps: Any, **_kw: Any) -> dict[str, Any]:
         await asyncio.sleep(random.uniform(0.3, 0.5))
         return {"ok": True, "tool": tool_name}
 
@@ -935,7 +1059,6 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     await handler.shutdown()
 
-
     # ---- Assertions ----
 
     # Serialization: every response.create() must have been called only when
@@ -955,23 +1078,15 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     # The error event handler must have set _last_response_rejected for each
     # rejection (the log message comes from the event handler code path).
-    rejection_logs = [
-        r for r in caplog.records
-        if "worker will retry" in getattr(r, "msg", "")
-    ]
+    rejection_logs = [r for r in caplog.records if "worker will retry" in getattr(r, "msg", "")]
     assert len(rejection_logs) == len(REJECT_CALL_NUMBERS), (
-        f"Expected {len(REJECT_CALL_NUMBERS)} rejection entries from error handler, "
-        f"got {len(rejection_logs)}"
+        f"Expected {len(REJECT_CALL_NUMBERS)} rejection entries from error handler, got {len(rejection_logs)}"
     )
 
     # The sender loop must have retried after each rejection.
-    retry_logs = [
-        r for r in caplog.records
-        if "response.create was rejected; retrying" in getattr(r, "msg", "")
-    ]
+    retry_logs = [r for r in caplog.records if "response.create was rejected; retrying" in getattr(r, "msg", "")]
     assert len(retry_logs) == len(REJECT_CALL_NUMBERS), (
-        f"Expected {len(REJECT_CALL_NUMBERS)} retry entries from sender loop, "
-        f"got {len(retry_logs)}"
+        f"Expected {len(REJECT_CALL_NUMBERS)} retry entries from sender loop, got {len(retry_logs)}"
     )
 
 
@@ -980,7 +1095,8 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
 @pytest.mark.asyncio
 async def test_response_sender_loop_times_out_waiting_for_response_done(
-    monkeypatch: Any, caplog: Any,
+    monkeypatch: Any,
+    caplog: Any,
 ) -> None:
     """If response.done is never received the sender loop should time out.
 
@@ -1025,18 +1141,14 @@ async def test_response_sender_loop_times_out_waiting_for_response_done(
 
     assert create_count == 2, f"Expected 2 response.create calls, got {create_count}"
 
-    timeout_logs = [
-        r for r in caplog.records
-        if "Timed out waiting for response.done" in r.getMessage()
-    ]
-    assert len(timeout_logs) == 2, (
-        f"Expected 2 timeout warnings, got {len(timeout_logs)}"
-    )
+    timeout_logs = [r for r in caplog.records if "Timed out waiting for response.done" in r.getMessage()]
+    assert len(timeout_logs) == 2, f"Expected 2 timeout warnings, got {len(timeout_logs)}"
 
 
 @pytest.mark.asyncio
 async def test_response_sender_loop_times_out_waiting_for_previous_response(
-    monkeypatch: Any, caplog: Any,
+    monkeypatch: Any,
+    caplog: Any,
 ) -> None:
     """If a previous response never completes, the pre-condition wait times out.
 
@@ -1078,16 +1190,12 @@ async def test_response_sender_loop_times_out_waiting_for_previous_response(
     handler._response_done_event.set()
     await asyncio.wait_for(sender_task, timeout=2.0)
 
-    timeout_logs = [
-        r for r in caplog.records
-        if "Timed out waiting for previous response" in r.getMessage()
-    ]
-    assert len(timeout_logs) == 1, (
-        f"Expected 1 pre-condition timeout warning, got {len(timeout_logs)}"
-    )
+    timeout_logs = [r for r in caplog.records if "Timed out waiting for previous response" in r.getMessage()]
+    assert len(timeout_logs) == 1, f"Expected 1 pre-condition timeout warning, got {len(timeout_logs)}"
 
 
 def test_should_ignore_server_vad_while_response_active() -> None:
+    """Server VAD is ignored while a response is active."""
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
     handler._response_done_event.clear()
@@ -1095,6 +1203,7 @@ def test_should_ignore_server_vad_while_response_active() -> None:
 
 
 def test_should_ignore_server_vad_after_recent_assistant_audio() -> None:
+    """Server VAD is ignored briefly after assistant audio."""
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
     handler._response_done_event.set()
@@ -1103,6 +1212,7 @@ def test_should_ignore_server_vad_after_recent_assistant_audio() -> None:
 
 
 def test_should_accept_server_vad_after_assistant_guard_elapsed() -> None:
+    """Server VAD resumes after the assistant audio guard expires."""
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
     handler._response_done_event.set()

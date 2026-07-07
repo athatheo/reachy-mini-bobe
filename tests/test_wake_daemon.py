@@ -1,11 +1,23 @@
 # ruff: noqa: D103
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 
 from bobe.wake_daemon.config import load_wake_daemon_config
 from bobe.wake_daemon.engine import WhisperWakeEngine
 
+
 _TEST_ENV = {"BOBE_WAKE_TOKEN": "test-token"}
+
+
+def _claude_code_launch_config():
+    return load_wake_daemon_config(
+        {
+            **_TEST_ENV,
+            "BOBE_CLAUDE_CODE_LAUNCH_ENABLED": "1",
+            "BOBE_CLAUDE_CODE_LAUNCH_TOKEN": "launch-token",
+        }
+    )
 
 
 def test_load_wake_daemon_config_requires_token():
@@ -144,3 +156,98 @@ def test_wake_daemon_app_starts_with_empty_engine_pool():
     config = load_wake_daemon_config(_TEST_ENV)
     app = create_app(config)
     assert app.state.wake_engines == {}
+
+
+def test_claude_code_launch_endpoint_disabled_by_default():
+    from bobe.wake_daemon.server import create_app
+
+    config = load_wake_daemon_config(_TEST_ENV)
+    client = TestClient(create_app(config))
+
+    response = client.post("/v1/launch/claude-code")
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "disabled"
+
+
+def test_claude_code_launch_endpoint_rejects_bad_token():
+    from bobe.wake_daemon.server import create_app
+
+    config = _claude_code_launch_config()
+    client = TestClient(create_app(config))
+
+    response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "bad-token"})
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "unauthorized"
+
+
+def test_claude_code_launch_endpoint_requires_launch_token_when_enabled():
+    from bobe.wake_daemon.server import create_app
+
+    config = load_wake_daemon_config(
+        {
+            **_TEST_ENV,
+            "BOBE_CLAUDE_CODE_LAUNCH_ENABLED": "1",
+        }
+    )
+    client = TestClient(create_app(config))
+
+    response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "missing_launch_token"
+
+
+def test_claude_code_launch_endpoint_calls_launcher_when_enabled():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeLauncher:
+        def launch(self):
+            return {"ok": True, "workdir": "/tmp/repos/bobe", "binary": "claude"}
+
+    config = _claude_code_launch_config()
+    app = create_app(config)
+    app.state.claude_code_launcher = FakeLauncher()
+    client = TestClient(app)
+
+    response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+
+def test_claude_code_launch_endpoint_returns_cooldown_status():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeLauncher:
+        def launch(self):
+            return {"ok": False, "error": "cooldown", "retry_after_s": 12.0}
+
+    config = _claude_code_launch_config()
+    app = create_app(config)
+    app.state.claude_code_launcher = FakeLauncher()
+    client = TestClient(app)
+
+    response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
+
+    assert response.status_code == 429
+    assert response.json()["error"] == "cooldown"
+
+
+def test_claude_code_launch_endpoint_maps_invalid_config():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeLauncher:
+        def launch(self):
+            return {"ok": False, "error": "invalid_config", "message": "bad workdir"}
+
+    config = _claude_code_launch_config()
+    app = create_app(config)
+    app.state.claude_code_launcher = FakeLauncher()
+    client = TestClient(app)
+
+    response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_config"

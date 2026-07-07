@@ -26,13 +26,14 @@ from bobe.wake_word import (
     AudioRingBuffer,
     is_sleep_phrase,
     load_wake_config,
-    create_wake_detector,
     wake_detector_error,
+    create_wake_detector,
 )
 from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
+from bobe.claude_code_launch import maybe_confirm_claude_code_launch
 from bobe.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -191,9 +192,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.error("Wake-word gating disabled: %s", self.wake_error)
             # Fallback: without a detector, stay in an always-on session so mic + replies work.
             self.wake_session.wake()
-            logger.warning(
-                "Wake-word detection unavailable; running in always-on mode until wake is configured"
-            )
+            logger.warning("Wake-word detection unavailable; running in always-on mode until wake is configured")
 
     def _session_accepts_responses(self) -> bool:
         """Return whether assistant responses should play (wake gating or always-on fallback)."""
@@ -499,7 +498,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             tool_result = bg_tool.result
             logger.info(
                 "Tool '%s' (id=%s) executed successfully.",
-                bg_tool.tool_name, bg_tool.id,
+                bg_tool.tool_name,
+                bg_tool.id,
             )
             logger.debug("Tool '%s' full result: %s", bg_tool.tool_name, tool_result)
         else:
@@ -508,7 +508,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Connection may have closed while tool was running
         if not self.connection:
-            logger.warning("Connection closed during tool '%s' (id=%s) execution; cannot send result back", bg_tool.tool_name, bg_tool.id)
+            logger.warning(
+                "Connection closed during tool '%s' (id=%s) execution; cannot send result back",
+                bg_tool.tool_name,
+                bg_tool.id,
+            )
             return
 
         try:
@@ -592,17 +596,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self.connection = None
             self._response_done_event.set()
 
-
     def _transcript_requests_sleep(self, transcript: str | None) -> bool:
         """Return True when a transcript contains a configured sleep phrase."""
         return bool(
-            transcript
-            and is_sleep_phrase(transcript, self.wake_config.sleep_phrases),
+            transcript and is_sleep_phrase(transcript, self.wake_config.sleep_phrases),
         )
 
-    async def _preempt_sleep_response(self) -> None:
-        """Cancel an in-flight or imminent server VAD response for a sleep command."""
-        self._sleep_pending = True
+    async def _cancel_in_flight_response(self) -> None:
+        """Cancel any active server VAD response and clear buffered user audio."""
         if not self.connection:
             return
         try:
@@ -614,6 +615,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         except Exception:
             pass
 
+    async def _preempt_sleep_response(self) -> None:
+        """Cancel an in-flight or imminent server VAD response for a sleep command."""
+        self._sleep_pending = True
+        await self._cancel_in_flight_response()
+
     async def _maybe_sleep_from_transcript(self, transcript: str | None) -> bool:
         """Return True after transitioning to sleep on a sleep phrase."""
         if self.wake_gating_enabled and not self.wake_session.awake:
@@ -624,14 +630,29 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self._transition_to_sleep("sleep phrase")
         return True
 
+    async def _maybe_launch_claude_code_from_transcript(self, transcript: str | None) -> bool:
+        """Return True after handling a local Claude Code launch confirmation."""
+        result = await maybe_confirm_claude_code_launch(transcript)
+        if result is None:
+            return False
+
+        await self._cancel_in_flight_response()
+        message = str(result.get("message") or "Claude Code launch request handled.")
+        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": message}))
+        if self.connection:
+            await self._safe_response_create(
+                response={
+                    "instructions": f"Say exactly this to the user: {message}",
+                },
+            )
+        self.wake_session.touch()
+        return True
+
     def _record_user_transcript(self, transcript: str | None) -> None:
         """Track the latest user transcript for early sleep detection."""
         if transcript:
             self._latest_user_transcript = transcript
-            if (
-                self.wake_session.awake
-                and self._transcript_requests_sleep(transcript)
-            ):
+            if self.wake_session.awake and self._transcript_requests_sleep(transcript):
                 self._sleep_pending = True
 
     async def _handle_completed_user_transcript(self, transcript: str) -> None:
@@ -647,6 +668,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
         if await self._maybe_sleep_from_transcript(transcript):
+            return
+        if await self._maybe_launch_claude_code_from_transcript(transcript):
             return
         self.wake_session.touch()
 
@@ -703,16 +726,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             except Exception:
                 pass
 
-
             response_sender_task: asyncio.Task[None] | None = None
             try:
                 # Start the background tool manager
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
                 # Start the response sender worker
-                response_sender_task = asyncio.create_task(
-                    self._response_sender_loop(), name="response-sender"
-                )
+                response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
 
                 async for event in self.connection:
                     logger.debug(f"OpenAI event: {event.type}")
@@ -746,9 +766,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         logger.debug("response completed")
 
                     if event.type == "response.created":
-                        if (
-                            not self._session_accepts_responses()
-                            or await self._maybe_sleep_from_transcript(self._latest_user_transcript)
+                        if not self._session_accepts_responses() or await self._maybe_sleep_from_transcript(
+                            self._latest_user_transcript
                         ):
                             if self.connection:
                                 try:
@@ -799,7 +818,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         if not self._session_accepts_responses():
                             continue
                         logger.debug(f"Assistant transcript: {event.transcript}")
-                        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
+                        await self.output_queue.put(
+                            AdditionalOutputs({"role": "assistant", "content": event.transcript})
+                        )
 
                     # Handle audio delta
                     if event.type in ("response.audio.delta", "response.output_audio.delta"):
@@ -825,14 +846,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                         logger.info(
                             "Tool call received — tool_name=%r, call_id=%s, args=%s",
-                            tool_name, call_id, args_json_str,
+                            tool_name,
+                            call_id,
+                            args_json_str,
                         )
 
                         if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
                             logger.error(
                                 "Invalid tool call: tool_name=%s (type=%s), args=%s (type=%s), call_id=%s",
-                                tool_name, type(tool_name).__name__,
-                                args_json_str, type(args_json_str).__name__,
+                                tool_name,
+                                type(tool_name).__name__,
+                                args_json_str,
+                                type(args_json_str).__name__,
                                 call_id,
                             )
                             continue
@@ -857,7 +882,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                         # No extra response here: the model's own turn already announces
                         # the tool; a second "notify" response doubled the speech.
-                        logger.info("Started background tool: %s (id=%s, call_id=%s)", tool_name, bg_tool.tool_id, call_id)
+                        logger.info(
+                            "Started background tool: %s (id=%s, call_id=%s)", tool_name, bg_tool.tool_id, call_id
+                        )
 
                     # server error
                     if event.type == "error":
@@ -981,9 +1008,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         tail = self._wake_buffer.drain_tail(DEFAULT_FLUSH_SECONDS)
         if tail.size and self.connection:
             try:
-                await self.connection.input_audio_buffer.append(
-                    audio=base64.b64encode(tail.tobytes()).decode("utf-8")
-                )
+                await self.connection.input_audio_buffer.append(audio=base64.b64encode(tail.tobytes()).decode("utf-8"))
             except Exception as e:
                 logger.warning("Could not flush pre-wake audio: %s", e)
         return True

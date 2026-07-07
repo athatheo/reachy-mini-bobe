@@ -1,19 +1,21 @@
 """WebSocket + HTTP server for the Mac wake daemon."""
 
 from __future__ import annotations
+import hmac
 import time
 import asyncio
 import logging
 from dataclasses import replace
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from bobe.wake.protocol import parse_json, wake_message, sleep_message, ready_message, stats_message
+from bobe.wake.protocol import parse_json, wake_message, ready_message, sleep_message, stats_message
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake_daemon.config import WakeDaemonConfig, load_wake_daemon_config
 from bobe.wake_daemon.engine import WhisperWakeEngine, WhisperWakeSession, whisper_engine_key
+from bobe.wake_daemon.launcher import ClaudeCodeLauncher
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
     app = FastAPI(title="BoBe Wake Daemon", version="0.1.0")
     engines: dict[tuple[str, str, str, str | None, str | None], WhisperWakeEngine] = {}
     app.state.wake_engines = engines
+    app.state.claude_code_launcher = ClaudeCodeLauncher(runtime)
 
     def shared_engine() -> WhisperWakeEngine:
         key = whisper_engine_key(runtime)
@@ -46,6 +49,33 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 "model": runtime.whisper_model,
             }
         )
+
+    @app.post("/v1/launch/claude-code")
+    async def launch_claude_code(request: Request) -> JSONResponse:
+        if not runtime.claude_code_launch_enabled:
+            return JSONResponse({"ok": False, "error": "disabled"}, status_code=403)
+
+        expected_token = (runtime.claude_code_launch_token or "").strip()
+        if not expected_token:
+            return JSONResponse({"ok": False, "error": "missing_launch_token"}, status_code=503)
+
+        provided_token = (request.headers.get("x-bobe-launch-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, expected_token):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+        launcher: ClaudeCodeLauncher = app.state.claude_code_launcher
+        result = await asyncio.to_thread(launcher.launch)
+        if result.get("ok"):
+            return JSONResponse(result)
+
+        status_code = 500
+        if result.get("error") == "cooldown":
+            status_code = 429
+        elif result.get("error") == "disabled":
+            status_code = 403
+        elif result.get("error") == "invalid_config":
+            status_code = 400
+        return JSONResponse(result, status_code=status_code)
 
     @app.websocket("/v1/stream")
     async def stream(websocket: WebSocket) -> None:
