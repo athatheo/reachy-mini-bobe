@@ -251,3 +251,102 @@ def test_claude_code_launch_endpoint_maps_invalid_config():
 
     assert response.status_code == 400
     assert response.json()["error"] == "invalid_config"
+
+
+def test_claude_code_session_start_endpoint_calls_manager():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeManager:
+        def start(self):
+            return {"ok": True, "session_id": "session-1"}
+
+    app = create_app(_claude_code_launch_config())
+    app.state.claude_code_session_manager = FakeManager()
+    client = TestClient(app)
+
+    response = client.post("/v1/claude-code/session/start", headers={"X-BoBe-Launch-Token": "launch-token"})
+
+    assert response.status_code == 200
+    assert response.json()["session_id"] == "session-1"
+
+
+def test_claude_code_session_send_endpoint_passes_command():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeManager:
+        def __init__(self):
+            self.commands = []
+
+        def send(self, command):
+            self.commands.append(command)
+            return {"ok": True, "output": "done"}
+
+    manager = FakeManager()
+    app = create_app(_claude_code_launch_config())
+    app.state.claude_code_session_manager = manager
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/claude-code/session/send",
+        headers={"X-BoBe-Launch-Token": "launch-token"},
+        json={"command": "run tests"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["output"] == "done"
+    assert manager.commands == ["run tests"]
+
+
+def test_claude_code_session_send_endpoint_rejects_empty_command():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeManager:
+        def send(self, command):
+            return {"ok": False, "error": "empty_command"}
+
+    app = create_app(_claude_code_launch_config())
+    app.state.claude_code_session_manager = FakeManager()
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/claude-code/session/send",
+        headers={"X-BoBe-Launch-Token": "launch-token"},
+        json={},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "empty_command"
+
+
+def test_claude_code_session_status_and_stop_endpoints():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeManager:
+        def status(self):
+            return {"ok": True, "active": True}
+
+        def stop(self):
+            return {"ok": True, "stopped_session_id": "session-1"}
+
+    app = create_app(_claude_code_launch_config())
+    app.state.claude_code_session_manager = FakeManager()
+    client = TestClient(app)
+
+    status_response = client.get("/v1/claude-code/session/status", headers={"X-BoBe-Launch-Token": "launch-token"})
+    stop_response = client.post("/v1/claude-code/session/stop", headers={"X-BoBe-Launch-Token": "launch-token"})
+
+    assert status_response.status_code == 200
+    assert status_response.json()["active"] is True
+    assert stop_response.status_code == 200
+    assert stop_response.json()["stopped_session_id"] == "session-1"
+
+
+def test_claude_code_session_endpoints_require_token():
+    from bobe.wake_daemon.server import create_app
+
+    client = TestClient(create_app(_claude_code_launch_config()))
+
+    response = client.post("/v1/claude-code/session/start", headers={"X-BoBe-Launch-Token": "bad-token"})
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "unauthorized"

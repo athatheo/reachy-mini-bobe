@@ -16,9 +16,18 @@ from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake_daemon.config import WakeDaemonConfig, load_wake_daemon_config
 from bobe.wake_daemon.engine import WhisperWakeEngine, WhisperWakeSession, whisper_engine_key
 from bobe.wake_daemon.launcher import ClaudeCodeLauncher
+from bobe.wake_daemon.claude_session import ClaudeCodeSessionManager
 
 
 logger = logging.getLogger(__name__)
+
+_CLAUDE_CODE_ERROR_STATUS = {
+    "busy": 409,
+    "cooldown": 429,
+    "disabled": 403,
+    "empty_command": 400,
+    "invalid_config": 400,
+}
 
 
 def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
@@ -30,6 +39,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
     engines: dict[tuple[str, str, str, str | None, str | None], WhisperWakeEngine] = {}
     app.state.wake_engines = engines
     app.state.claude_code_launcher = ClaudeCodeLauncher(runtime)
+    app.state.claude_code_session_manager = ClaudeCodeSessionManager(runtime)
 
     def shared_engine() -> WhisperWakeEngine:
         key = whisper_engine_key(runtime)
@@ -50,8 +60,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
             }
         )
 
-    @app.post("/v1/launch/claude-code")
-    async def launch_claude_code(request: Request) -> JSONResponse:
+    def require_claude_code_control(request: Request) -> JSONResponse | None:
         if not runtime.claude_code_launch_enabled:
             return JSONResponse({"ok": False, "error": "disabled"}, status_code=403)
 
@@ -62,20 +71,64 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         provided_token = (request.headers.get("x-bobe-launch-token") or "").strip()
         if not provided_token or not hmac.compare_digest(provided_token, expected_token):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        return None
 
-        launcher: ClaudeCodeLauncher = app.state.claude_code_launcher
-        result = await asyncio.to_thread(launcher.launch)
+    def response_for_result(result: dict[str, object]) -> JSONResponse:
         if result.get("ok"):
             return JSONResponse(result)
 
-        status_code = 500
-        if result.get("error") == "cooldown":
-            status_code = 429
-        elif result.get("error") == "disabled":
-            status_code = 403
-        elif result.get("error") == "invalid_config":
-            status_code = 400
+        error = str(result.get("error") or "")
+        status_code = _CLAUDE_CODE_ERROR_STATUS.get(error, 500)
         return JSONResponse(result, status_code=status_code)
+
+    @app.post("/v1/launch/claude-code")
+    async def launch_claude_code(request: Request) -> JSONResponse:
+        auth_error = require_claude_code_control(request)
+        if auth_error is not None:
+            return auth_error
+        launcher: ClaudeCodeLauncher = app.state.claude_code_launcher
+        result = await asyncio.to_thread(launcher.launch)
+        return response_for_result(result)
+
+    @app.post("/v1/claude-code/session/start")
+    async def start_claude_code_session(request: Request) -> JSONResponse:
+        auth_error = require_claude_code_control(request)
+        if auth_error is not None:
+            return auth_error
+        manager: ClaudeCodeSessionManager = app.state.claude_code_session_manager
+        result = await asyncio.to_thread(manager.start)
+        return response_for_result(result)
+
+    @app.post("/v1/claude-code/session/send")
+    async def send_claude_code_command(request: Request) -> JSONResponse:
+        auth_error = require_claude_code_control(request)
+        if auth_error is not None:
+            return auth_error
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        command = str(payload.get("command") or "").strip() if isinstance(payload, dict) else ""
+        manager: ClaudeCodeSessionManager = app.state.claude_code_session_manager
+        result = await asyncio.to_thread(manager.send, command)
+        return response_for_result(result)
+
+    @app.get("/v1/claude-code/session/status")
+    async def claude_code_session_status(request: Request) -> JSONResponse:
+        auth_error = require_claude_code_control(request)
+        if auth_error is not None:
+            return auth_error
+        manager: ClaudeCodeSessionManager = app.state.claude_code_session_manager
+        return JSONResponse(manager.status())
+
+    @app.post("/v1/claude-code/session/stop")
+    async def stop_claude_code_session(request: Request) -> JSONResponse:
+        auth_error = require_claude_code_control(request)
+        if auth_error is not None:
+            return auth_error
+        manager: ClaudeCodeSessionManager = app.state.claude_code_session_manager
+        result = await asyncio.to_thread(manager.stop)
+        return response_for_result(result)
 
     @app.websocket("/v1/stream")
     async def stream(websocket: WebSocket) -> None:

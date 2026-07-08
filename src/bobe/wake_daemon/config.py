@@ -20,6 +20,9 @@ DEFAULT_REFRACTORY_S = 2.5
 DEFAULT_CLAUDE_CODE_WORKDIR = "~/repos/bobe-claude-code-workspace"
 DEFAULT_CLAUDE_CODE_BIN = "claude"
 DEFAULT_CLAUDE_CODE_LAUNCH_COOLDOWN_S = 30.0
+DEFAULT_CLAUDE_CODE_COMMAND_TIMEOUT_S = 300.0
+DEFAULT_CLAUDE_CODE_OUTPUT_LIMIT_CHARS = 6000
+DEFAULT_CLAUDE_CODE_PERMISSION_MODE = "default"
 
 
 def whisper_initial_prompt_from_phrase(phrase: str) -> str:
@@ -63,6 +66,9 @@ class WakeDaemonConfig:
     claude_code_workdir: str = DEFAULT_CLAUDE_CODE_WORKDIR
     claude_code_bin: str = DEFAULT_CLAUDE_CODE_BIN
     claude_code_launch_cooldown_s: float = DEFAULT_CLAUDE_CODE_LAUNCH_COOLDOWN_S
+    claude_code_command_timeout_s: float = DEFAULT_CLAUDE_CODE_COMMAND_TIMEOUT_S
+    claude_code_output_limit_chars: int = DEFAULT_CLAUDE_CODE_OUTPUT_LIMIT_CHARS
+    claude_code_permission_mode: str = DEFAULT_CLAUDE_CODE_PERMISSION_MODE
 
 
 def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConfig:
@@ -133,5 +139,17 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
         claude_code_launch_cooldown_s=max(
             0.0,
             _float("BOBE_CLAUDE_CODE_LAUNCH_COOLDOWN_S", DEFAULT_CLAUDE_CODE_LAUNCH_COOLDOWN_S),
+        ),
+        claude_code_command_timeout_s=max(
+            1.0,
+            _float("BOBE_CLAUDE_CODE_COMMAND_TIMEOUT_S", DEFAULT_CLAUDE_CODE_COMMAND_TIMEOUT_S),
+        ),
+        claude_code_output_limit_chars=max(
+            500,
+            _int("BOBE_CLAUDE_CODE_OUTPUT_LIMIT_CHARS", DEFAULT_CLAUDE_CODE_OUTPUT_LIMIT_CHARS),
+        ),
+        claude_code_permission_mode=(
+            source.get("BOBE_CLAUDE_CODE_PERMISSION_MODE", DEFAULT_CLAUDE_CODE_PERMISSION_MODE).strip()
+            or DEFAULT_CLAUDE_CODE_PERMISSION_MODE
         ),
     )

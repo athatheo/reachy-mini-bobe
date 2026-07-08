@@ -17,6 +17,11 @@ from bobe.claude_code_launch import (
     ClaudeCodeLaunchController,
     reset_claude_code_launch_controller,
 )
+from bobe.claude_code_session import (
+    ClaudeCodeSessionSettings,
+    ClaudeCodeSessionController,
+    reset_claude_code_session_controller,
+)
 from bobe.tools.background_tool_manager import ToolCallRoutine
 
 
@@ -715,6 +720,102 @@ def test_partial_confirmation_transcript_does_not_launch_claude_code() -> None:
         assert controller.has_pending() is True
     finally:
         reset_claude_code_launch_controller()
+
+
+@pytest.mark.asyncio
+async def test_completed_command_confirmation_sends_claude_code_command() -> None:
+    """Only completed exact command confirmation sends a staged Claude Code command."""
+    calls = []
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b'{"ok": true, "output": "done"}'
+
+    def fake_opener(request: Any, *, timeout: float) -> FakeResponse:
+        calls.append((request, timeout))
+        return FakeResponse()
+
+    controller = ClaudeCodeSessionController(
+        settings_loader=lambda: ClaudeCodeSessionSettings(
+            base_url="http://mac.local:8765/v1/claude-code",
+            token="control-token",
+        ),
+        opener=fake_opener,
+    )
+    reset_claude_code_session_controller(controller)
+    try:
+        controller.request_send("run the tests")
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        await handler._handle_completed_user_transcript("confirm Claude command")
+
+        user_output = await handler.output_queue.get()
+        assistant_output = await handler.output_queue.get()
+        assert user_output.args[0] == {"role": "user", "content": "confirm Claude command"}
+        assert assistant_output.args[0]["role"] == "assistant"
+        assert "sent" in assistant_output.args[0]["content"]
+        assert len(calls) == 1
+    finally:
+        reset_claude_code_session_controller()
+
+
+@pytest.mark.asyncio
+async def test_near_miss_command_confirmation_does_not_send_claude_code_command() -> None:
+    """Near-miss command confirmation leaves the command pending."""
+    calls = []
+    controller = ClaudeCodeSessionController(
+        settings_loader=lambda: ClaudeCodeSessionSettings(
+            base_url="http://mac.local:8765/v1/claude-code",
+            token="control-token",
+        ),
+        opener=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    reset_claude_code_session_controller(controller)
+    try:
+        controller.request_send("run the tests")
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        await handler._handle_completed_user_transcript("please confirm Claude command")
+
+        assert calls == []
+        assert controller.has_pending() is True
+        user_output = await handler.output_queue.get()
+        assert user_output.args[0] == {"role": "user", "content": "please confirm Claude command"}
+        assert handler.output_queue.empty()
+    finally:
+        reset_claude_code_session_controller()
+
+
+def test_partial_command_confirmation_does_not_send_claude_code_command() -> None:
+    """Partial transcript tracking alone does not send a staged Claude Code command."""
+    calls = []
+    controller = ClaudeCodeSessionController(
+        settings_loader=lambda: ClaudeCodeSessionSettings(
+            base_url="http://mac.local:8765/v1/claude-code",
+            token="control-token",
+        ),
+        opener=lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    reset_claude_code_session_controller(controller)
+    try:
+        controller.request_send("run the tests")
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        handler._record_user_transcript("confirm Claude command")
+
+        assert calls == []
+        assert controller.has_pending() is True
+    finally:
+        reset_claude_code_session_controller()
 
 
 @pytest.mark.asyncio

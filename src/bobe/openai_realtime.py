@@ -34,6 +34,7 @@ from bobe.tools.core_tools import (
     get_tool_specs,
 )
 from bobe.claude_code_launch import maybe_confirm_claude_code_launch
+from bobe.claude_code_session import maybe_confirm_claude_code_command
 from bobe.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -633,11 +634,31 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     async def _maybe_launch_claude_code_from_transcript(self, transcript: str | None) -> bool:
         """Return True after handling a local Claude Code launch confirmation."""
         result = await maybe_confirm_claude_code_launch(transcript)
+        return await self._handle_claude_code_confirmation_result(
+            result,
+            fallback_message="Claude Code launch request handled.",
+        )
+
+    async def _maybe_send_claude_code_command_from_transcript(self, transcript: str | None) -> bool:
+        """Return True after handling a local Claude Code command confirmation."""
+        result = await maybe_confirm_claude_code_command(transcript)
+        return await self._handle_claude_code_confirmation_result(
+            result,
+            fallback_message="Claude Code command request handled.",
+        )
+
+    async def _handle_claude_code_confirmation_result(
+        self,
+        result: dict[str, Any] | None,
+        *,
+        fallback_message: str,
+    ) -> bool:
+        """Return True after surfacing a local Claude Code confirmation result."""
         if result is None:
             return False
 
         await self._cancel_in_flight_response()
-        message = str(result.get("message") or "Claude Code launch request handled.")
+        message = str(result.get("message") or fallback_message)
         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": message}))
         if self.connection:
             await self._safe_response_create(
@@ -670,6 +691,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         if await self._maybe_sleep_from_transcript(transcript):
             return
         if await self._maybe_launch_claude_code_from_transcript(transcript):
+            return
+        if await self._maybe_send_claude_code_command_from_transcript(transcript):
             return
         self.wake_session.touch()
 

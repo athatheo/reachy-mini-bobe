@@ -3,6 +3,10 @@
 
 ask_claude
 launch_claude_code
+start_claude_code_session
+send_claude_code_command
+get_claude_code_status
+stop_claude_code_session
 play_emotion
 stop_emotion
 move_head
