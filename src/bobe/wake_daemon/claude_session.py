@@ -1,6 +1,7 @@
 """Managed Claude Code sessions for the Mac wake daemon."""
 
 from __future__ import annotations
+import os
 import json
 import time
 import uuid
@@ -228,12 +229,12 @@ def _limit_text(value: str, limit: int) -> str:
 def _terminate_process_group(process: subprocess.Popen[str]) -> None:
     try:
         if process.pid:
-            signal.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         try:
             if process.pid:
-                signal.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
     except ProcessLookupError:
