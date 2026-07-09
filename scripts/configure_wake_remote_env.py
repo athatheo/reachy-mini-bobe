@@ -2,18 +2,9 @@
 """Merge remote wake settings into a BoBe .env file."""
 
 from __future__ import annotations
-
-import argparse
 import socket
+import argparse
 from pathlib import Path
-
-
-REMOTE_KEYS = (
-    "BOBE_WAKE_BACKEND",
-    "BOBE_WAKE_REMOTE_URL",
-    "BOBE_WAKE_TOKEN",
-    "BOBE_WAKE_GAIN",
-)
 
 
 def _detect_host(default: str) -> str:

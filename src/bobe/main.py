@@ -3,10 +3,8 @@
 import os
 import sys
 import time
-import asyncio
 import argparse
 import threading
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import gradio as gr
@@ -15,14 +13,14 @@ from fastrtc import Stream
 from gradio.utils import get_space
 
 from reachy_mini import ReachyMini, ReachyMiniApp
-from bobe.instance import load_instance_env, resolve_instance_path
-from bobe.settings_server import bootstrap_settings_ui
 from bobe.utils import (
     parse_args,
     setup_logger,
     handle_vision_stuff,
     log_connection_troubleshooting,
 )
+from bobe.instance import load_instance_env, resolve_instance_path
+from bobe.settings_server import bootstrap_settings_ui
 
 
 def update_chatbot(chatbot: List[Dict[str, Any]], response: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -43,7 +41,7 @@ def run(
     app_stop_event: Optional[threading.Event] = None,
     settings_app: Optional[FastAPI] = None,
     instance_path: Optional[str] = None,
-    handler_box: Optional[list] = None,
+    handler_box: Optional[list[Any]] = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
@@ -243,13 +241,10 @@ class Bobe(ReachyMiniApp):  # type: ignore[misc]
 
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event) -> None:
         """Run the Reachy Mini conversation app."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
         args, _ = parse_args()
         instance_path = resolve_instance_path()
         load_instance_env(instance_path)
-        handler_box: list = [None]
+        handler_box: list[Any] = [None]
         bootstrap_settings_ui(self.settings_app, str(instance_path), lambda: handler_box[0])
 
         run(

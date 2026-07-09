@@ -1,3 +1,4 @@
+import os
 import json
 import time
 import uuid
@@ -17,18 +18,18 @@ from numpy.typing import NDArray
 from scipy.signal import resample
 from websockets.exceptions import ConnectionClosedError
 
-from bobe.config import config
+from bobe.config import config, set_custom_profile
 from bobe.prompts import get_session_voice, get_realtime_session_instructions
 from bobe.wake_word import (
-    WAKE_SAMPLE_RATE,
     DEFAULT_FLUSH_SECONDS,
     WakeSession,
     AudioRingBuffer,
-    is_sleep_phrase,
     load_wake_config,
     wake_detector_error,
     create_wake_detector,
 )
+from bobe.wake.phrases import matches_sleep_phrase
+from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
@@ -132,14 +133,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         )
 
         # Override typing of the sample rates to match OpenAI's requirements
-        self.output_sample_rate: Literal[24000] = self.output_sample_rate
-        self.input_sample_rate: Literal[24000] = self.input_sample_rate
+        self.output_sample_rate: Literal[24000] = OPEN_AI_OUTPUT_SAMPLE_RATE
+        self.input_sample_rate: Literal[24000] = OPEN_AI_INPUT_SAMPLE_RATE
 
         self.deps = deps
-
-        # Override type annotations for OpenAI strict typing (only for values used in API)
-        self.output_sample_rate = OPEN_AI_OUTPUT_SAMPLE_RATE
-        self.input_sample_rate = OPEN_AI_INPUT_SAMPLE_RATE
 
         self.connection: Any = None
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
@@ -176,9 +173,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         self.wake_config = load_wake_config()
         self.wake_session = WakeSession(timeout_s=self.wake_config.timeout_s)
-        # Diagnostic mode: keep scoring the mic but never wake or stream upstream.
-        self.wake_test_mode = False
-        self.wake_test_detections = 0
         self._wake_buffer = AudioRingBuffer(sample_rate=self.input_sample_rate)
         self._wake_detector = create_wake_detector(
             on_wake=self.wake_session.request_wake,
@@ -221,13 +215,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         Returns a short status message for UI feedback.
         """
         try:
-            # Update the in-process config value and env
-            from bobe.config import config as _config
-            from bobe.config import set_custom_profile
-
             set_custom_profile(profile)
             logger.info(
-                "Set custom profile to %r (config=%r)", profile, getattr(_config, "REACHY_MINI_CUSTOM_PROFILE", None)
+                "Set custom profile to %r (config=%r)", profile, getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None)
             )
 
             try:
@@ -280,15 +270,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 openai_api_key = textbox_api_key
                 self._key_source = "textbox"
                 self._provided_api_key = textbox_api_key
-            else:
-                openai_api_key = config.OPENAI_API_KEY
-        else:
-            if not openai_api_key or not openai_api_key.strip():
-                # In headless console mode, LocalStream now blocks startup until the key is provided.
-                # However, unit tests may invoke this handler directly with a stubbed client.
-                # To keep tests hermetic without requiring a real key, fall back to a placeholder.
-                logger.warning("OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
-                openai_api_key = "DUMMY"
+        elif not openai_api_key or not openai_api_key.strip():
+            # In headless console mode, LocalStream now blocks startup until the key is provided.
+            # However, unit tests may invoke this handler directly with a stubbed client.
+            # To keep tests hermetic without requiring a real key, fall back to a placeholder.
+            logger.warning("OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
+            openai_api_key = "DUMMY"
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
 
@@ -329,10 +316,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             finally:
                 # never keep a stale reference
                 self.connection = None
-                try:
-                    self._connected_event.clear()
-                except Exception:
-                    pass
+                self._connected_event.clear()
 
     async def _ensure_openai_connection(self, timeout: float = 5.0) -> bool:
         """Wait for an active Realtime connection, restarting the session if needed."""
@@ -380,10 +364,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Drop the active connection so the session task can exit and restart."""
         conn = self.connection
         self.connection = None
-        try:
-            self._connected_event.clear()
-        except Exception:
-            pass
+        self._connected_event.clear()
         if conn is not None:
             try:
                 await conn.close()
@@ -600,7 +581,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     def _transcript_requests_sleep(self, transcript: str | None) -> bool:
         """Return True when a transcript contains a configured sleep phrase."""
         return bool(
-            transcript and is_sleep_phrase(transcript, self.wake_config.sleep_phrases),
+            transcript and matches_sleep_phrase(transcript, self.wake_config.sleep_phrases),
         )
 
     async def _cancel_in_flight_response(self) -> None:
@@ -744,10 +725,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             # Manage event received from the openai server
             self.connection = conn
-            try:
-                self._connected_event.set()
-            except Exception:
-                pass
+            self._connected_event.set()
 
             response_sender_task: asyncio.Task[None] | None = None
             try:
@@ -826,7 +804,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         if await self._maybe_sleep_from_transcript(transcript):
                             continue
 
-                        await self._partial_debouncer.schedule(transcript)
+                        if transcript:
+                            await self._partial_debouncer.schedule(transcript)
 
                     # Handle completed transcription (user finished speaking)
                     if event.type == "conversation.item.input_audio_transcription.completed":
@@ -1061,24 +1040,17 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     def _listen_for_sleep_detector(self) -> None:
         detector = self._wake_detector
-        if detector is not None and hasattr(detector, "listen_for_sleep"):
+        if detector is not None:
             detector.listen_for_sleep()
 
     def _listen_for_wake_detector(self) -> None:
         detector = self._wake_detector
         if detector is None:
             return
-        if hasattr(detector, "listen_for_wake"):
-            detector.listen_for_wake()
+        detector.listen_for_wake()
         if not detector.is_running():
             logger.warning("Wake detector thread not running; restarting")
             detector.start()
-
-    def _pause_wake_detector(self) -> None:
-        self._listen_for_sleep_detector()
-
-    def _resume_wake_detector(self) -> None:
-        self._listen_for_wake_detector()
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive a mic frame; keep it local while asleep, otherwise send upstream.
@@ -1109,12 +1081,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Cast if needed
         upstream_frame = audio_to_int16(upstream_frame)
-
-        if self.wake_test_mode:
-            if self.wake_session.consume_wake_request():
-                self.wake_test_detections += 1
-            self._feed_wake_detector(audio_frame, input_sample_rate)
-            return
 
         if self.wake_gating_enabled:
             if self.wake_session.consume_wake_request():
@@ -1149,10 +1115,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.warning("Failed to send audio frame; will retry reconnect (%s)", e)
             conn = self.connection
             self.connection = None
-            try:
-                self._connected_event.clear()
-            except Exception:
-                pass
+            self._connected_event.clear()
             if conn is not None:
                 try:
                     await conn.close()
@@ -1211,14 +1174,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 break
 
     async def get_available_voices(self) -> list[str]:
-        """Try to discover available voices for the configured realtime model.
-
-        Attempts to retrieve model metadata from the OpenAI Models API and look
-        for any keys that might contain voice names. Falls back to a curated
-        list known to work with realtime if discovery fails.
-        """
-        # Conservative fallback list with default first
-        fallback = [
+        """Return the realtime voices offered in the UI (default first)."""
+        return [
             "cedar",
             "alloy",
             "aria",
@@ -1227,55 +1184,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             "sage",
             "coral",
         ]
-        try:
-            # Best effort discovery; safe-guarded for unexpected shapes
-            model = await self.client.models.retrieve(config.MODEL_NAME)
-            # Try common serialization paths
-            raw = None
-            for attr in ("model_dump", "to_dict"):
-                fn = getattr(model, attr, None)
-                if callable(fn):
-                    try:
-                        raw = fn()
-                        break
-                    except Exception:
-                        pass
-            if raw is None:
-                try:
-                    raw = dict(model)
-                except Exception:
-                    raw = None
-            # Scan for voice candidates
-            candidates: set[str] = set()
-
-            def _collect(obj: object) -> None:
-                try:
-                    if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            kl = str(k).lower()
-                            if "voice" in kl and isinstance(v, (list, tuple)):
-                                for item in v:
-                                    if isinstance(item, str):
-                                        candidates.add(item)
-                                    elif isinstance(item, dict) and "name" in item and isinstance(item["name"], str):
-                                        candidates.add(item["name"])
-                            else:
-                                _collect(v)
-                    elif isinstance(obj, (list, tuple)):
-                        for it in obj:
-                            _collect(it)
-                except Exception:
-                    pass
-
-            if isinstance(raw, dict):
-                _collect(raw)
-            # Ensure default present and stable order
-            voices = sorted(candidates) if candidates else fallback
-            if "cedar" not in voices:
-                voices = ["cedar", *[v for v in voices if v != "cedar"]]
-            return voices
-        except Exception:
-            return fallback
 
     def _persist_api_key_if_needed(self) -> None:
         """Persist the API key into `.env` inside `instance_path/` when appropriate.
@@ -1303,12 +1211,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 return
 
             # Update the current process environment for downstream consumers
-            try:
-                import os
-
-                os.environ["OPENAI_API_KEY"] = key
-            except Exception:  # best-effort
-                pass
+            os.environ["OPENAI_API_KEY"] = key
 
             target_dir = Path(self.instance_path)
             env_path = target_dir / ".env"

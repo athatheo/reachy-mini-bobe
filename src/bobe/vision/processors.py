@@ -15,10 +15,10 @@ from bobe.config import config
 
 try:
     import torch as _torch
-except ImportError:  # pragma: no cover - exercised through import behavior
-    _torch = None
 
-torch: Any = _torch
+    torch: Any = _torch
+except ImportError:  # pragma: no cover - exercised through import behavior
+    torch = None
 
 try:
     from transformers import AutoProcessor as _AutoProcessor
@@ -243,9 +243,8 @@ class LocalVision:
     processor: VisionProcessor
 
 
-def initialize_local_vision(camera_worker: Any) -> LocalVision | None:
+def initialize_local_vision() -> LocalVision | None:
     """Download and initialize the local vision model for on-demand camera tool use."""
-    _ = camera_worker  # retained for call-site compatibility
     try:
         model_id = config.LOCAL_VISION_MODEL
         cache_dir = os.path.expanduser(config.HF_HOME)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from bobe.env_utils import parse_bool, parse_float, parse_int
+from bobe.env_utils import parse_int, parse_bool, parse_float
 from bobe.wake.phrases import WAKE_PHRASE
 
 

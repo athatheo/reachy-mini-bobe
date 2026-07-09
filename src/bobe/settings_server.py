@@ -3,18 +3,22 @@
 # ruff: noqa: D102,D103,D107
 
 from __future__ import annotations
-
 import os
 import logging
-from typing import Annotated, Callable
+from typing import Any, Callable, Annotated
 from pathlib import Path
 from urllib.parse import urlparse
+
+from fastapi import Body, FastAPI, Response
+from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.staticfiles import StaticFiles
 
 from bobe.claude import DEFAULT_CLAUDE_MODEL
 from bobe.config import config
 from bobe.env_file import persist_api_settings, is_plausible_openai_key, is_plausible_anthropic_key
+from bobe.wake_env import persist_wake_env, is_wake_remote_host_allowed
 from bobe.wake.phrases import WAKE_PHRASE
-from bobe.wake_env import is_wake_remote_host_allowed, persist_wake_env
 from bobe.openai_realtime import OpenaiRealtimeHandler
 
 
@@ -28,43 +32,30 @@ WAKE_DEBUG_TRANSCRIPT_KEYS = (
 )
 WAKE_DEBUG_REMOTE_TRANSCRIPT_KEYS = ("transcript", "partial")
 
-try:
-    from fastapi import Body, FastAPI, Response
-    from pydantic import BaseModel
-    from fastapi.responses import FileResponse, JSONResponse
-    from starlette.staticfiles import StaticFiles
-except Exception:  # pragma: no cover
-    FastAPI = object  # type: ignore
-    Body = object  # type: ignore
-    Response = object  # type: ignore
-    FileResponse = object  # type: ignore
-    JSONResponse = object  # type: ignore
-    BaseModel = object  # type: ignore
-    StaticFiles = object  # type: ignore
+
+class ApiSettingsPayload(BaseModel):
+    """POST /api_keys payload."""
+
+    openai_api_key: str
+    anthropic_api_key: str
+    claude_model: str = DEFAULT_CLAUDE_MODEL
 
 
-if BaseModel is not object:
-    class ApiSettingsPayload(BaseModel):
-        openai_api_key: str
-        anthropic_api_key: str
-        claude_model: str = DEFAULT_CLAUDE_MODEL
+class WakeConfigPayload(BaseModel):
+    """POST /wake-config payload."""
 
-    class WakeConfigPayload(BaseModel):
-        backend: str = "remote"
-        remote_url: str
-        token: str
-        gain: float = 1.75
-else:
-    ApiSettingsPayload = object  # type: ignore
-    WakeConfigPayload = object  # type: ignore
+    backend: str = "remote"
+    remote_url: str
+    token: str
+    gain: float = 1.75
 
 
 _settings_server: SettingsUIServer | None = None
 
 
 def _redact_wake_debug_for_public(
-    wake_debug: dict | None,
-) -> dict | None:
+    wake_debug: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     """Strip transcript-bearing wake debug fields for unauthenticated status callers."""
     if wake_debug is None:
         return None
@@ -100,11 +91,7 @@ class SettingsUIServer:
         static_dir = Path(__file__).parent / "static"
         index_file = static_dir / "index.html"
 
-        if hasattr(app, "mount"):
-            try:
-                app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-            except Exception:
-                pass
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
         @app.get("/")
         def _root() -> FileResponse:
@@ -146,12 +133,10 @@ class SettingsUIServer:
                     "wake_error": wake_error,
                     "awake": awake,
                     "wake_backend": wake_config.backend if wake_config else None,
-                    "wake_phrase": WAKE_PHRASE,
+                    "wake_phrase": wake_config.phrase if wake_config else WAKE_PHRASE,
                     "wake_remote_url": wake_remote_url,
                     "wake_timeout_s": wake_config.timeout_s if wake_config else None,
                     "wake_debug": wake_debug,
-                    "wake_test_mode": bool(getattr(handler, "wake_test_mode", False)) if handler else False,
-                    "wake_test_detections": int(getattr(handler, "wake_test_detections", 0)) if handler else 0,
                 }
             )
 

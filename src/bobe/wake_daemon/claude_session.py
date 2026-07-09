@@ -15,9 +15,6 @@ from bobe.wake_daemon.config import WakeDaemonConfig
 from bobe.wake_daemon.launcher import ClaudeCodeLaunchError, resolve_binary, resolve_workdir
 
 
-DEFAULT_COMMAND_TIMEOUT_S = 300.0
-DEFAULT_OUTPUT_LIMIT_CHARS = 6000
-DEFAULT_PERMISSION_MODE = "default"
 ALLOWED_PERMISSION_MODES = {"acceptEdits", "auto", "bypassPermissions", "default", "dontAsk", "plan"}
 
 

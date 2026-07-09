@@ -6,17 +6,37 @@ and executed sequentially by the MovementManager.
 
 from __future__ import annotations
 import logging
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 
+from reachy_mini.utils import create_head_pose
 from reachy_mini.motion.move import Move
+from reachy_mini.utils.interpolation import linear_pose_interpolation
 from reachy_mini.motion.recorded_move import RecordedMoves
 from reachy_mini_dances_library.dance_move import DanceMove
 
 
 logger = logging.getLogger(__name__)
+
+MoveEval = Tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]
+
+
+def _evaluate_wrapped(move: Any, t: float, label: str) -> MoveEval:
+    """Evaluate a wrapped library move, falling back to a neutral pose on error."""
+    try:
+        head_pose, antennas, body_yaw = move.evaluate(t)
+
+        # Convert to numpy array if antennas is tuple and return in official Move format
+        if isinstance(antennas, tuple):
+            antennas = np.array([antennas[0], antennas[1]])
+
+        return (head_pose, antennas, body_yaw)
+    except Exception as e:
+        logger.error(f"Error evaluating {label} at t={t}: {e}")
+        neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+        return (neutral_head_pose, np.array([0.0, 0.0], dtype=np.float64), 0.0)
 
 
 class DanceQueueMove(Move):  # type: ignore
@@ -32,25 +52,9 @@ class DanceQueueMove(Move):  # type: ignore
         """Duration property required by official Move interface."""
         return float(self.dance_move.duration)
 
-    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+    def evaluate(self, t: float) -> MoveEval:
         """Evaluate dance move at time t."""
-        try:
-            # Get the pose from the dance move
-            head_pose, antennas, body_yaw = self.dance_move.evaluate(t)
-
-            # Convert to numpy array if antennas is tuple and return in official Move format
-            if isinstance(antennas, tuple):
-                antennas = np.array([antennas[0], antennas[1]])
-
-            return (head_pose, antennas, body_yaw)
-
-        except Exception as e:
-            logger.error(f"Error evaluating dance move '{self.move_name}' at t={t}: {e}")
-            # Return neutral pose on error
-            from reachy_mini.utils import create_head_pose
-
-            neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
-            return (neutral_head_pose, np.array([0.0, 0.0], dtype=np.float64), 0.0)
+        return _evaluate_wrapped(self.dance_move, t, f"dance move '{self.move_name}'")
 
 
 class EmotionQueueMove(Move):  # type: ignore
@@ -66,25 +70,9 @@ class EmotionQueueMove(Move):  # type: ignore
         """Duration property required by official Move interface."""
         return float(self.emotion_move.duration)
 
-    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+    def evaluate(self, t: float) -> MoveEval:
         """Evaluate emotion move at time t."""
-        try:
-            # Get the pose from the emotion move
-            head_pose, antennas, body_yaw = self.emotion_move.evaluate(t)
-
-            # Convert to numpy array if antennas is tuple and return in official Move format
-            if isinstance(antennas, tuple):
-                antennas = np.array([antennas[0], antennas[1]])
-
-            return (head_pose, antennas, body_yaw)
-
-        except Exception as e:
-            logger.error(f"Error evaluating emotion '{self.emotion_name}' at t={t}: {e}")
-            # Return neutral pose on error
-            from reachy_mini.utils import create_head_pose
-
-            neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
-            return (neutral_head_pose, np.array([0.0, 0.0], dtype=np.float64), 0.0)
+        return _evaluate_wrapped(self.emotion_move, t, f"emotion '{self.emotion_name}'")
 
 
 class GotoQueueMove(Move):  # type: ignore
@@ -114,12 +102,9 @@ class GotoQueueMove(Move):  # type: ignore
         """Duration property required by official Move interface."""
         return self._duration
 
-    def evaluate(self, t: float) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None, float | None]:
+    def evaluate(self, t: float) -> MoveEval:
         """Evaluate goto move at time t using linear interpolation."""
         try:
-            from reachy_mini.utils import create_head_pose
-            from reachy_mini.utils.interpolation import linear_pose_interpolation
-
             # Clamp t to [0, 1] for interpolation
             t_clamped = max(0, min(1, t / self.duration))
 

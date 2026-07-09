@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from bobe.config import config
 from bobe.console import LocalStream
-from bobe.env_file import is_plausible_anthropic_key, is_plausible_openai_key, persist_api_settings
+from bobe.env_file import persist_api_settings, is_plausible_openai_key, is_plausible_anthropic_key
 from bobe.settings_server import SettingsUIServer, _redact_wake_debug_for_public
 
 
@@ -94,8 +94,6 @@ def _settings_client(tmp_path, monkeypatch):
             }
         ),
         connection=None,
-        wake_test_mode=False,
-        wake_test_detections=0,
     )
     app = FastAPI()
     SettingsUIServer(str(tmp_path), lambda: handler).mount(app)
@@ -121,8 +119,9 @@ def test_status_includes_wake_debug_with_api_keys(tmp_path, monkeypatch):
 
 
 def test_status_reports_wake_error_when_gating_disabled(tmp_path, monkeypatch):
-    from bobe.openai_realtime import OpenaiRealtimeHandler
     from unittest.mock import MagicMock
+
+    from bobe.openai_realtime import OpenaiRealtimeHandler
     from bobe.tools.core_tools import ToolDependencies
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

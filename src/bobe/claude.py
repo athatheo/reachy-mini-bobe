@@ -6,6 +6,7 @@ from typing import Any, Mapping, Protocol, cast
 from dataclasses import dataclass
 
 from bobe.prompts import get_claude_system_prompt
+from bobe.env_utils import parse_int, clean_optional
 
 
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -36,17 +37,11 @@ class ClaudeSettings:
 def load_claude_settings(env: Mapping[str, str] | None = None) -> ClaudeSettings:
     """Load Claude settings from environment variables."""
     source = os.environ if env is None else env
-    raw_max_tokens = source.get("CLAUDE_MAX_TOKENS", str(DEFAULT_MAX_TOKENS))
-
-    try:
-        max_tokens = int(raw_max_tokens)
-    except ValueError:
-        max_tokens = DEFAULT_MAX_TOKENS
 
     return ClaudeSettings(
-        api_key=_clean_env_value(source.get("ANTHROPIC_API_KEY")),
+        api_key=clean_optional(source.get("ANTHROPIC_API_KEY")),
         model=source.get("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL,
-        max_tokens=max(1, max_tokens),
+        max_tokens=max(1, parse_int(source.get("CLAUDE_MAX_TOKENS"), DEFAULT_MAX_TOKENS)),
         web_search=(source.get("BOBE_CLAUDE_WEB_SEARCH", "1").strip().lower() not in {"0", "false", "no", "off"}),
     )
 
@@ -105,10 +100,3 @@ async def ask_claude(
 
     response = await active_client.messages.create(**request)
     return extract_message_text(response)
-
-
-def _clean_env_value(value: str | None) -> str | None:
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None

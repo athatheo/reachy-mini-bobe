@@ -1,7 +1,6 @@
 """Helpers for persisting remote wake settings into the app instance .env."""
 
 from __future__ import annotations
-
 import os
 from pathlib import Path
 from urllib.parse import urlparse

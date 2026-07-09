@@ -7,14 +7,14 @@ JSON-over-HTTP error mapping.
 """
 
 from __future__ import annotations
-
+import re
 import json
 import logging
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
+
 
 logger = logging.getLogger(__name__)
 

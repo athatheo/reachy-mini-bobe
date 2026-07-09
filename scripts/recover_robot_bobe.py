@@ -2,10 +2,9 @@
 """Try to restart BoBe on a Reachy robot; print recovery steps if the apps API is wedged."""
 
 from __future__ import annotations
-
-import argparse
-import json
 import sys
+import json
+import argparse
 import urllib.error
 import urllib.request
 

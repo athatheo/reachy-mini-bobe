@@ -1,5 +1,5 @@
 # ruff: noqa: D103
-from bobe.wake.phrases import matches_sleep_phrase, matches_wake_phrase, normalize_transcript
+from bobe.wake.phrases import matches_wake_phrase, matches_sleep_phrase, normalize_transcript
 
 
 def test_normalize_transcript():
@@ -33,4 +33,6 @@ def test_matches_sleep_phrase():
     assert matches_sleep_phrase("go to sleep")
     assert matches_sleep_phrase("please go to sleep now")
     assert matches_sleep_phrase("got to sleep")
+    assert matches_sleep_phrase("κοιμήσου")
     assert not matches_sleep_phrase("hey jarvis")
+    assert not matches_sleep_phrase("")

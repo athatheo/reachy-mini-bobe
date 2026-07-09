@@ -1,9 +1,8 @@
 """Entrypoint for the Mac-side BoBe wake daemon."""
 
 from __future__ import annotations
-
-import argparse
 import logging
+import argparse
 
 import uvicorn
 

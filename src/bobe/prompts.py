@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from bobe.config import LOCKED_PROFILE, DEFAULT_PROFILES_DIRECTORY, config
+from bobe.personality.store import read_voice_for
 
 
 logger = logging.getLogger(__name__)
@@ -11,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 PROMPTS_LIBRARY_DIRECTORY = Path(__file__).parent / "prompts"
 INSTRUCTIONS_FILENAME = "instructions.txt"
-VOICE_FILENAME = "voice.txt"
 
 
 def _expand_prompt_includes(content: str) -> str:
@@ -124,11 +124,4 @@ def get_session_voice(default: str = "cedar") -> str:
     profile = config.REACHY_MINI_CUSTOM_PROFILE
     if not profile:
         return default
-    try:
-        voice_file = config.PROFILES_DIRECTORY / profile / VOICE_FILENAME
-        if voice_file.exists():
-            voice = voice_file.read_text(encoding="utf-8").strip()
-            return voice or default
-    except Exception:
-        pass
-    return default
+    return read_voice_for(profile, default=default)

@@ -1,7 +1,6 @@
 """Filesystem helpers for conversation personalities (profiles)."""
 
 from __future__ import annotations
-
 import re
 from pathlib import Path
 
@@ -66,6 +65,20 @@ def read_instructions_for(name: str) -> str:
         return target.read_text(encoding="utf-8").strip() if target.exists() else ""
     except Exception as exc:
         return f"Could not load instructions: {exc}"
+
+
+def read_voice_for(name: str, default: str = "cedar") -> str:
+    """Read the voice configured for a profile (``voice.txt``), or ``default``."""
+    if name == DEFAULT_OPTION:
+        return default
+    try:
+        voice_file = resolve_profile_dir(name) / "voice.txt"
+        if voice_file.exists():
+            voice = voice_file.read_text(encoding="utf-8").strip()
+            return voice or default
+    except Exception:
+        pass
+    return default
 
 
 def available_tools_for(selected: str) -> list[str]:

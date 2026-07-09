@@ -45,10 +45,9 @@ def test_load_wake_daemon_config_defaults():
 
 
 def test_whisper_prompt_helpers():
-    from bobe.wake_daemon.config import whisper_hotwords_from_phrase, whisper_initial_prompt_from_phrase
+    from bobe.wake_daemon.config import whisper_initial_prompt_from_phrase
 
     assert whisper_initial_prompt_from_phrase("hey jarvis") == "Jarvis."
-    assert whisper_hotwords_from_phrase("hey jarvis") == "Hey Jarvis Jarvis"
 
 
 def test_whisper_prompt_env_override():

@@ -171,12 +171,6 @@ class CameraWorker:
                                     rotation[2],  # roll, pitch, yaw
                                 ]
 
-                        # No face detected while tracking enabled - set face lost timestamp
-                        elif self.last_face_detected_time is None or self.last_face_detected_time == current_time:
-                            # Only update if we haven't already set a face lost time
-                            # (current_time check prevents overriding the disable-triggered timestamp)
-                            pass
-
                     # Handle smooth interpolation (works for both face-lost and tracking-disabled cases)
                     if self.last_face_detected_time is not None:
                         time_since_face_lost = current_time - self.last_face_detected_time

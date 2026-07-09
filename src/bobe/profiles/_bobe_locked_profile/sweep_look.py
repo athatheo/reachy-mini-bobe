@@ -120,8 +120,5 @@ class SweepLook(Tool):
         deps.movement_manager.queue_move(hold_right)
         deps.movement_manager.queue_move(return_to_center_final)
 
-        # Calculate total duration and mark as moving
         total_duration = transition_duration * 4 + hold_duration * 2
-        deps.movement_manager.set_moving_state(total_duration)
-
         return {"status": f"sweeping look left-right-center, total {total_duration:.1f}s"}

@@ -28,7 +28,7 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 - While asleep, microphone PCM streams from the robot to a Mac-side wake daemon over WebSocket. A short in-memory ring buffer on the robot is continuously discarded; nothing goes to OpenAI until wake.
 - Saying `Hey Jarvis` opens a streaming window (chime + antennas up). During that window audio streams to OpenAI Realtime for transcription and speech, like any cloud voice assistant.
 - The window closes (chime + antennas relaxed) when you say `go to sleep` (or Greek `κοιμήσου`) or after `BOBE_WAKE_TIMEOUT_S` (default 300s) without session activity.
-- Tune with `BOBE_WAKE_REMOTE_URL`, `BOBE_WAKE_TOKEN`, `BOBE_WAKE_GAIN`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_SLEEP_PHRASE`. Wake-word gating is always on: say the wake phrase to stream, `go to sleep` to stop.
+- Tune with `BOBE_WAKE_REMOTE_URL`, `BOBE_WAKE_TOKEN`, `BOBE_WAKE_GAIN`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_WAKE_PHRASE`, `BOBE_SLEEP_PHRASE`. Wake-word gating is always on: say the wake phrase to stream, `go to sleep` to stop.
 
 Claude Code control is disabled by default. To enable it, set a launch-specific token on both robot and Mac. Terminal launch requires `confirm launch Claude Code`; managed follow-up commands require `confirm Claude command`.
 

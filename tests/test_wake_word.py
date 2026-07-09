@@ -2,15 +2,14 @@
 
 import pytest
 
-from bobe.wake.remote_client import RemoteWakeClient
 from bobe.wake_word import (
     WakeSession,
     AudioRingBuffer,
-    create_wake_detector,
-    is_sleep_phrase,
     load_wake_config,
     wake_detector_error,
+    create_wake_detector,
 )
+from bobe.wake.remote_client import RemoteWakeClient
 
 
 class FakeClock:
@@ -97,24 +96,6 @@ def test_ring_buffer_drain_tail_slices_and_clears():
     assert tail[0] == 100
 
 
-# ---- is_sleep_phrase ----
-
-
-@pytest.mark.parametrize(
-    ("text", "expected"),
-    [
-        ("go to sleep", True),
-        ("please go to sleep now", True),
-        ("got to sleep", True),
-        ("κοιμήσου", True),
-        ("hey jarvis", False),
-        ("", False),
-    ],
-)
-def test_is_sleep_phrase(text, expected):
-    assert is_sleep_phrase(text) is expected
-
-
 # ---- load_wake_config / create_wake_detector ----
 
 
@@ -124,6 +105,7 @@ def test_load_wake_config_defaults():
     assert config.backend == "remote"
     assert config.gain == 1.75
     assert config.timeout_s == 300.0
+    assert config.phrase == "hey jarvis"
     assert "go to sleep" in config.sleep_phrases
 
 
@@ -135,6 +117,7 @@ def test_load_wake_config_env_overrides():
             "BOBE_WAKE_TOKEN": "secret",
             "BOBE_WAKE_GAIN": "3.5",
             "BOBE_WAKE_TIMEOUT_S": "60",
+            "BOBE_WAKE_PHRASE": "Hey BoBe",
             "BOBE_SLEEP_PHRASE": "time for bed",
         }
     )
@@ -144,6 +127,7 @@ def test_load_wake_config_env_overrides():
     assert config.remote_token == "secret"
     assert config.gain == 3.5
     assert config.timeout_s == 60.0
+    assert config.phrase == "hey bobe"
     assert config.sleep_phrases[0] == "time for bed"
 
 
@@ -180,10 +164,12 @@ def test_create_wake_detector_remote_returns_client():
             "BOBE_WAKE_BACKEND": "remote",
             "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
             "BOBE_WAKE_TOKEN": "secret",
+            "BOBE_WAKE_PHRASE": "hey bobe",
         }
     )
     detector = create_wake_detector(lambda: None, config)
     assert isinstance(detector, RemoteWakeClient)
+    assert detector.phrase == "hey bobe"
 
 
 @pytest.mark.parametrize("backend", ["heed", "openwakeword"])

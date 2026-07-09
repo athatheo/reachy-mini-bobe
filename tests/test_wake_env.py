@@ -1,12 +1,12 @@
 from pathlib import Path
 
 from bobe.wake_env import (
+    persist_wake_env,
+    wake_allowed_hosts,
+    upsert_wake_env_lines,
     default_wake_allowed_hosts,
     is_wake_remote_host_allowed,
     merge_packaged_wake_defaults,
-    persist_wake_env,
-    upsert_wake_env_lines,
-    wake_allowed_hosts,
 )
 
 

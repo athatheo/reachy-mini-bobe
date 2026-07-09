@@ -78,6 +78,10 @@ bobe = [ "static/*", "profiles/**/*.txt", "profiles/**/*.py", "prompts/**/*.txt"
 select = [ "E", "F", "W", "I", "C4", "D",]
 ignore = [ "E501", "D100", "D203", "D213",]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [ "D",]
+"scripts/**" = [ "D",]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

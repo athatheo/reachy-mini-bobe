@@ -1,7 +1,6 @@
 """Gradio personality UI components and wiring."""
 
 from __future__ import annotations
-
 from typing import Any
 
 import gradio as gr
@@ -9,12 +8,13 @@ import gradio as gr
 from bobe.config import LOCKED_PROFILE, config
 from bobe.personality.store import (
     DEFAULT_OPTION,
-    available_tools_for,
-    list_personalities,
-    read_instructions_for,
-    resolve_profile_dir,
     sanitize_name,
     write_profile,
+    read_voice_for,
+    list_personalities,
+    available_tools_for,
+    resolve_profile_dir,
+    read_instructions_for,
 )
 
 
@@ -102,22 +102,10 @@ class PersonalityUI:
             preview = read_instructions_for(selected)
             return status, preview
 
-        def _read_voice_for(name: str) -> str:
-            try:
-                if name == self.DEFAULT_OPTION:
-                    return "cedar"
-                voice_file = resolve_profile_dir(name) / "voice.txt"
-                if voice_file.exists():
-                    voice = voice_file.read_text(encoding="utf-8").strip()
-                    return voice or "cedar"
-            except Exception:
-                pass
-            return "cedar"
-
         async def _fetch_voices(selected: str) -> dict[str, Any]:
             try:
                 voices = await handler.get_available_voices()
-                current = _read_voice_for(selected)
+                current = read_voice_for(selected)
                 if current not in voices:
                     current = "cedar"
                 return gr.update(choices=voices, value=current)
@@ -181,7 +169,7 @@ class PersonalityUI:
                 return gr.update(), gr.update(), "Please enter a valid name."
             try:
                 value = write_profile(name, instructions, tools_text, voice or "cedar")
-                choices = [self.DEFAULT_OPTION, *sorted(set([*list_personalities(), value]))]
+                choices = [self.DEFAULT_OPTION, *sorted({*list_personalities(), value})]
                 return (
                     gr.update(choices=choices, value=value),
                     gr.update(value=instructions),

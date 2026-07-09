@@ -1,23 +1,23 @@
 """Robot-side client and confirmation gate for Claude Code managed sessions."""
 
 from __future__ import annotations
-
-import asyncio
 import os
 import time
+import asyncio
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from typing import Any, Callable
+from dataclasses import dataclass
 
+from bobe.env_utils import parse_float, clean_optional
 from bobe.claude_code_client import (
     DEFAULT_CONFIRM_TTL_S,
     DEFAULT_REQUEST_TIMEOUT_S,
-    derive_daemon_http_url,
     request_daemon_json,
+    derive_daemon_http_url,
     transcript_matches_phrase,
 )
-from bobe.env_utils import clean_optional, parse_float
+
 
 COMMAND_CONFIRMATION_PHRASE = "confirm claude command"
 CONTROL_PATH = "/v1/claude-code"

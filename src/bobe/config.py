@@ -107,11 +107,10 @@ class Config:
     # Required
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # The key is downloaded in console.py if needed
 
-    # Optional
+    # Optional. HF_TOKEN is read directly from the environment by huggingface_hub.
     MODEL_NAME = os.getenv("MODEL_NAME", "gpt-realtime")
     HF_HOME = os.getenv("HF_HOME", "./cache")
     LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
-    HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
 
     logger.debug(f"Model: {MODEL_NAME}, HF_HOME: {HF_HOME}, Vision Model: {LOCAL_VISION_MODEL}")
 
@@ -201,17 +200,9 @@ def set_custom_profile(profile: str | None) -> None:
     """
     if LOCKED_PROFILE is not None:
         return
-    try:
-        config.REACHY_MINI_CUSTOM_PROFILE = profile
-    except Exception:
-        pass
-    try:
-        import os as _os
-
-        if profile:
-            _os.environ["REACHY_MINI_CUSTOM_PROFILE"] = profile
-        else:
-            # Remove to reflect default
-            _os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)
-    except Exception:
-        pass
+    config.REACHY_MINI_CUSTOM_PROFILE = profile
+    if profile:
+        os.environ["REACHY_MINI_CUSTOM_PROFILE"] = profile
+    else:
+        # Remove to reflect default
+        os.environ.pop("REACHY_MINI_CUSTOM_PROFILE", None)

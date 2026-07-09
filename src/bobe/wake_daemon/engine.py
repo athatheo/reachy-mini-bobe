@@ -1,17 +1,16 @@
 """faster-whisper wake phrase detection for streamed PCM audio."""
 
 from __future__ import annotations
-
-import logging
 import time
-from collections import deque
-from dataclasses import dataclass, field
+import logging
 from typing import Any, Literal
+from collections import deque
+from dataclasses import field, dataclass
 
 import numpy as np
 
+from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_phrase
 from bobe.wake.constants import WAKE_SAMPLE_RATE
-from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_sleep_phrase, matches_wake_phrase
 from bobe.wake_daemon.config import WakeDaemonConfig
 
 
@@ -111,6 +110,7 @@ class WhisperWakeSession:
 
     @property
     def phrase(self) -> str:
+        """Wake phrase this session listens for."""
         return self.config.phrase
 
     def set_listen_mode(
@@ -126,6 +126,7 @@ class WhisperWakeSession:
         self.reset()
 
     def reset(self) -> None:
+        """Clear the in-progress utterance buffer and partial transcript."""
         self._in_speech = False
         self._speech_samples.clear()
         self._silence_samples = 0
@@ -160,6 +161,7 @@ class WhisperWakeSession:
         )
 
     def debug_state(self) -> dict[str, Any]:
+        """Snapshot of session state for stats messages and diagnostics."""
         return {
             "engine": "faster-whisper",
             "model": self.config.whisper_model,
@@ -174,7 +176,7 @@ class WhisperWakeSession:
             "rms_last": round(self._last_rms, 1),
         }
 
-    def _maybe_emit_sleep(self, transcript: str, *, latency_ms: float) -> dict[str, object] | None:
+    def _maybe_emit_sleep(self, transcript: str, *, latency_ms: float) -> dict[str, Any] | None:
         if self._listen_mode != "sleep":
             return None
         if not matches_sleep_phrase(transcript, self._sleep_phrases):
@@ -189,7 +191,7 @@ class WhisperWakeSession:
             "latency_ms": latency_ms,
         }
 
-    def _maybe_emit_wake(self, transcript: str, *, latency_ms: float) -> dict[str, object] | None:
+    def _maybe_emit_wake(self, transcript: str, *, latency_ms: float) -> dict[str, Any] | None:
         if self._listen_mode != "wake":
             return None
         if time.monotonic() - self._last_wake_at < self.config.refractory_s:
@@ -205,7 +207,7 @@ class WhisperWakeSession:
             "latency_ms": latency_ms,
         }
 
-    def feed(self, pcm_i16: np.ndarray) -> dict[str, object] | None:
+    def feed(self, pcm_i16: np.ndarray) -> dict[str, Any] | None:
         """Consume PCM samples and return a wake/sleep event when detected."""
         chunk = pcm_i16.reshape(-1).astype(np.int16, copy=False)
         if chunk.size == 0:

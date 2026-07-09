@@ -1,8 +1,7 @@
 """Tests for the vision processing module."""
 
-import time
 from typing import Any
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -264,15 +263,7 @@ def test_vision_processor_get_model_info(mock_torch: Any, mock_transformers: Any
     assert "cuda_available" in info
 
 
-@pytest.fixture
-def mock_camera() -> Mock:
-    """Create a mock camera object."""
-    camera = Mock()
-    camera.get_latest_frame.return_value = np.zeros((480, 640, 3), dtype=np.uint8)
-    return camera
-
-
-def test_initialize_local_vision_success(mock_torch: Any, mock_transformers: Any, mock_camera: Mock) -> None:
+def test_initialize_local_vision_success(mock_torch: Any, mock_transformers: Any) -> None:
     """Test initialize_local_vision creates LocalVision successfully."""
     with patch("bobe.vision.processors.snapshot_download") as mock_download, \
          patch("bobe.vision.processors.os.makedirs"), \
@@ -281,7 +272,7 @@ def test_initialize_local_vision_success(mock_torch: Any, mock_transformers: Any
         mock_config.LOCAL_VISION_MODEL = "test/model"
         mock_config.HF_HOME = "/tmp/hf_cache"
 
-        result = initialize_local_vision(mock_camera)
+        result = initialize_local_vision()
 
         assert result is not None
         assert isinstance(result, LocalVision)
@@ -289,7 +280,7 @@ def test_initialize_local_vision_success(mock_torch: Any, mock_transformers: Any
         mock_download.assert_called_once()
 
 
-def test_initialize_local_vision_download_failure(mock_torch: Any, mock_camera: Mock) -> None:
+def test_initialize_local_vision_download_failure(mock_torch: Any) -> None:
     """Test initialize_local_vision handles download failure."""
     with patch("bobe.vision.processors.snapshot_download") as mock_download, \
          patch("bobe.vision.processors.os.makedirs"), \
@@ -299,12 +290,12 @@ def test_initialize_local_vision_download_failure(mock_torch: Any, mock_camera: 
         mock_config.HF_HOME = "/tmp/hf_cache"
         mock_download.side_effect = Exception("Network error")
 
-        result = initialize_local_vision(mock_camera)
+        result = initialize_local_vision()
 
         assert result is None
 
 
-def test_initialize_local_vision_processor_failure(mock_torch: Any, mock_camera: Mock) -> None:
+def test_initialize_local_vision_processor_failure(mock_torch: Any) -> None:
     """Test initialize_local_vision handles processor initialization failure."""
     with patch("bobe.vision.processors.snapshot_download"), \
          patch("bobe.vision.processors.os.makedirs"), \
@@ -315,7 +306,7 @@ def test_initialize_local_vision_processor_failure(mock_torch: Any, mock_camera:
         mock_config.HF_HOME = "/tmp/hf_cache"
         mock_proc.from_pretrained.side_effect = Exception("Model load error")
 
-        result = initialize_local_vision(mock_camera)
+        result = initialize_local_vision()
 
         assert result is None
 

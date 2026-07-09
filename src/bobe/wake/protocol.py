@@ -1,7 +1,6 @@
 """JSON control messages for the remote wake-word stream."""
 
 from __future__ import annotations
-
 import json
 from typing import Any
 

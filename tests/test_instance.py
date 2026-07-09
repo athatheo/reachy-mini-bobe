@@ -1,6 +1,4 @@
-from pathlib import Path
-
-from bobe.instance import _migrate_legacy_env, default_instance_dir, resolve_instance_path
+from bobe.instance import _migrate_legacy_env, resolve_instance_path
 
 
 def test_resolve_instance_path_creates_dir(tmp_path, monkeypatch):

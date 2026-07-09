@@ -70,7 +70,6 @@ class MoveHead(Tool):
             )
 
             movement_manager.queue_move(goto_move)
-            movement_manager.set_moving_state(deps.motion_duration_s)
 
             return {"status": f"looking {direction}"}
 

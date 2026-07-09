@@ -6,6 +6,7 @@ Leaf module: must not import anything from ``bobe`` so every config module
 
 from __future__ import annotations
 
+
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _FALSE_VALUES = {"0", "false", "no", "off"}
 

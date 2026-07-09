@@ -2,10 +2,8 @@
 """Upload a clean BoBe snapshot to the private HF space."""
 
 from __future__ import annotations
-
 import argparse
 import subprocess
-import sys
 from pathlib import Path
 
 
@@ -15,6 +13,7 @@ INCLUDE_PATHS = (
     "README.md",
     "LICENSE",
     "index.html",
+    "style.css",
     "src",
     "scripts",
     "tests",

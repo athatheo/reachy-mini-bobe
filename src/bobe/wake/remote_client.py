@@ -15,9 +15,9 @@ from collections import deque
 import numpy as np
 from numpy.typing import NDArray
 
-from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, WAKE_PHRASE, matches_sleep_phrase, matches_wake_phrase
+from bobe.wake.phrases import WAKE_PHRASE, DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_phrase
 from bobe.wake.protocol import hello_message, listen_message
-from bobe.wake.constants import DEBUG_WINDOW_SECONDS, WAKE_SAMPLE_RATE
+from bobe.wake.constants import WAKE_SAMPLE_RATE, DEBUG_WINDOW_SECONDS
 
 
 logger = logging.getLogger(__name__)

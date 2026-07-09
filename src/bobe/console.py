@@ -16,8 +16,8 @@ import asyncio
 import logging
 import threading
 from typing import List, Optional
-from pathlib import Path
 
+from fastapi import FastAPI
 from fastrtc import AdditionalOutputs, audio_to_float32
 from scipy.signal import resample
 
@@ -25,13 +25,9 @@ from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
 from bobe.config import config
 from bobe.env_file import is_plausible_openai_key, is_plausible_anthropic_key
+from bobe.instance import load_instance_env
 from bobe.openai_realtime import OpenaiRealtimeHandler
-
-
-try:
-    from fastapi import FastAPI
-except Exception:  # pragma: no cover - only loaded when settings_app is used
-    FastAPI = object  # type: ignore
+from bobe.settings_server import get_settings_server, bootstrap_settings_ui
 
 
 logger = logging.getLogger(__name__)
@@ -79,8 +75,6 @@ class LocalStream:
             return
         if self._settings_app is None:
             return
-        from bobe.settings_server import get_settings_server, bootstrap_settings_ui
-
         if get_settings_server() is None:
             bootstrap_settings_ui(self._settings_app, self._instance_path, lambda: self.handler)
         self._settings_initialized = True
@@ -93,20 +87,13 @@ class LocalStream:
         """
         self._stop_event.clear()
 
-        # Try to load an existing instance .env first (covers subsequent runs)
+        # Try to load an existing instance .env first (covers subsequent runs);
+        # load_instance_env also syncs config.OPENAI_API_KEY.
         if self._instance_path:
             try:
-                from bobe.instance import load_instance_env
-
                 load_instance_env(self._instance_path)
-                new_key = os.getenv("OPENAI_API_KEY", "").strip()
-                if new_key:
-                    try:
-                        config.OPENAI_API_KEY = new_key
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Could not load instance .env from %s: %s", self._instance_path, exc)
 
         # Always expose settings UI if a settings app is available.
         self._init_settings_ui_if_needed()

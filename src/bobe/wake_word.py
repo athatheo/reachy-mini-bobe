@@ -8,7 +8,6 @@ OpenAI transcript fallback.
 """
 
 from __future__ import annotations
-
 import os
 import time
 import logging
@@ -21,8 +20,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from bobe.env_utils import parse_float
+from bobe.wake.phrases import WAKE_PHRASE, DEFAULT_SLEEP_PHRASES
 from bobe.wake.constants import WAKE_SAMPLE_RATE
-from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, WAKE_PHRASE
 from bobe.wake.remote_client import RemoteWakeClient
 
 

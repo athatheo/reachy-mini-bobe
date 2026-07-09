@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 WAKE_PHRASE = "hey jarvis"
 
 DEFAULT_SLEEP_PHRASES: tuple[str, ...] = ("go to sleep", "κοιμήσου")

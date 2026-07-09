@@ -13,8 +13,8 @@ Design overview
 Threading model
 - A dedicated worker thread owns all real-time state and issues `set_target`
   commands.
-- Other threads communicate via a command queue (enqueue moves, mark activity,
-  toggle listening).
+- Other threads communicate via a command queue (enqueue moves, toggle
+  listening).
 - Secondary offset producers set pending values guarded by locks; the worker
   snaps them atomically.
 
@@ -230,8 +230,8 @@ class MovementManager:
       secondary offsets, and calls `set_target` exactly once per tick.
     - Start an idle `BreathingMove` after `idle_inactivity_delay` when not
       listening and no moves are queued.
-    - Expose thread-safe APIs so other threads can enqueue moves, mark activity,
-      or feed secondary offsets without touching internal state.
+    - Expose thread-safe APIs so other threads can enqueue moves or feed
+      secondary offsets without touching internal state.
 
     Timing:
     - All elapsed-time calculations rely on `time.monotonic()` through `self._now`
@@ -298,17 +298,6 @@ class MovementManager:
         )
         self._speech_offsets_dirty = False
 
-        self._face_offsets_lock = threading.Lock()
-        self._pending_face_offsets: Tuple[float, float, float, float, float, float] = (
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        )
-        self._face_offsets_dirty = False
-
         self._shared_state_lock = threading.Lock()
         self._shared_last_activity_time = self.state.last_activity_time
         self._shared_is_listening = self._is_listening
@@ -341,25 +330,6 @@ class MovementManager:
             self._pending_speech_offsets = offsets
             self._speech_offsets_dirty = True
 
-    def set_moving_state(self, duration: float) -> None:
-        """Mark the robot as actively moving for the provided duration.
-
-        Legacy hook used by goto helpers to keep inactivity and breathing logic
-        aware of manual motions. Thread-safe via the command queue.
-        """
-        self._command_queue.put(("set_moving_state", duration))
-
-    def is_idle(self) -> bool:
-        """Return True when the robot has been inactive longer than the idle delay."""
-        with self._shared_state_lock:
-            last_activity = self._shared_last_activity_time
-            listening = self._shared_is_listening
-
-        if listening:
-            return False
-
-        return self._now() - last_activity >= self.idle_inactivity_delay
-
     def set_listening(self, listening: bool) -> None:
         """Enable or disable listening mode without touching shared state directly.
 
@@ -387,7 +357,11 @@ class MovementManager:
             self._handle_command(command, payload, current_time)
 
     def _apply_pending_offsets(self) -> None:
-        """Apply the most recent speech/face offset updates."""
+        """Apply the most recent speech offset update.
+
+        Face-tracking offsets are polled directly from the camera worker each
+        tick in ``_update_face_tracking``.
+        """
         speech_offsets: Tuple[float, float, float, float, float, float] | None = None
         with self._speech_offsets_lock:
             if self._speech_offsets_dirty:
@@ -396,16 +370,6 @@ class MovementManager:
 
         if speech_offsets is not None:
             self.state.speech_offsets = speech_offsets
-            self.state.update_activity()
-
-        face_offsets: Tuple[float, float, float, float, float, float] | None = None
-        with self._face_offsets_lock:
-            if self._face_offsets_dirty:
-                face_offsets = self._pending_face_offsets
-                self._face_offsets_dirty = False
-
-        if face_offsets is not None:
-            self.state.face_tracking_offsets = face_offsets
             self.state.update_activity()
 
     def _handle_command(self, command: str, payload: Any, current_time: float) -> None:
@@ -435,15 +399,6 @@ class MovementManager:
             self.state.move_start_time = None
             self._breathing_active = False
             logger.info("Cleared move queue and stopped current move")
-        elif command == "set_moving_state":
-            try:
-                duration = float(payload)
-            except (TypeError, ValueError):
-                logger.warning("Invalid moving state duration: %s", payload)
-                return
-            self.state.update_activity()
-        elif command == "mark_activity":
-            self.state.update_activity()
         elif command == "set_listening":
             desired_state = bool(payload)
             now = self._now()

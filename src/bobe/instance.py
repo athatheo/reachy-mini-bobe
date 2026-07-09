@@ -1,13 +1,14 @@
 """Persistent per-robot BoBe instance directory (survives app reinstalls)."""
 
 from __future__ import annotations
-
-import logging
 import os
 import shutil
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from bobe.config import config
 
 
 logger = logging.getLogger(__name__)
@@ -61,12 +62,7 @@ def load_instance_env(instance_path: Path | str | None) -> Path | None:
     if not env_path.exists():
         return None
     load_dotenv(dotenv_path=str(env_path), override=True)
-    try:
-        from bobe.config import config
-
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if openai_key:
-            config.OPENAI_API_KEY = openai_key
-    except Exception:
-        pass
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if openai_key:
+        config.OPENAI_API_KEY = openai_key
     return env_path

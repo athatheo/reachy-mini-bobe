@@ -2,11 +2,9 @@
 """Deploy BoBe to the robot and configure remote wake via daemon APIs."""
 
 from __future__ import annotations
-
-import argparse
 import json
-import socket
 import time
+import argparse
 import urllib.error
 import urllib.request
 from pathlib import Path

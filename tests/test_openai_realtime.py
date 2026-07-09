@@ -567,23 +567,6 @@ async def test_receive_goes_back_to_sleep_after_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_receive_in_wake_test_mode_counts_detections_without_waking() -> None:
-    """Diagnostic mode keeps audio local, never wakes, and tallies would-be wakes."""
-    handler = _build_wake_enabled_handler()
-    handler.connection = FakeGatingConnection()
-    handler.wake_test_mode = True
-
-    await handler.receive(_mic_frame())
-    handler.wake_session.request_wake()
-    await handler.receive(_mic_frame())
-    await handler.receive(_mic_frame())
-
-    assert handler.wake_test_detections == 1
-    assert not handler.wake_session.awake
-    assert handler.connection.input_audio_buffer.appended == []
-
-
-@pytest.mark.asyncio
 async def test_receive_streams_mic_frames_while_awake() -> None:
     """While awake, mic frames stream continuously so the user can barge in mid-sentence."""
     handler = _build_wake_enabled_handler()
