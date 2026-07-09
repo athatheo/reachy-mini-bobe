@@ -38,7 +38,7 @@ def test_load_wake_daemon_config_defaults():
     config = load_wake_daemon_config(_TEST_ENV)
 
     assert config.phrase == "hey jarvis"
-    assert config.whisper_model == "base.en"
+    assert config.whisper_model == "distil-small.en"
     assert config.whisper_initial_prompt == "Jarvis."
     assert config.whisper_hotwords is None
     assert config.port == 8765

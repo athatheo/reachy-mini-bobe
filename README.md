@@ -64,7 +64,7 @@ echo "BOBE_WAKE_TOKEN=$BOBE_WAKE_TOKEN" >> .env
 uv run bobe-wake-daemon
 ```
 
-Defaults: WebSocket on port **8765**, path `/v1/stream`, Whisper model `base.en`. Optional tuning: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `VAD_*` (see `.env.example`).
+Defaults: WebSocket on port **8765**, path `/v1/stream`, Whisper model `distil-small.en`. Optional tuning: `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`, `VAD_*` (see `.env.example`).
 
 Note the Mac hostname or IP (e.g. `Mac.local` or `192.168.1.114`).
 
