@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from bobe.env_utils import parse_bool, parse_float, parse_int
 from bobe.wake.phrases import WAKE_PHRASE
 
 
@@ -31,16 +32,6 @@ def whisper_initial_prompt_from_phrase(phrase: str) -> str:
     if not words:
         return ""
     return f"{words[-1].capitalize()}."
-
-
-def whisper_hotwords_from_phrase(phrase: str) -> str:
-    """Build hotwords that nudge Whisper toward the wake name."""
-    words = phrase.strip().casefold().split()
-    if not words:
-        return ""
-    titled = " ".join(word.capitalize() for word in words)
-    wake_name = words[-1].capitalize()
-    return f"{titled} {wake_name}"
 
 
 @dataclass(frozen=True)
@@ -76,27 +67,14 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
     source = os.environ if env is None else env
 
     def _int(name: str, default: int) -> int:
-        try:
-            return int(source.get(name, default))
-        except (TypeError, ValueError):
-            return default
+        return parse_int(source.get(name), default)
 
     def _float(name: str, default: float) -> float:
-        try:
-            return float(source.get(name, default))
-        except (TypeError, ValueError):
-            return default
+        return parse_float(source.get(name), default)
 
     def _bool(name: str, default: bool = False) -> bool:
-        raw = source.get(name)
-        if raw is None:
-            return default
-        value = raw.strip().lower()
-        if value in {"1", "true", "yes", "on"}:
-            return True
-        if value in {"0", "false", "no", "off"}:
-            return False
-        return default
+        value = parse_bool(source.get(name))
+        return default if value is None else value
 
     token = (source.get("BOBE_WAKE_TOKEN") or "").strip()
     if not token:

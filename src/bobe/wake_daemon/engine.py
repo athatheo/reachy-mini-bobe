@@ -6,17 +6,17 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
+from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_sleep_phrase, matches_wake_phrase
 from bobe.wake_daemon.config import WakeDaemonConfig
 
 
 logger = logging.getLogger(__name__)
 
-WAKE_SAMPLE_RATE = 16000
 PARTIAL_TRANSCRIBE_INTERVAL_S = 0.45
 STATS_PARTIAL_MIN_SAMPLES = int(0.35 * WAKE_SAMPLE_RATE)
 TRANSCRIPT_HISTORY_MAX = 30
@@ -125,14 +125,6 @@ class WhisperWakeSession:
             self._sleep_phrases = tuple(sleep_phrases)
         self.reset()
 
-    def pause(self) -> None:
-        """Legacy alias: listen for sleep phrases while BoBe is awake."""
-        self.set_listen_mode("sleep", sleep_phrases=self._sleep_phrases)
-
-    def resume(self) -> None:
-        """Legacy alias: listen for wake phrases while BoBe is asleep."""
-        self.set_listen_mode("wake")
-
     def reset(self) -> None:
         self._in_speech = False
         self._speech_samples.clear()
@@ -147,7 +139,7 @@ class WhisperWakeSession:
             if self._transcript_history and self._transcript_history[-1].get("partial"):
                 self._transcript_history.pop()
             return
-        entry = {"text": cleaned, "partial": True, "ts": round(time.time(), 3)}
+        entry: dict[str, str | float | bool] = {"text": cleaned, "partial": True, "ts": round(time.time(), 3)}
         if self._transcript_history and self._transcript_history[-1].get("partial"):
             self._transcript_history[-1] = entry
         else:
@@ -167,7 +159,7 @@ class WhisperWakeSession:
             }
         )
 
-    def debug_state(self) -> dict[str, float | int | str | bool]:
+    def debug_state(self) -> dict[str, Any]:
         return {
             "engine": "faster-whisper",
             "model": self.config.whisper_model,

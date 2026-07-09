@@ -185,10 +185,6 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     msg_type = payload.get("type")
                     if msg_type == "listen":
                         apply_listen(payload)
-                    elif msg_type == "pause":
-                        apply_listen({"mode": "sleep"})
-                    elif msg_type == "resume":
-                        apply_listen({"mode": "wake"})
                     continue
 
                 data = message.get("bytes")

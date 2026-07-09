@@ -1,27 +1,28 @@
 """Robot-side state and client for confirmed Claude Code launches."""
 
 from __future__ import annotations
-import os
-import re
-import json
-import time
+
 import asyncio
 import logging
-import urllib.error
-import urllib.parse
+import os
+import time
 import urllib.request
-from typing import Any, Callable
 from dataclasses import dataclass
+from typing import Any, Callable
 
+from bobe.claude_code_client import (
+    DEFAULT_CONFIRM_TTL_S,
+    DEFAULT_REQUEST_TIMEOUT_S,
+    derive_daemon_http_url,
+    request_daemon_json,
+    transcript_matches_phrase,
+)
+from bobe.env_utils import clean_optional, parse_float
 
 logger = logging.getLogger(__name__)
 
 CONFIRMATION_PHRASE = "confirm launch claude code"
-DEFAULT_CONFIRM_TTL_S = 45.0
-DEFAULT_REQUEST_TIMEOUT_S = 5.0
-
-_SPACE_RE = re.compile(r"\s+")
-_TRAILING_PUNCTUATION_RE = re.compile(r"^[\s\"'`.,!?;:]+|[\s\"'`.,!?;:]+$")
+LAUNCH_PATH = "/v1/launch/claude-code"
 
 
 @dataclass(frozen=True)
@@ -159,72 +160,42 @@ class ClaudeCodeLaunchController:
     def _post_launch(self, settings: ClaudeCodeLaunchSettings) -> dict[str, Any]:
         assert settings.launch_url is not None
         assert settings.launch_token is not None
-        payload = json.dumps({"source": "bobe", "confirmed_phrase": CONFIRMATION_PHRASE}).encode("utf-8")
-        request = urllib.request.Request(
-            settings.launch_url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "X-BoBe-Launch-Token": settings.launch_token,
-            },
+        return request_daemon_json(
+            self._opener,
+            url=settings.launch_url,
+            token=settings.launch_token,
             method="POST",
+            payload={"source": "bobe", "confirmed_phrase": CONFIRMATION_PHRASE},
+            timeout_s=settings.request_timeout_s,
+            log_label="Claude Code launch",
         )
-        try:
-            with self._opener(request, timeout=settings.request_timeout_s) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            return _json_or_error(body, fallback={"ok": False, "error": f"http_{exc.code}"})
-        except urllib.error.URLError as exc:
-            logger.warning("Claude Code launch endpoint unreachable: %s", exc)
-            return {"ok": False, "error": "endpoint_unreachable"}
-        except TimeoutError:
-            return {"ok": False, "error": "endpoint_timeout"}
-
-        return _json_or_error(raw, fallback={"ok": False, "error": "bad_response"})
 
 
 def load_claude_code_launch_settings(env: dict[str, str] | None = None) -> ClaudeCodeLaunchSettings:
     """Load robot-side Claude Code launch settings."""
     source = os.environ if env is None else env
-    launch_url = _clean(source.get("BOBE_CLAUDE_CODE_LAUNCH_URL"))
+    launch_url = clean_optional(source.get("BOBE_CLAUDE_CODE_LAUNCH_URL"))
     if launch_url is None:
         launch_url = derive_launch_url_from_wake_url(source.get("BOBE_WAKE_REMOTE_URL"))
 
     return ClaudeCodeLaunchSettings(
         launch_url=launch_url,
-        launch_token=_clean(source.get("BOBE_CLAUDE_CODE_LAUNCH_TOKEN")),
-        confirm_ttl_s=max(1.0, _float(source.get("BOBE_CLAUDE_CODE_CONFIRM_TTL_S"), DEFAULT_CONFIRM_TTL_S)),
+        launch_token=clean_optional(source.get("BOBE_CLAUDE_CODE_LAUNCH_TOKEN")),
+        confirm_ttl_s=max(1.0, parse_float(source.get("BOBE_CLAUDE_CODE_CONFIRM_TTL_S"), DEFAULT_CONFIRM_TTL_S)),
         request_timeout_s=max(
-            1.0, _float(source.get("BOBE_CLAUDE_CODE_REQUEST_TIMEOUT_S"), DEFAULT_REQUEST_TIMEOUT_S)
+            1.0, parse_float(source.get("BOBE_CLAUDE_CODE_REQUEST_TIMEOUT_S"), DEFAULT_REQUEST_TIMEOUT_S)
         ),
     )
 
 
 def derive_launch_url_from_wake_url(wake_url: str | None) -> str | None:
     """Derive the launch endpoint from the configured wake daemon URL."""
-    wake_url = _clean(wake_url)
-    if wake_url is None:
-        return None
-    parsed = urllib.parse.urlparse(wake_url)
-    if parsed.scheme == "ws":
-        scheme = "http"
-    elif parsed.scheme == "wss":
-        scheme = "https"
-    else:
-        return None
-    if not parsed.netloc:
-        return None
-    return urllib.parse.urlunparse((scheme, parsed.netloc, "/v1/launch/claude-code", "", "", ""))
+    return derive_daemon_http_url(wake_url, LAUNCH_PATH)
 
 
 def confirmation_phrase_matches(transcript: str | None) -> bool:
     """Return True only for the exact confirmation phrase, allowing ASR punctuation."""
-    if transcript is None:
-        return False
-    normalized = _TRAILING_PUNCTUATION_RE.sub("", transcript.casefold())
-    normalized = _SPACE_RE.sub(" ", normalized).strip()
-    return normalized == CONFIRMATION_PHRASE
+    return transcript_matches_phrase(transcript, CONFIRMATION_PHRASE)
 
 
 _controller = ClaudeCodeLaunchController()
@@ -244,25 +215,3 @@ def reset_claude_code_launch_controller(controller: ClaudeCodeLaunchController |
 async def maybe_confirm_claude_code_launch(transcript: str | None) -> dict[str, Any] | None:
     """Confirm a pending launch from a completed transcript when possible."""
     return await _controller.maybe_confirm_from_transcript(transcript)
-
-
-def _clean(value: str | None) -> str | None:
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
-
-
-def _float(raw: str | None, default: float) -> float:
-    try:
-        return float(raw) if raw is not None else default
-    except ValueError:
-        return default
-
-
-def _json_or_error(raw: str, *, fallback: dict[str, Any]) -> dict[str, Any]:
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return fallback
-    return parsed if isinstance(parsed, dict) else fallback

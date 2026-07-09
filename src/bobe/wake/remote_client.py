@@ -17,12 +17,10 @@ from numpy.typing import NDArray
 
 from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, WAKE_PHRASE, matches_sleep_phrase, matches_wake_phrase
 from bobe.wake.protocol import hello_message, listen_message
-from bobe.wake.constants import WAKE_SAMPLE_RATE
+from bobe.wake.constants import DEBUG_WINDOW_SECONDS, WAKE_SAMPLE_RATE
 
 
 logger = logging.getLogger(__name__)
-
-DEBUG_WINDOW_SECONDS = 10.0
 
 RECONNECT_BASE_S = 0.5
 RECONNECT_MAX_S = 10.0
@@ -38,12 +36,14 @@ class RemoteWakeClient:
         url: str,
         token: str | None = None,
         gain: float = 1.0,
+        phrase: str = WAKE_PHRASE,
         sample_rate: int = WAKE_SAMPLE_RATE,
         on_sleep: Any | None = None,
         sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
     ) -> None:
         self._on_wake = on_wake
         self._on_sleep = on_sleep
+        self._phrase = phrase.strip().casefold() or WAKE_PHRASE
         self._sleep_phrases = sleep_phrases
         self._url = url
         self._token = (token or "").strip() or None
@@ -66,7 +66,7 @@ class RemoteWakeClient:
 
     @property
     def phrase(self) -> str:
-        return WAKE_PHRASE
+        return self._phrase
 
     def is_running(self) -> bool:
         """Return whether the background client thread is alive."""
@@ -110,14 +110,6 @@ class RemoteWakeClient:
         self._listen_mode = "wake"
         self._queue_listen_mode("wake")
 
-    def pause(self) -> None:
-        """Legacy alias for listen_for_sleep()."""
-        self.listen_for_sleep()
-
-    def resume(self) -> None:
-        """Legacy alias for listen_for_wake()."""
-        self.listen_for_wake()
-
     def _queue_listen_mode(self, mode: str) -> None:
         payload = listen_message(mode=mode, sleep_phrases=self._sleep_phrases if mode == "sleep" else None)
         try:
@@ -125,7 +117,7 @@ class RemoteWakeClient:
         except queue.Full:
             pass
 
-    def debug_state(self) -> dict[str, float | int | str | bool | list[dict[str, float | int | str | bool]] | dict[str, float | int | str | bool]]:
+    def debug_state(self) -> dict[str, Any]:
         now = time.monotonic()
         with self._stats_lock:
             while self._recent_stats and now - self._recent_stats[0][0] > DEBUG_WINDOW_SECONDS:
@@ -140,7 +132,7 @@ class RemoteWakeClient:
         partial = str(remote_stats.get("partial") or "")
         return {
             "backend": "remote",
-            "phrase": WAKE_PHRASE,
+            "phrase": self._phrase,
             "url": self._url,
             "gain": self._gain,
             "frames_window": len(entries),
@@ -183,7 +175,7 @@ class RemoteWakeClient:
             "model",
         ):
             if key in payload and payload[key] is not None:
-                stats[key] = payload[key]  # type: ignore[assignment]
+                stats[key] = payload[key]
         transcript = str(payload.get("transcript") or "")
         partial = str(payload.get("partial") or "")
         stream = payload.get("transcript_stream")
@@ -237,7 +229,11 @@ class RemoteWakeClient:
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(self._url, open_timeout=5.0, ping_interval=20.0) as ws:
-                    await ws.send(json.dumps(hello_message(sample_rate=self._sample_rate, token=self._token)))
+                    await ws.send(
+                        json.dumps(
+                            hello_message(sample_rate=self._sample_rate, token=self._token, phrase=self._phrase)
+                        )
+                    )
                     self._connected = True
                     backoff = RECONNECT_BASE_S
                     logger.info("Remote wake client connected to %s", self._url)
@@ -366,7 +362,7 @@ class RemoteWakeClient:
             msg_type = payload.get("type")
             if msg_type == "ready":
                 engine = str(payload.get("engine") or "")
-                phrase = str(payload.get("phrase") or WAKE_PHRASE)
+                phrase = str(payload.get("phrase") or self._phrase)
                 with self._stats_lock:
                     self._daemon_engine = engine
                 self._log_event("info", f"Daemon ready ({engine})", phrase=phrase)

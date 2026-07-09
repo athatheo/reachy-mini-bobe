@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from bobe.claude_code_client import DEFAULT_REQUEST_TIMEOUT_S
 from bobe.claude_code_launch import (
     ClaudeCodeLaunchSettings,
     ClaudeCodeLaunchController,
@@ -78,7 +79,7 @@ async def test_confirm_posts_to_mac_endpoint():
     assert result["status"] == "launched"
     assert len(calls) == 1
     request, timeout = calls[0]
-    assert timeout == 5.0
+    assert timeout == DEFAULT_REQUEST_TIMEOUT_S
     assert request.full_url == "http://mac.local:8765/v1/launch/claude-code"
     assert request.get_header("X-bobe-launch-token") == "launch-token"
 

@@ -20,7 +20,9 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from bobe.env_utils import parse_float
 from bobe.wake.constants import WAKE_SAMPLE_RATE
+from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, WAKE_PHRASE
 from bobe.wake.remote_client import RemoteWakeClient
 
 
@@ -29,7 +31,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_WAKE_BACKEND = "remote"
 DEFAULT_WAKE_GAIN = 1.75
 DEFAULT_WAKE_TIMEOUT_S = 300.0
-from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_sleep_phrase
 DEFAULT_BUFFER_SECONDS = 3.0
 DEFAULT_FLUSH_SECONDS = 1.6
 _DEPRECATED_BACKENDS = frozenset({"heed", "openwakeword"})
@@ -42,6 +43,7 @@ class WakeConfig:
     backend: str = DEFAULT_WAKE_BACKEND
     gain: float = DEFAULT_WAKE_GAIN
     timeout_s: float = DEFAULT_WAKE_TIMEOUT_S
+    phrase: str = WAKE_PHRASE
     sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES
     remote_url: str | None = None
     remote_token: str | None = None
@@ -52,10 +54,7 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
     source = os.environ if env is None else env
 
     def _float(name: str, default: float) -> float:
-        try:
-            return float(source.get(name, default))
-        except (TypeError, ValueError):
-            return default
+        return parse_float(source.get(name), default)
 
     sleep_phrases = list(DEFAULT_SLEEP_PHRASES)
     custom_phrase = (source.get("BOBE_SLEEP_PHRASE") or "").strip()
@@ -68,15 +67,11 @@ def load_wake_config(env: Mapping[str, str] | None = None) -> WakeConfig:
         backend=backend,
         gain=max(1.0, _float("BOBE_WAKE_GAIN", DEFAULT_WAKE_GAIN)),
         timeout_s=max(1.0, _float("BOBE_WAKE_TIMEOUT_S", DEFAULT_WAKE_TIMEOUT_S)),
+        phrase=(source.get("BOBE_WAKE_PHRASE") or WAKE_PHRASE).strip().casefold() or WAKE_PHRASE,
         sleep_phrases=tuple(sleep_phrases),
         remote_url=(source.get("BOBE_WAKE_REMOTE_URL") or "").strip() or None,
         remote_token=(source.get("BOBE_WAKE_TOKEN") or "").strip() or None,
     )
-
-
-def is_sleep_phrase(text: str, phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES) -> bool:
-    """Return whether a transcript asks BoBe to go back to sleep."""
-    return matches_sleep_phrase(text, phrases)
 
 
 class AudioRingBuffer:
@@ -185,9 +180,6 @@ class WakeSession:
             return self._awake and (self._clock() - self._last_activity) >= self._timeout_s
 
 
-WakeDetector = RemoteWakeClient
-
-
 def wake_detector_error(config: WakeConfig) -> str | None:
     """Return a user-visible error when wake detection cannot start."""
     backend = config.backend
@@ -208,18 +200,20 @@ def create_wake_detector(
     config: WakeConfig,
     *,
     on_sleep: Callable[[], None] | None = None,
-) -> WakeDetector | None:
+) -> RemoteWakeClient | None:
     """Instantiate the configured wake-word backend."""
     error = wake_detector_error(config)
     if error is not None:
         logger.error(error)
         return None
 
+    assert config.remote_url is not None  # guaranteed by wake_detector_error
     return RemoteWakeClient(
         on_wake,
         url=config.remote_url,
         token=config.remote_token,
         gain=config.gain,
+        phrase=config.phrase,
         on_sleep=on_sleep,
         sleep_phrases=config.sleep_phrases,
     )

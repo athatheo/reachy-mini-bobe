@@ -5,16 +5,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, WAKE_PHRASE
+from bobe.wake.phrases import WAKE_PHRASE
 
 
-def hello_message(*, sample_rate: int, token: str | None) -> dict[str, Any]:
+def hello_message(*, sample_rate: int, token: str | None, phrase: str = WAKE_PHRASE) -> dict[str, Any]:
     """Build the robot handshake payload."""
     payload: dict[str, Any] = {
         "type": "hello",
         "client": "bobe",
         "sample_rate": sample_rate,
-        "phrase": WAKE_PHRASE,
+        "phrase": phrase,
     }
     if token:
         payload["token"] = token
@@ -64,16 +64,6 @@ def listen_message(
     if mode == "sleep" and sleep_phrases:
         payload["sleep_phrases"] = list(sleep_phrases)
     return payload
-
-
-def pause_message() -> dict[str, Any]:
-    """Legacy alias: switch to sleep-phrase listening."""
-    return listen_message(mode="sleep", sleep_phrases=list(DEFAULT_SLEEP_PHRASES))
-
-
-def resume_message() -> dict[str, Any]:
-    """Legacy alias: switch to wake-phrase listening."""
-    return listen_message(mode="wake")
 
 
 def parse_json(raw: str) -> dict[str, Any] | None:

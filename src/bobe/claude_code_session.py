@@ -1,27 +1,26 @@
 """Robot-side client and confirmation gate for Claude Code managed sessions."""
 
 from __future__ import annotations
-import os
-import re
-import json
-import time
+
 import asyncio
-import logging
-import urllib.error
+import os
+import time
 import urllib.parse
 import urllib.request
-from typing import Any, Callable
 from dataclasses import dataclass
+from typing import Any, Callable
 
-
-logger = logging.getLogger(__name__)
+from bobe.claude_code_client import (
+    DEFAULT_CONFIRM_TTL_S,
+    DEFAULT_REQUEST_TIMEOUT_S,
+    derive_daemon_http_url,
+    request_daemon_json,
+    transcript_matches_phrase,
+)
+from bobe.env_utils import clean_optional, parse_float
 
 COMMAND_CONFIRMATION_PHRASE = "confirm claude command"
-DEFAULT_COMMAND_CONFIRM_TTL_S = 45.0
-DEFAULT_REQUEST_TIMEOUT_S = 10.0
-
-_SPACE_RE = re.compile(r"\s+")
-_TRAILING_PUNCTUATION_RE = re.compile(r"^[\s\"'`.,!?;:]+|[\s\"'`.,!?;:]+$")
+CONTROL_PATH = "/v1/claude-code"
 
 
 @dataclass(frozen=True)
@@ -30,7 +29,7 @@ class ClaudeCodeSessionSettings:
 
     base_url: str | None
     token: str | None
-    confirm_ttl_s: float = DEFAULT_COMMAND_CONFIRM_TTL_S
+    confirm_ttl_s: float = DEFAULT_CONFIRM_TTL_S
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
 
     @property
@@ -169,73 +168,44 @@ class ClaudeCodeSessionController:
     ) -> dict[str, Any]:
         assert settings.base_url is not None
         assert settings.token is not None
-        data = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            urllib.parse.urljoin(settings.base_url.rstrip("/") + "/", path.lstrip("/")),
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "X-BoBe-Launch-Token": settings.token,
-            },
+        return request_daemon_json(
+            self._opener,
+            url=urllib.parse.urljoin(settings.base_url.rstrip("/") + "/", path.lstrip("/")),
+            token=settings.token,
             method=method,
+            payload=payload,
+            timeout_s=settings.request_timeout_s,
+            log_label="Claude Code session",
         )
-        try:
-            with self._opener(request, timeout=settings.request_timeout_s) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            return _json_or_error(body, fallback={"ok": False, "error": f"http_{exc.code}"})
-        except urllib.error.URLError as exc:
-            logger.warning("Claude Code session endpoint unreachable: %s", exc)
-            return {"ok": False, "error": "endpoint_unreachable"}
-        except TimeoutError:
-            return {"ok": False, "error": "endpoint_timeout"}
-        return _json_or_error(raw, fallback={"ok": False, "error": "bad_response"})
 
 
 def load_claude_code_session_settings(env: dict[str, str] | None = None) -> ClaudeCodeSessionSettings:
     """Load robot-side Claude Code session settings."""
     source = os.environ if env is None else env
-    base_url = _clean(source.get("BOBE_CLAUDE_CODE_CONTROL_URL"))
+    base_url = clean_optional(source.get("BOBE_CLAUDE_CODE_CONTROL_URL"))
     if base_url is None:
         base_url = derive_control_url_from_wake_url(source.get("BOBE_WAKE_REMOTE_URL"))
 
     return ClaudeCodeSessionSettings(
         base_url=base_url,
-        token=_clean(source.get("BOBE_CLAUDE_CODE_LAUNCH_TOKEN")),
+        token=clean_optional(source.get("BOBE_CLAUDE_CODE_LAUNCH_TOKEN")),
         confirm_ttl_s=max(
-            1.0, _float(source.get("BOBE_CLAUDE_CODE_COMMAND_CONFIRM_TTL_S"), DEFAULT_COMMAND_CONFIRM_TTL_S)
+            1.0, parse_float(source.get("BOBE_CLAUDE_CODE_COMMAND_CONFIRM_TTL_S"), DEFAULT_CONFIRM_TTL_S)
         ),
         request_timeout_s=max(
-            1.0, _float(source.get("BOBE_CLAUDE_CODE_REQUEST_TIMEOUT_S"), DEFAULT_REQUEST_TIMEOUT_S)
+            1.0, parse_float(source.get("BOBE_CLAUDE_CODE_REQUEST_TIMEOUT_S"), DEFAULT_REQUEST_TIMEOUT_S)
         ),
     )
 
 
 def derive_control_url_from_wake_url(wake_url: str | None) -> str | None:
     """Derive the Claude Code control base URL from the wake daemon URL."""
-    wake_url = _clean(wake_url)
-    if wake_url is None:
-        return None
-    parsed = urllib.parse.urlparse(wake_url)
-    if parsed.scheme == "ws":
-        scheme = "http"
-    elif parsed.scheme == "wss":
-        scheme = "https"
-    else:
-        return None
-    if not parsed.netloc:
-        return None
-    return urllib.parse.urlunparse((scheme, parsed.netloc, "/v1/claude-code", "", "", ""))
+    return derive_daemon_http_url(wake_url, CONTROL_PATH)
 
 
 def command_confirmation_phrase_matches(transcript: str | None) -> bool:
     """Return True only for the exact command confirmation phrase."""
-    if transcript is None:
-        return False
-    normalized = _TRAILING_PUNCTUATION_RE.sub("", transcript.casefold())
-    normalized = _SPACE_RE.sub(" ", normalized).strip()
-    return normalized == COMMAND_CONFIRMATION_PHRASE
+    return transcript_matches_phrase(transcript, COMMAND_CONFIRMATION_PHRASE)
 
 
 _controller = ClaudeCodeSessionController()
@@ -266,25 +236,3 @@ def _missing_config() -> dict[str, Any]:
             "BOBE_CLAUDE_CODE_CONTROL_URL or BOBE_WAKE_REMOTE_URL, plus BOBE_CLAUDE_CODE_LAUNCH_TOKEN."
         ),
     }
-
-
-def _clean(value: str | None) -> str | None:
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
-
-
-def _float(raw: str | None, default: float) -> float:
-    try:
-        return float(raw) if raw is not None else default
-    except ValueError:
-        return default
-
-
-def _json_or_error(raw: str, *, fallback: dict[str, Any]) -> dict[str, Any]:
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return fallback
-    return parsed if isinstance(parsed, dict) else fallback
