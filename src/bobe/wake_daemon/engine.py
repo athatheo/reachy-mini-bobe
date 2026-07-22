@@ -55,7 +55,7 @@ class WhisperWakeEngine:
             beam_size=1,
             best_of=1,
             temperature=0.0,
-            vad_filter=True,
+            vad_filter=False,
             condition_on_previous_text=False,
             initial_prompt=runtime.whisper_initial_prompt or None,
             hotwords=runtime.whisper_hotwords or None,
