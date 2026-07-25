@@ -235,8 +235,13 @@ class WhisperWakeSession:
                 latency_ms = (time.monotonic() - started) * 1000.0
                 self._set_partial(partial)
                 self._last_partial_at = now
-                if partial and self._listen_mode == "sleep":
-                    event = self._maybe_emit_sleep(partial, latency_ms=latency_ms)
+                # Wake/sleep on partials: finals often arrive late and re-transcribe
+                # trailing noise into junk ("Thank you."), wiping a good live match.
+                if partial:
+                    if self._listen_mode == "sleep":
+                        event = self._maybe_emit_sleep(partial, latency_ms=latency_ms)
+                    else:
+                        event = self._maybe_emit_wake(partial, latency_ms=latency_ms)
                     if event is not None:
                         self.reset()
                         return event

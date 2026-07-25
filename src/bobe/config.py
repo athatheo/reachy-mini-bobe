@@ -108,7 +108,7 @@ class Config:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # The key is downloaded in console.py if needed
 
     # Optional. HF_TOKEN is read directly from the environment by huggingface_hub.
-    MODEL_NAME = os.getenv("MODEL_NAME", "gpt-realtime")
+    MODEL_NAME = os.getenv("MODEL_NAME", "gpt-realtime-2.1")
     HF_HOME = os.getenv("HF_HOME", "./cache")
     LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
 

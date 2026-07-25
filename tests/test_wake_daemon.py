@@ -78,6 +78,26 @@ def test_whisper_engine_detects_wake_phrase(monkeypatch):
     assert event["phrase"] == "hey bobe"
 
 
+def test_whisper_engine_wakes_on_partial_before_final(monkeypatch):
+    """Wake must fire from a live partial — waiting for final often rewrites noise."""
+    session = _session(
+        monkeypatch=monkeypatch,
+        transcribe=lambda _audio: "Hey Bobby, how are you?",
+    )
+    # Continuous speech only (no trailing silence), so finalize should not run.
+    pcm = np.full(16000, 5000, dtype=np.int16)
+    event = None
+    for offset in range(0, pcm.size, 1600):
+        maybe = session.feed(pcm[offset : offset + 1600])
+        if maybe is not None:
+            event = maybe
+            break
+
+    assert event is not None
+    assert event["type"] == "wake"
+    assert "bobby" in event["transcript"].casefold() or "bobe" in event["transcript"].casefold()
+
+
 def test_whisper_engine_ignores_unrelated_speech(monkeypatch):
     session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: "good morning")
 
