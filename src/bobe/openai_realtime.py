@@ -1006,7 +1006,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._queue_antenna_cue(awake=True)
 
         # Flush the buffered audio that arrived with/after the wake phrase so a
-        # one-breath request like "hey jarvis, what's the weather" is not lost.
+        # one-breath request like "hey bobe, what's the weather" is not lost.
         tail = self._wake_buffer.drain_tail(DEFAULT_FLUSH_SECONDS)
         if tail.size and self.connection:
             try:

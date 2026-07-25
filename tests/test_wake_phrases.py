@@ -3,19 +3,24 @@ from bobe.wake.phrases import matches_wake_phrase, matches_sleep_phrase, normali
 
 
 def test_normalize_transcript():
-    assert normalize_transcript("  Hey Jarvis!  ") == "hey jarvis"
+    assert normalize_transcript("  Hey Bobe!  ") == "hey bobe"
 
 
 def test_matches_wake_phrase_exact():
-    assert matches_wake_phrase("hey jarvis")
+    assert matches_wake_phrase("hey bobe")
 
 
 def test_matches_wake_phrase_with_command():
-    assert matches_wake_phrase("hey jarvis what's the weather")
+    assert matches_wake_phrase("hey bobe what's the weather")
 
 
-def test_matches_wake_phrase_jarvis_prefix():
-    assert matches_wake_phrase("jarvis turn on the lights")
+def test_matches_wake_phrase_bobe_prefix():
+    assert matches_wake_phrase("bobe turn on the lights")
+
+
+def test_matches_wake_phrase_asr_variants():
+    assert matches_wake_phrase("hey bobby")
+    assert matches_wake_phrase("hey boby what's up")
 
 
 def test_rejects_unrelated_speech():
@@ -29,10 +34,14 @@ def test_rejects_false_wake_homophones():
     assert not matches_wake_phrase("customer service desk")
 
 
+def test_custom_phrase_does_not_use_bobe_variants():
+    assert not matches_wake_phrase("hey bobby", phrase="hey jarvis")
+
+
 def test_matches_sleep_phrase():
     assert matches_sleep_phrase("go to sleep")
     assert matches_sleep_phrase("please go to sleep now")
     assert matches_sleep_phrase("got to sleep")
     assert matches_sleep_phrase("κοιμήσου")
-    assert not matches_sleep_phrase("hey jarvis")
+    assert not matches_sleep_phrase("hey bobe")
     assert not matches_sleep_phrase("")

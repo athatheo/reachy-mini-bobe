@@ -105,7 +105,7 @@ def test_load_wake_config_defaults():
     assert config.backend == "remote"
     assert config.gain == 1.75
     assert config.timeout_s == 300.0
-    assert config.phrase == "hey jarvis"
+    assert config.phrase == "hey bobe"
     assert "go to sleep" in config.sleep_phrases
 
 

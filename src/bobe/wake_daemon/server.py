@@ -15,6 +15,7 @@ from bobe.wake.protocol import parse_json, wake_message, ready_message, sleep_me
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake_daemon.config import WakeDaemonConfig, load_wake_daemon_config
 from bobe.wake_daemon.engine import WhisperWakeEngine, WhisperWakeSession, whisper_engine_key
+from bobe.wake.phrases import matches_wake_phrase
 from bobe.wake_daemon.launcher import ClaudeCodeLauncher
 from bobe.wake_daemon.claude_session import ClaudeCodeSessionManager
 
@@ -170,8 +171,11 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 await websocket.close(code=1008)
                 return
             client_phrase = str(hello.get("phrase") or runtime.phrase).casefold()
-            session = shared_engine().session(replace(runtime, phrase=client_phrase))
-            await websocket.send_json(ready_message(engine="faster-whisper", phrase=client_phrase))
+            # Match against the daemon env phrase so Mac-side config wins when the
+            # robot app still has a stale BOBE_WAKE_PHRASE.
+            match_phrase = runtime.phrase.casefold() or client_phrase
+            session = shared_engine().session(replace(runtime, phrase=match_phrase))
+            await websocket.send_json(ready_message(engine="faster-whisper", phrase=match_phrase))
 
             while True:
                 message = await websocket.receive()
@@ -206,12 +210,23 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                             )
                         )
                     else:
-                        logger.info("Wake phrase detected (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
+                        wake_transcript = transcript
+                        if client_phrase and client_phrase != match_phrase:
+                            if not matches_wake_phrase(transcript, phrase=client_phrase):
+                                # Old robot builds still filter wake events with their
+                                # local phrase; rewrite so the event is accepted.
+                                wake_transcript = client_phrase
+                        logger.info(
+                            "Wake phrase detected (transcript=%r, client_transcript=%r, latency_ms=%.1f)",
+                            transcript,
+                            wake_transcript,
+                            latency_ms,
+                        )
                         await websocket.send_json(
                             wake_message(
-                                transcript=transcript,
+                                transcript=wake_transcript,
                                 latency_ms=latency_ms,
-                                phrase=str(event["phrase"]),
+                                phrase=match_phrase,
                             )
                         )
 

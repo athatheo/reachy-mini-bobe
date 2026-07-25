@@ -149,12 +149,12 @@ function renderWakeStatus(st) {
     chip.textContent = "Asleep \u00b7 Mac wake";
     chip.className = "chip chip-ok";
     text.textContent =
-      "Mic audio streams to the Mac Whisper daemon while asleep. Say 'Hey Jarvis' to wake BoBe.";
+      "Mic audio streams to the Mac Whisper daemon while asleep. Say 'Hey Bobe' to wake BoBe.";
   } else {
     chip.textContent = "Asleep \u00b7 local only";
     chip.className = "chip chip-ok";
     text.textContent =
-      "Listening locally for 'Hey Jarvis'. No audio leaves the robot until the wake word is heard.";
+      "Listening locally for 'Hey Bobe'. No audio leaves the robot until the wake word is heard.";
   }
 }
 

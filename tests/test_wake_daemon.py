@@ -37,9 +37,9 @@ def _session(config=None, *, monkeypatch=None, transcribe=None):
 def test_load_wake_daemon_config_defaults():
     config = load_wake_daemon_config(_TEST_ENV)
 
-    assert config.phrase == "hey jarvis"
+    assert config.phrase == "hey bobe"
     assert config.whisper_model == "distil-small.en"
-    assert config.whisper_initial_prompt == "Jarvis."
+    assert config.whisper_initial_prompt == "Bobe."
     assert config.whisper_hotwords is None
     assert config.port == 8765
 
@@ -47,7 +47,7 @@ def test_load_wake_daemon_config_defaults():
 def test_whisper_prompt_helpers():
     from bobe.wake_daemon.config import whisper_initial_prompt_from_phrase
 
-    assert whisper_initial_prompt_from_phrase("hey jarvis") == "Jarvis."
+    assert whisper_initial_prompt_from_phrase("hey bobe") == "Bobe."
 
 
 def test_whisper_prompt_env_override():
@@ -63,7 +63,7 @@ def test_whisper_prompt_env_override():
 
 
 def test_whisper_engine_detects_wake_phrase(monkeypatch):
-    session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: "hey jarvis")
+    session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: "hey bobe")
 
     pcm = np.zeros(16000, dtype=np.int16)
     pcm[:8000] = 5000
@@ -75,7 +75,7 @@ def test_whisper_engine_detects_wake_phrase(monkeypatch):
 
     assert event is not None
     assert event["type"] == "wake"
-    assert event["phrase"] == "hey jarvis"
+    assert event["phrase"] == "hey bobe"
 
 
 def test_whisper_engine_ignores_unrelated_speech(monkeypatch):

@@ -17,7 +17,7 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 
 ## Current milestone
 
-- Remote wake word: say `Hey Jarvis` to wake BoBe (Mac-side Whisper daemon; robot streams PCM while asleep).
+- Remote wake word: say `Hey Bobe` to wake BoBe (Mac-side Whisper daemon; robot streams PCM while asleep).
 - Voice input/output uses the official Reachy Mini conversation app pipeline.
 - Normal assistant answers are routed through Claude with the `ask_claude` profile tool.
 - Claude Code can be launched on the Mac mini after a second spoken confirmation, and follow-up commands can be sent to a managed Claude Code session after command confirmation.
@@ -26,7 +26,7 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 ## Privacy model
 
 - While asleep, microphone PCM streams from the robot to a Mac-side wake daemon over WebSocket. A short in-memory ring buffer on the robot is continuously discarded; nothing goes to OpenAI until wake.
-- Saying `Hey Jarvis` opens a streaming window (chime + antennas up). During that window audio streams to OpenAI Realtime for transcription and speech, like any cloud voice assistant.
+- Saying `Hey Bobe` opens a streaming window (chime + antennas up). During that window audio streams to OpenAI Realtime for transcription and speech, like any cloud voice assistant.
 - The window closes (chime + antennas relaxed) when you say `go to sleep` (or Greek `κοιμήσου`) or after `BOBE_WAKE_TIMEOUT_S` (default 300s) without session activity.
 - Tune with `BOBE_WAKE_REMOTE_URL`, `BOBE_WAKE_TOKEN`, `BOBE_WAKE_GAIN`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_WAKE_PHRASE`, `BOBE_SLEEP_PHRASE`. Wake-word gating is always on: say the wake phrase to stream, `go to sleep` to stop.
 
@@ -51,7 +51,7 @@ The OpenAI key is used by the inherited realtime speech bridge. The Anthropic ke
 
 ## Remote wake runbook (Mac + robot)
 
-BoBe wake detection runs on a Mac host. The robot streams microphone PCM over WebSocket while asleep; the Mac runs Whisper and sends a wake event when it hears `Hey Jarvis`.
+BoBe wake detection runs on a Mac host. The robot streams microphone PCM over WebSocket while asleep; the Mac runs Whisper and sends a wake event when it hears `Hey Bobe`.
 
 ### 1. Mac: start the wake daemon
 
@@ -111,7 +111,7 @@ Restart the BoBe app after saving. The settings page at `/wake-config` can persi
 
 1. Daemon running on Mac; firewall allows inbound **8765** from the robot.
 2. Start BoBe on the robot; check `/status`: `wake_enabled`, `wake_backend=remote`, `wake_debug.connected=true`.
-3. Say **Hey Jarvis** → chime + antennas up; Realtime session opens.
+3. Say **Hey Bobe** → chime + antennas up; Realtime session opens.
 4. Optional Claude Code launch: ask BoBe to launch Claude Code, then say **confirm launch Claude Code** when prompted.
 5. Optional managed command: ask BoBe to tell Claude Code something, then say **confirm Claude command** when prompted.
 6. Say **go to sleep** (or wait for `BOBE_WAKE_TIMEOUT_S`) → session closes.

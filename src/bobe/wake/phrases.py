@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 
-WAKE_PHRASE = "hey jarvis"
+WAKE_PHRASE = "hey bobe"
 
 DEFAULT_SLEEP_PHRASES: tuple[str, ...] = ("go to sleep", "κοιμήσου")
 SLEEP_PHRASE_ASR_VARIANTS: tuple[str, ...] = ("got to sleep",)
+
+# Common Whisper near-misses for the wake name (keep tight — avoid everyday phrases).
+WAKE_PHRASE_ASR_VARIANTS: tuple[str, ...] = (
+    "hey bobby",
+    "hey boby",
+    "hey bobbie",
+)
 
 # Substrings that must not trigger wake (common Whisper false positives / homophones).
 FALSE_WAKE_SUBSTRINGS: tuple[str, ...] = (
@@ -44,7 +51,15 @@ def matches_wake_phrase(text: str, *, phrase: str = WAKE_PHRASE) -> bool:
         return True
     if wake_name and normalized.startswith(wake_name):
         return True
-    return wake in normalized
+    if wake in normalized:
+        return True
+    # Near-miss variants apply only for the default BoBe phrase.
+    if wake == WAKE_PHRASE:
+        for variant in WAKE_PHRASE_ASR_VARIANTS:
+            candidate = variant.casefold()
+            if candidate and (normalized.startswith(candidate) or candidate in normalized):
+                return True
+    return False
 
 
 def matches_sleep_phrase(
