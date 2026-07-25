@@ -119,7 +119,7 @@ def restart_robot_app(robot_host: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deploy BoBe and configure remote wake on Reachy")
     parser.add_argument("--robot-host", default="192.168.1.117")
-    parser.add_argument("--mac-host", default="192.168.1.114")
+    parser.add_argument("--mac-host", default="Mac.local")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--daemon-env", type=Path, default=Path("config/wake-daemon.env"))
     parser.add_argument("--skip-deploy", action="store_true")
