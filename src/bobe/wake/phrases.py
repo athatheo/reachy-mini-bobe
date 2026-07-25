@@ -26,8 +26,9 @@ FALSE_WAKE_SUBSTRINGS: tuple[str, ...] = (
 
 def normalize_transcript(text: str) -> str:
     """Normalize ASR text for wake phrase comparison."""
-    stripped = text.strip().strip(" \t\n\r,.:;!?-")
-    return " ".join(stripped.casefold().split())
+    # Strip punctuation inside tokens too — Whisper often emits "Hey, Bobby."
+    cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.casefold())
+    return " ".join(cleaned.split())
 
 
 def is_false_wake_transcript(text: str) -> bool:
@@ -39,25 +40,32 @@ def is_false_wake_transcript(text: str) -> bool:
 
 
 def matches_wake_phrase(text: str, *, phrase: str = WAKE_PHRASE) -> bool:
-    """Return whether a transcript contains the wake phrase."""
+    """Return whether a transcript contains the wake phrase.
+
+    Requires the full phrase (e.g. ``hey bobe``), not the bare name. Whisper's
+    initial prompt often echoes just ``Bobe.`` / ``Jarvis.`` and that must not wake.
+    """
     if is_false_wake_transcript(text):
         return False
     normalized = normalize_transcript(text)
     if not normalized:
         return False
-    wake = phrase.casefold()
-    wake_name = wake.split()[-1] if wake else ""
-    if normalized.startswith(wake):
-        return True
-    if wake_name and normalized.startswith(wake_name):
-        return True
-    if wake in normalized:
+    wake = phrase.casefold().strip()
+    if not wake:
+        return False
+    if normalized == wake or normalized.startswith(wake + " ") or f" {wake} " in f" {normalized} ":
         return True
     # Near-miss variants apply only for the default BoBe phrase.
     if wake == WAKE_PHRASE:
         for variant in WAKE_PHRASE_ASR_VARIANTS:
-            candidate = variant.casefold()
-            if candidate and (normalized.startswith(candidate) or candidate in normalized):
+            candidate = variant.casefold().strip()
+            if not candidate:
+                continue
+            if (
+                normalized == candidate
+                or normalized.startswith(candidate + " ")
+                or f" {candidate} " in f" {normalized} "
+            ):
                 return True
     return False
 

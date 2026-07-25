@@ -87,10 +87,12 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
         value = (source.get(name) or "").strip()
         return value or None
 
+    # Do not auto-inject the wake name as an initial prompt — Whisper often
+    # echoes it alone ("Bobe." / "Jarvis.") which false-triggers name matching.
     if "WHISPER_INITIAL_PROMPT" in source:
         initial_prompt = _optional("WHISPER_INITIAL_PROMPT")
     else:
-        initial_prompt = whisper_initial_prompt_from_phrase(phrase)
+        initial_prompt = None
     hotwords = _optional("WHISPER_HOTWORDS")
 
     return WakeDaemonConfig(

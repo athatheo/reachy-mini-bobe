@@ -4,6 +4,7 @@ from bobe.wake.phrases import matches_wake_phrase, matches_sleep_phrase, normali
 
 def test_normalize_transcript():
     assert normalize_transcript("  Hey Bobe!  ") == "hey bobe"
+    assert normalize_transcript("Hey, Bobby.") == "hey bobby"
 
 
 def test_matches_wake_phrase_exact():
@@ -14,8 +15,15 @@ def test_matches_wake_phrase_with_command():
     assert matches_wake_phrase("hey bobe what's the weather")
 
 
-def test_matches_wake_phrase_bobe_prefix():
-    assert matches_wake_phrase("bobe turn on the lights")
+def test_matches_whisper_comma_bobby():
+    assert matches_wake_phrase("Hey, Bobby.")
+
+
+def test_rejects_bare_name_prompt_echo():
+    # Whisper initial_prompt often emits just the name — must not wake.
+    assert not matches_wake_phrase("bobe")
+    assert not matches_wake_phrase("Bobe.")
+    assert not matches_wake_phrase("jarvis")
 
 
 def test_matches_wake_phrase_asr_variants():
@@ -26,6 +34,7 @@ def test_matches_wake_phrase_asr_variants():
 def test_rejects_unrelated_speech():
     assert not matches_wake_phrase("good morning")
     assert not matches_wake_phrase("hey there")
+    assert not matches_wake_phrase("I'm going to ask you.")
 
 
 def test_rejects_false_wake_homophones():
