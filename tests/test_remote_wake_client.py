@@ -137,6 +137,53 @@ def test_remote_client_ignores_sleep_without_phrase_match():
     assert not slept
 
 
+def test_remote_client_ignores_sleep_phrase_inside_conversation():
+    """Re-validation must be a strict command match, not substring containment."""
+    slept = False
+
+    def on_sleep():
+        nonlocal slept
+        slept = True
+
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://127.0.0.1:8765/v1/stream",
+        on_sleep=on_sleep,
+    )
+    client._handle_sleep_payload(
+        {
+            "type": "sleep",
+            "transcript": "My toddler won't go to sleep, any tips?",
+            "latency_ms": 40.0,
+        }
+    )
+    assert not slept
+    events = client.debug_state()["events"]
+    assert events[-1]["level"] == "warn"
+
+
+def test_remote_client_accepts_sleep_command_with_fillers():
+    slept = False
+
+    def on_sleep():
+        nonlocal slept
+        slept = True
+
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://127.0.0.1:8765/v1/stream",
+        on_sleep=on_sleep,
+    )
+    client._handle_sleep_payload(
+        {
+            "type": "sleep",
+            "transcript": "Okay Bobe, please go to sleep now.",
+            "latency_ms": 40.0,
+        }
+    )
+    assert slept
+
+
 # ---- reconnect handshake / session lifecycle ----
 
 
@@ -184,19 +231,33 @@ def test_run_connection_drops_stale_queued_audio():
     assert not any(isinstance(m, (bytes, bytearray)) for m in ws.sent)
 
 
-def test_queue_listen_mode_coalesces_to_latest():
+def _listen_payloads(ws: FakeWebSocket) -> list[dict]:
+    payloads = [json.loads(m) for m in ws.sent if isinstance(m, str)]
+    return [p for p in payloads if p.get("type") == "listen"]
+
+
+async def _drive_send_loop(client: RemoteWakeClient, ws: object) -> None:
+    task = asyncio.create_task(client._send_loop(ws))
+    await asyncio.sleep(0.2)
+    client._audio_queue.put_nowait(None)  # stop sentinel
+    await asyncio.wait_for(task, timeout=5.0)
+
+
+def test_rapid_mode_toggles_send_only_latest_mode():
     client = _make_client()
     for _ in range(10):
         client.listen_for_sleep()
         client.listen_for_wake()
-    mode, payload = client._control_queue.get_nowait()
-    assert mode == "wake"
-    assert payload["mode"] == "wake"
-    with pytest.raises(queue.Empty):
-        client._control_queue.get_nowait()
+    ws = FakeWebSocket()
+
+    asyncio.run(_drive_send_loop(client, ws))
+
+    listens = _listen_payloads(ws)
+    assert len(listens) == 1
+    assert listens[0]["mode"] == "wake"
 
 
-def test_send_loop_requeues_control_payload_on_send_failure():
+def test_send_loop_reflags_mode_send_on_failure():
     client = _make_client()
     client.listen_for_sleep()
 
@@ -207,9 +268,52 @@ def test_send_loop_requeues_control_payload_on_send_failure():
     with pytest.raises(ConnectionError):
         asyncio.run(client._send_loop(FailingWebSocket()))
 
-    mode, payload = client._control_queue.get_nowait()
-    assert mode == "sleep"
-    assert payload["mode"] == "sleep"
+    assert client._mode_send_pending.is_set()
+
+    # The retried send must resolve the *current* mode, not replay the
+    # payload that failed: a mode change while disconnected wins.
+    client.listen_for_wake()
+    ws = FakeWebSocket()
+    asyncio.run(_drive_send_loop(client, ws))
+    listens = _listen_payloads(ws)
+    assert listens
+    assert listens[-1]["mode"] == "wake"
+
+
+def test_reconnect_replay_cannot_clobber_concurrent_mode_change():
+    """Regression: the replay used to snapshot the mode and drain the control
+    queue, dropping a listen_for_sleep() that raced with the reconnect and
+    leaving the daemon in wake mode while BoBe was awake."""
+    client = _make_client()  # desired mode starts as "wake"
+
+    class ModeSwitchingWebSocket(FakeWebSocket):
+        """Switches modes while the replayed wake send is in flight."""
+
+        def __init__(self, owner: RemoteWakeClient) -> None:
+            super().__init__()
+            self._owner = owner
+            self._switched = False
+
+        async def send(self, data: object) -> None:
+            await super().send(data)
+            if not self._switched and isinstance(data, str) and json.loads(data).get("type") == "listen":
+                self._switched = True
+                self._owner.listen_for_sleep()
+
+    ws = ModeSwitchingWebSocket(client)
+
+    async def run() -> None:
+        task = asyncio.create_task(client._run_connection(ws))
+        await asyncio.sleep(0.3)
+        client._audio_queue.put_nowait(None)
+        await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(run())
+
+    listens = _listen_payloads(ws)
+    assert listens, "the reconnect must replay a listen mode"
+    assert listens[-1]["mode"] == "sleep"
+    assert listens[-1]["sleep_phrases"]
 
 
 def test_start_drains_stale_audio_and_sentinels(monkeypatch):

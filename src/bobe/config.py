@@ -89,13 +89,15 @@ def _find_config_dotenv() -> Path | None:
     """Locate the project .env anchored to the package/repo, never the launch CWD.
 
     Searching upward from the CWD made the loaded config depend on where the
-    process was started (shell vs dashboard vs systemd). Only the packaged
-    directory and, for repo checkouts, the repo root are considered.
+    process was started (shell vs dashboard vs systemd). For repo checkouts the
+    repo-root .env (the README-documented location) is preferred; the packaged
+    directory's .env remains a legacy fallback.
     """
     package_dir = Path(__file__).resolve().parent
-    candidates = [package_dir / ".env"]
+    candidates: list[Path] = []
     if package_dir.parent.name == "src":
         candidates.append(package_dir.parent.parent / ".env")
+    candidates.append(package_dir / ".env")
     for candidate in candidates:
         if candidate.is_file():
             return candidate

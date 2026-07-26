@@ -80,3 +80,58 @@ def test_find_config_dotenv_ignores_launch_cwd(
     assert found != tmp_path / ".env"
     if found is not None:
         assert tmp_path not in found.parents
+
+
+def _fake_repo_checkout(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a repo-checkout layout and return (repo_root, package_dir)."""
+    repo_root = tmp_path.resolve() / "repo"
+    package_dir = repo_root / "src" / "bobe"
+    package_dir.mkdir(parents=True)
+    return repo_root, package_dir
+
+
+def test_find_config_dotenv_prefers_repo_root_over_package_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The README-documented repo-root .env must win over a legacy src/bobe/.env."""
+    repo_root, package_dir = _fake_repo_checkout(tmp_path)
+    (repo_root / ".env").write_text("OPENAI_API_KEY=root-key\n", encoding="utf-8")
+    (package_dir / ".env").write_text("OPENAI_API_KEY=legacy-key\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "__file__", str(package_dir / "config.py"))
+
+    assert config_mod._find_config_dotenv() == repo_root / ".env"
+
+
+def test_find_config_dotenv_falls_back_to_package_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a repo-root .env, the legacy src/bobe/.env is still honored."""
+    repo_root, package_dir = _fake_repo_checkout(tmp_path)
+    (package_dir / ".env").write_text("OPENAI_API_KEY=legacy-key\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "__file__", str(package_dir / "config.py"))
+
+    assert config_mod._find_config_dotenv() == package_dir / ".env"
+
+
+def test_find_config_dotenv_returns_none_when_no_env_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No candidate .env files means no dotenv is loaded."""
+    _, package_dir = _fake_repo_checkout(tmp_path)
+    monkeypatch.setattr(config_mod, "__file__", str(package_dir / "config.py"))
+
+    assert config_mod._find_config_dotenv() is None
+
+
+def test_find_config_dotenv_installed_package_only_checks_package_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Outside a src/ checkout, only the packaged directory's .env is considered."""
+    site_packages = tmp_path.resolve() / "site-packages"
+    package_dir = site_packages / "bobe"
+    package_dir.mkdir(parents=True)
+    (site_packages.parent / ".env").write_text("OPENAI_API_KEY=outside\n", encoding="utf-8")
+    (package_dir / ".env").write_text("OPENAI_API_KEY=packaged\n", encoding="utf-8")
+    monkeypatch.setattr(config_mod, "__file__", str(package_dir / "config.py"))
+
+    assert config_mod._find_config_dotenv() == package_dir / ".env"

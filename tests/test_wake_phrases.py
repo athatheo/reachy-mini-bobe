@@ -1,7 +1,12 @@
 # ruff: noqa: D103
 import unicodedata
 
-from bobe.wake.phrases import matches_wake_phrase, matches_sleep_phrase, normalize_transcript
+from bobe.wake.phrases import (
+    matches_wake_phrase,
+    matches_sleep_phrase,
+    normalize_transcript,
+    matches_sleep_command,
+)
 
 
 def test_normalize_transcript():
@@ -82,3 +87,48 @@ def test_sleep_phrase_matches_decomposed_unicode_both_ways():
     assert matches_sleep_phrase(nfd)
     # NFD-configured custom phrase against an NFC transcript.
     assert matches_sleep_phrase("κοιμήσου", (nfd,))
+
+
+def test_matches_sleep_command_exact_and_with_fillers():
+    assert matches_sleep_command("go to sleep")
+    assert matches_sleep_command("Go to sleep!")
+    assert matches_sleep_command("please go to sleep now")
+    assert matches_sleep_command("Okay Bobe, please go to sleep now.")
+    assert matches_sleep_command("κοιμήσου")
+    assert matches_sleep_command("κοιμήσου τώρα παρακαλώ")
+
+
+def test_matches_sleep_command_rejects_conversational_transcripts():
+    # Substring containment used to put BoBe to sleep mid-conversation.
+    assert not matches_sleep_command("My toddler won't go to sleep, any tips?")
+    assert not matches_sleep_command("I want to go to sleep early tonight")
+    assert not matches_sleep_command("what time is it")
+    assert not matches_sleep_command("hey bobe")
+    assert not matches_sleep_command("")
+
+
+def test_matches_sleep_command_limits_filler_budget():
+    # Five extra words is conversation even when every word is a filler.
+    assert not matches_sleep_command("okay okay okay okay okay go to sleep")
+    # Non-filler extras are conversation even under the word budget.
+    assert not matches_sleep_command("we should go to sleep")
+
+
+def test_matches_sleep_command_accepts_asr_variant_as_command_only():
+    # Whisper mishears "go to sleep" as "got to sleep" — accept it as a
+    # near-exact command, never inside a longer sentence.
+    assert matches_sleep_command("got to sleep")
+    assert matches_sleep_command("Got to sleep, please.")
+    assert not matches_sleep_command("my toddler finally got to sleep at nine")
+
+
+def test_matches_sleep_command_normalizes_custom_phrases():
+    assert matches_sleep_command("It's bedtime.", ("it's bedtime",))
+    assert matches_sleep_command("time to rest now", ("time to  rest",))
+    assert not matches_sleep_command("we argued about whether it's bedtime yet", ("it's bedtime",))
+
+
+def test_matches_sleep_command_decomposed_unicode_both_ways():
+    nfd = unicodedata.normalize("NFD", "κοιμήσου")
+    assert matches_sleep_command(nfd)
+    assert matches_sleep_command("κοιμήσου", (nfd,))

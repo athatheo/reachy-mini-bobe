@@ -23,6 +23,7 @@ from bobe.claude_code_client import (
 logger = logging.getLogger(__name__)
 
 CONFIRMATION_PHRASE = "confirm launch claude code"
+CONFIRMATION_INSTRUCTION = f"To launch Claude Code, say exactly: {CONFIRMATION_PHRASE}."
 LAUNCH_PATH = "/v1/launch/claude-code"
 
 
@@ -87,7 +88,7 @@ class ClaudeCodeLaunchController:
             "status": "pending_confirmation",
             "confirmation_phrase": CONFIRMATION_PHRASE,
             "expires_in_s": round(max(1.0, settings.confirm_ttl_s), 1),
-            "message": f"To launch Claude Code, say exactly: {CONFIRMATION_PHRASE}.",
+            "message": CONFIRMATION_INSTRUCTION,
         }
 
     def cancel(self) -> dict[str, Any]:
@@ -109,18 +110,28 @@ class ClaudeCodeLaunchController:
             return False
         return True
 
-    async def maybe_confirm_from_transcript(self, transcript: str | None) -> dict[str, Any] | None:
-        """Launch only when a completed transcript is the exact confirmation phrase."""
+    async def maybe_confirm_from_transcript(
+        self,
+        transcript: str | None,
+        *,
+        correct_mismatch: bool = True,
+    ) -> dict[str, Any] | None:
+        """Launch only when a completed transcript is the exact confirmation phrase.
+
+        With ``correct_mismatch`` (the default), a garbled confirmation attempt
+        while a launch is pending returns a corrective ``confirmation_mismatch``
+        response instead of failing silently. Orchestrators coordinating several
+        pending confirmations pass ``False`` so a corrective reply here can never
+        shadow another controller's exactly-spoken phrase; they build the
+        correction themselves once every exact match has failed.
+        """
         if not confirmation_phrase_matches(transcript):
-            if self.has_pending() and transcript_attempts_confirmation(transcript):
+            if correct_mismatch and self.has_pending() and transcript_attempts_confirmation(transcript):
                 # Don't fail silently while a launch is pending: keep the pending
                 # request alive and tell the user the exact phrase to repeat.
                 return {
                     "status": "confirmation_mismatch",
-                    "message": (
-                        "That wasn't the exact confirmation phrase. "
-                        f"To launch Claude Code, say exactly: {CONFIRMATION_PHRASE}."
-                    ),
+                    "message": f"That wasn't the exact confirmation phrase. {CONFIRMATION_INSTRUCTION}",
                 }
             return None
 
@@ -223,6 +234,15 @@ def reset_claude_code_launch_controller(controller: ClaudeCodeLaunchController |
     _controller = controller or ClaudeCodeLaunchController()
 
 
-async def maybe_confirm_claude_code_launch(transcript: str | None) -> dict[str, Any] | None:
+async def maybe_confirm_claude_code_launch(
+    transcript: str | None,
+    *,
+    correct_mismatch: bool = True,
+) -> dict[str, Any] | None:
     """Confirm a pending launch from a completed transcript when possible."""
-    return await _controller.maybe_confirm_from_transcript(transcript)
+    return await _controller.maybe_confirm_from_transcript(transcript, correct_mismatch=correct_mismatch)
+
+
+def pending_launch_confirmation_instruction() -> str | None:
+    """Return the exact-phrase instruction while a launch confirmation is pending."""
+    return CONFIRMATION_INSTRUCTION if _controller.has_pending() else None

@@ -522,25 +522,28 @@ class MovementManager:
         ):
             idle_for = current_time - self.state.last_activity_time
             if idle_for >= self.idle_inactivity_delay:
-                try:
-                    # These 2 functions return the latest available sensor data from the robot, but don't perform I/O synchronously.
-                    # Therefore, we accept calling them inside the control loop.
-                    _, current_antennas = self.current_robot.get_current_joint_positions()
-                    current_head_pose = self.current_robot.get_current_head_pose()
+                # Interpolate from the PRIMARY (offset-free) pose, not the
+                # measured pose: the measured pose already contains the
+                # secondary offsets (speech sway / face tracking), so starting
+                # there would compose those offsets twice during the blend-in.
+                # `last_primary_pose` is worker-owned, so it can be read
+                # directly here (external threads use get_primary_target_pose).
+                primary_pose = self.state.last_primary_pose
+                if primary_pose is None:
+                    neutral_head = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+                    primary_pose = (neutral_head, (0.0, 0.0), 0.0)
+                primary_head, primary_antennas, _ = clone_full_body_pose(primary_pose)
 
-                    self._breathing_active = True
-                    self.state.update_activity()
+                self._breathing_active = True
+                self.state.update_activity()
 
-                    breathing_move = BreathingMove(
-                        interpolation_start_pose=current_head_pose,
-                        interpolation_start_antennas=current_antennas,
-                        interpolation_duration=1.0,
-                    )
-                    self.move_queue.append(breathing_move)
-                    logger.debug("Started breathing after %.1fs of inactivity", idle_for)
-                except Exception as e:
-                    self._breathing_active = False
-                    logger.error("Failed to start breathing: %s", e)
+                breathing_move = BreathingMove(
+                    interpolation_start_pose=primary_head,
+                    interpolation_start_antennas=primary_antennas,
+                    interpolation_duration=1.0,
+                )
+                self.move_queue.append(breathing_move)
+                logger.debug("Started breathing after %.1fs of inactivity", idle_for)
 
         if isinstance(self.state.current_move, BreathingMove) and self.move_queue:
             self.state.current_move = None

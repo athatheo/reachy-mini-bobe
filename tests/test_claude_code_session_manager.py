@@ -263,20 +263,58 @@ def test_session_manager_send_aborts_when_stopped_during_spawn(tmp_path, monkeyp
 
 
 def test_session_manager_send_never_asserts_when_stop_races_session_id(tmp_path, monkeypatch):
-    """A stop() landing around send() must yield a clean error/new session, not a 500."""
+    """A stop() landing around send() must yield a clean error/new session, not a 500 (#15).
+
+    send() resolves settings between the caller's start() and re-acquiring the
+    lock; the pre-fix code asserted the session id survived that window. Gate
+    the settings resolution on events and fire stop() inside every such window
+    so the session id really is gone when send() takes the lock.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    gate_armed = threading.Event()
+    in_settings = threading.Event()
+    release_settings = threading.Event()
+
+    def gated_resolve_binary(_binary):
+        if gate_armed.is_set():
+            in_settings.set()
+            assert release_settings.wait(timeout=5)
+            release_settings.clear()  # turnstile: block each pass through settings
+        return "/usr/local/bin/claude"
+
+    monkeypatch.setattr(session_module, "resolve_binary", gated_resolve_binary)
     manager = ClaudeCodeSessionManager(
         WakeDaemonConfig(token="wake-token"),
         popen_factory=lambda *args, **kwargs: FakeProcess(json.dumps({"result": "done"})),
     )
-    manager.start()
-    manager.stop()  # simulates the stop() winning the race before send()'s critical section
+    stopped_session_id = manager.start()["session_id"]
+    outcome: dict = {}
 
-    result = manager.send("task")
+    def send_task():
+        try:
+            outcome["result"] = manager.send("task")
+        except BaseException as exc:  # the pre-fix code raised AssertionError here
+            outcome["exception"] = exc
 
+    gate_armed.set()
+    stops: list[dict] = []
+    worker = threading.Thread(target=send_task)
+    worker.start()
+    while worker.is_alive():
+        if not in_settings.wait(timeout=0.05):
+            continue
+        in_settings.clear()
+        stops.append(manager.stop())  # clear the session id in send()'s blind spot
+        release_settings.set()
+
+    assert "exception" not in outcome, f"send() raised: {outcome.get('exception')!r}"
+    assert stops and stops[0]["stopped_session_id"] == stopped_session_id
+    result = outcome["result"]
     assert result["ok"] is True
+    assert result["accepted"] is True
+    # Proof the race landed: send() had to mint a fresh session id.
     assert result["session_id"]
+    assert result["session_id"] != stopped_session_id
     assert _wait_for_result(manager)["ok"] is True
 
 

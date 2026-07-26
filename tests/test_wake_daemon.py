@@ -159,6 +159,37 @@ def test_whisper_engine_detects_sleep_phrase(monkeypatch):
     assert event["type"] == "sleep"
 
 
+def test_whisper_engine_detects_sleep_command_with_fillers(monkeypatch):
+    session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: "Okay Bobe, please go to sleep now.")
+    session.set_listen_mode("sleep")
+
+    pcm = np.zeros(16000, dtype=np.int16)
+    pcm[:8000] = 5000
+    event = None
+    for offset in range(0, pcm.size, 1600):
+        maybe = session.feed(pcm[offset : offset + 1600])
+        if maybe is not None:
+            event = maybe
+
+    assert event is not None
+    assert event["type"] == "sleep"
+
+
+def test_whisper_engine_ignores_sleep_phrase_inside_conversation(monkeypatch):
+    """Substring matching used to sleep on 'my toddler won't go to sleep'."""
+    session = _session(
+        monkeypatch=monkeypatch,
+        transcribe=lambda _audio: "My toddler won't go to sleep, any tips?",
+    )
+    session.set_listen_mode("sleep")
+
+    pcm = np.zeros(16000, dtype=np.int16)
+    pcm[:8000] = 5000
+    events = [session.feed(pcm[offset : offset + 1600]) for offset in range(0, pcm.size, 1600)]
+
+    assert all(event is None for event in events)
+
+
 def test_transcribe_passes_configured_language():
     captured = {}
 

@@ -14,6 +14,7 @@ from reachy_mini.motion.move import Move
 from bobe.moves import (
     SECONDARY_ROTATION_LIMIT_RAD,
     SECONDARY_TRANSLATION_LIMIT_M,
+    BreathingMove,
     MovementManager,
 )
 from bobe.audio.head_wobbler import HeadWobbler
@@ -83,6 +84,11 @@ def test_reset_pushes_neutral_offsets() -> None:
         offsets = [captured_offsets for _, captured_offsets in captured]
         assert NEUTRAL_OFFSETS in offsets, "reset did not push a neutral offset snapshot"
         assert offsets[-1] == NEUTRAL_OFFSETS, "head left with non-neutral offsets after reset"
+
+        # The neutral push is atomic with the generation bump, so a stale
+        # in-flight offset can never land after reset() returns.
+        time.sleep(0.2)
+        assert captured[-1][1] == NEUTRAL_OFFSETS, "stale offset applied after reset returned"
     finally:
         wobbler.stop()
 
@@ -153,6 +159,56 @@ def test_reset_during_inflight_chunk_keeps_worker(monkeypatch: Any) -> None:
         assert _wait_for(lambda: len(captured) > pre_second), "no offsets emitted after in-flight reset"
         assert wobbler._thread.is_alive()
     finally:
+        wobbler.stop()
+
+
+def test_reset_serializes_with_inflight_apply() -> None:
+    """reset() must not interleave between the worker's generation check and apply.
+
+    Regression for the TOCTOU race: with the check and apply un-atomic, a
+    reset() (generation bump + neutral push) running in that gap lost to the
+    worker's stale sway offset (last-writer-wins) and the head stayed tilted.
+    This pins the exact interleaving by blocking the worker mid-apply and
+    running reset() concurrently: reset() must wait for the in-flight apply,
+    so its neutral snapshot always lands last.
+    """
+    captured: List[Tuple[float, float, float, float, float, float]] = []
+    inflight = threading.Event()
+    release = threading.Event()
+
+    def capture(offsets: Tuple[float, float, float, float, float, float]) -> None:
+        captured.append(offsets)
+        if offsets != NEUTRAL_OFFSETS and not inflight.is_set():
+            inflight.set()
+            release.wait(timeout=2.0)
+
+    wobbler = HeadWobbler(set_speech_offsets=capture)
+    wobbler.start()
+    try:
+        wobbler.feed(_make_audio_chunk(duration_s=0.35))
+        assert inflight.wait(timeout=1.0), "worker never applied a wobble offset"
+
+        # The worker is blocked inside the apply; a concurrent reset() must
+        # serialize behind it instead of sneaking its neutral push in between.
+        reset_done = threading.Event()
+
+        def run_reset() -> None:
+            wobbler.reset()
+            reset_done.set()
+
+        resetter = threading.Thread(target=run_reset, daemon=True)
+        resetter.start()
+        assert not reset_done.wait(timeout=0.2), "reset() completed while an apply was in flight"
+
+        release.set()
+        assert reset_done.wait(timeout=3.0), "reset() did not complete after the apply finished"
+        resetter.join(timeout=1.0)
+
+        # Give the worker a window to (incorrectly) push a stale offset.
+        time.sleep(0.2)
+        assert captured[-1] == NEUTRAL_OFFSETS, "stale sway offset overwrote reset()'s neutral push"
+    finally:
+        release.set()
         wobbler.stop()
 
 
@@ -248,6 +304,44 @@ def test_secondary_offsets_are_clamped_and_sanitized() -> None:
     assert np.allclose(head_pose, expected)
     assert antennas == (0.0, 0.0)
     assert body_yaw == 0.0
+
+
+def test_breathing_starts_from_primary_pose_not_measured_pose() -> None:
+    """Idle breathing must interpolate from the offset-free PRIMARY pose.
+
+    The measured head pose already contains the secondary offsets (speech
+    sway / face tracking); starting the breathing blend from it would compose
+    those offsets twice for the interpolation duration.
+    """
+    robot = _FakeRobot()
+    # Measured pose = primary + secondary offsets (e.g. face tracking active).
+    measured_pose = create_head_pose(x=0.01, y=0.0, z=0.02, roll=0.0, pitch=0.0, yaw=0.3, degrees=False, mm=False)
+    robot.get_current_head_pose = lambda: measured_pose  # type: ignore[method-assign]
+
+    manager = MovementManager(robot)
+    primary_head = create_head_pose(x=0.0, y=0.0, z=0.01, roll=0.0, pitch=0.0, yaw=0.1, degrees=False, mm=False)
+    primary_antennas = (0.2, -0.2)
+    manager.state.last_primary_pose = (primary_head, primary_antennas, 0.0)
+
+    # Force the idle timeout to elapse, then run one breathing-management pass
+    # exactly as the worker thread would (no thread needed for this check).
+    now = manager._now()
+    manager.state.last_activity_time = now - manager.idle_inactivity_delay - 1.0
+    manager._manage_breathing(now)
+
+    assert manager._breathing_active, "idle breathing was not scheduled"
+    assert len(manager.move_queue) == 1
+    breathing = manager.move_queue[0]
+    assert isinstance(breathing, BreathingMove)
+    assert np.allclose(breathing.interpolation_start_pose, primary_head), (
+        "breathing interpolation must start from the primary pose"
+    )
+    assert not np.allclose(breathing.interpolation_start_pose, measured_pose), (
+        "breathing interpolation started from the measured (offset-composed) pose"
+    )
+    assert np.allclose(breathing.interpolation_start_antennas, primary_antennas), (
+        "breathing antennas must start from the primary pose tuple"
+    )
 
 
 def test_listening_debounce_coalesces_to_latest_state() -> None:

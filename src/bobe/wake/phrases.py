@@ -24,6 +24,29 @@ FALSE_WAKE_SUBSTRINGS: tuple[str, ...] = (
     " church service",
 )
 
+# Filler words allowed around a sleep phrase without turning it into ordinary
+# conversation ("okay bobe, please go to sleep now" sleeps; "my toddler won't
+# go to sleep, any tips?" must not).
+SLEEP_COMMAND_FILLER_WORDS: frozenset[str] = frozenset(
+    {
+        "please",
+        "now",
+        "ok",
+        "okay",
+        "hey",
+        "bobe",
+        "thanks",
+        "thank",
+        "you",
+        "and",
+        "παρακαλώ",
+        "τώρα",
+        "εντάξει",
+    }
+)
+# Beyond this many non-phrase words, treat the transcript as conversation.
+SLEEP_COMMAND_MAX_EXTRA_WORDS: int = 4
+
 
 def normalize_transcript(text: str) -> str:
     """Normalize ASR text for wake phrase comparison."""
@@ -80,7 +103,12 @@ def matches_sleep_phrase(
     text: str,
     phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
 ) -> bool:
-    """Return whether a transcript asks BoBe to go back to sleep."""
+    """Return whether a transcript contains a sleep phrase anywhere.
+
+    Loose substring containment — prefer :func:`matches_sleep_command` for
+    deciding whether to actually put BoBe to sleep, since sleep phrases are
+    ordinary English n-grams that occur naturally inside sentences.
+    """
     normalized = normalize_transcript(text)
     if not normalized:
         return False
@@ -88,3 +116,41 @@ def matches_sleep_phrase(
     # can match the normalized transcript.
     candidates = (normalize_transcript(phrase) for phrase in (*phrases, *SLEEP_PHRASE_ASR_VARIANTS))
     return any(candidate in normalized for candidate in candidates if candidate)
+
+
+def matches_sleep_command(
+    text: str,
+    phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
+) -> bool:
+    """Return True when a transcript is essentially just a sleep phrase.
+
+    The configured sleep phrases are ordinary English n-grams ("go to sleep")
+    that occur naturally inside sentences, so substring containment over full
+    conversational transcripts would put the robot to sleep mid-conversation.
+    A transcript only counts as a sleep command when, after normalization, it
+    is the phrase itself surrounded by nothing but a few filler words. The
+    Whisper mishear variants ("got to sleep") are accepted under the same
+    strict rule — as near-exact commands, never as substrings of a longer
+    sentence.
+    """
+    normalized = normalize_transcript(text)
+    if not normalized:
+        return False
+    words = normalized.split()
+    for phrase in (*phrases, *SLEEP_PHRASE_ASR_VARIANTS):
+        # Normalize the phrase side too so punctuated/decomposed custom
+        # phrases can match the normalized transcript.
+        candidate = normalize_transcript(phrase)
+        if not candidate:
+            continue
+        phrase_words = candidate.split()
+        extra_count = len(words) - len(phrase_words)
+        if extra_count < 0 or extra_count > SLEEP_COMMAND_MAX_EXTRA_WORDS:
+            continue
+        for start in range(extra_count + 1):
+            if words[start : start + len(phrase_words)] != phrase_words:
+                continue
+            extras = words[:start] + words[start + len(phrase_words) :]
+            if all(word in SLEEP_COMMAND_FILLER_WORDS for word in extras):
+                return True
+    return False

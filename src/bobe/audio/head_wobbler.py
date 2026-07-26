@@ -153,13 +153,17 @@ class HeadWobbler:
                         r["yaw_rad"],
                     )
 
+                    # Check the generation and apply atomically: if reset()'s
+                    # bump-plus-neutral-push ran between an unlocked check and
+                    # the apply, this stale sway offset would overwrite the
+                    # neutral snapshot (last-writer-wins) and leave the head
+                    # tilted until the next assistant audio. Holding the lock
+                    # across the apply is safe because set_speech_offsets is a
+                    # non-blocking snapshot store.
                     with self._state_lock:
                         if self._generation != current_generation:
                             break
-
-                    self._apply_offsets(offsets)
-
-                    with self._state_lock:
+                        self._apply_offsets(offsets)
                         self._hops_done += 1
                     i += 1
             finally:
@@ -172,6 +176,14 @@ class HeadWobbler:
             self._generation += 1
             self._base_ts = None
             self._hops_done = 0
+            # Push a neutral snapshot to the movement manager so the head
+            # does not stay frozen mid-sway after a barge-in or tool call
+            # (offsets are only updated when a new snapshot is applied). This
+            # happens inside the same critical section as the generation bump
+            # so it is atomic with respect to the worker's
+            # generation-check-plus-apply: a stale offset can only land
+            # before this neutral push, never after it.
+            self._apply_offsets((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
         # Drain any queued audio chunks from previous generations
         drained_any = False
@@ -186,11 +198,6 @@ class HeadWobbler:
 
         with self._sway_lock:
             self.sway.reset()
-
-        # Push a neutral snapshot to the movement manager so the head does not
-        # stay frozen mid-sway after a barge-in or tool call (offsets are only
-        # updated when a new snapshot is applied).
-        self._apply_offsets((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
         if drained_any:
             logger.debug("Head wobbler queue drained during reset")

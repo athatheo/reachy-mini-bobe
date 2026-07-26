@@ -1138,6 +1138,145 @@ def test_partial_command_confirmation_does_not_send_claude_code_command() -> Non
         reset_claude_code_session_controller()
 
 
+class _JsonOkResponse:
+    """Context-manager HTTP response stub returning a fixed JSON body."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_JsonOkResponse":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _stage_both_claude_code_pendings(
+    *,
+    launch_opener: Any,
+    command_opener: Any,
+) -> tuple[ClaudeCodeLaunchController, ClaudeCodeSessionController]:
+    """Install both controllers with a pending launch AND a pending command."""
+    launch_controller = ClaudeCodeLaunchController(
+        settings_loader=lambda: ClaudeCodeLaunchSettings(
+            launch_url="http://mac.local:8765/v1/launch/claude-code",
+            launch_token="launch-token",
+        ),
+        opener=launch_opener,
+    )
+    session_controller = ClaudeCodeSessionController(
+        settings_loader=lambda: ClaudeCodeSessionSettings(
+            base_url="http://mac.local:8765/v1/claude-code",
+            token="control-token",
+        ),
+        opener=command_opener,
+    )
+    reset_claude_code_launch_controller(launch_controller)
+    reset_claude_code_session_controller(session_controller)
+    launch_controller.request()
+    session_controller.request_send("run the tests")
+    return launch_controller, session_controller
+
+
+@pytest.mark.asyncio
+async def test_command_confirmation_works_while_launch_is_also_pending() -> None:
+    """With a launch AND a command pending, the exact command phrase must send.
+
+    Regression: the launch controller's corrective mismatch reply used to
+    intercept the exactly-spoken command confirmation phrase, so the command
+    became unconfirmable whenever both confirmations were pending.
+    """
+    command_calls = []
+
+    def command_opener(request: Any, *, timeout: float) -> _JsonOkResponse:
+        command_calls.append(request)
+        return _JsonOkResponse(b'{"ok": true, "output": "done"}')
+
+    launch_controller, session_controller = _stage_both_claude_code_pendings(
+        launch_opener=lambda *args, **kwargs: pytest.fail("the launch endpoint must not be called"),
+        command_opener=command_opener,
+    )
+    try:
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        await handler._handle_completed_user_transcript("confirm Claude command")
+        await _drain_claude_code_tasks(handler)
+
+        user_output = await handler.output_queue.get()
+        assistant_output = await handler.output_queue.get()
+        assert user_output.args[0] == {"role": "user", "content": "confirm Claude command"}
+        assert "sent" in assistant_output.args[0]["content"]
+        assert len(command_calls) == 1
+        assert session_controller.has_pending() is False
+        # The launch confirmation stays pending and unconsumed.
+        assert launch_controller.has_pending() is True
+    finally:
+        reset_claude_code_launch_controller()
+        reset_claude_code_session_controller()
+
+
+@pytest.mark.asyncio
+async def test_launch_confirmation_works_while_command_is_also_pending() -> None:
+    """With both pending, the exact launch phrase launches instead of a correction."""
+    launch_calls = []
+
+    def launch_opener(request: Any, *, timeout: float) -> _JsonOkResponse:
+        launch_calls.append(request)
+        return _JsonOkResponse(b'{"ok": true}')
+
+    launch_controller, session_controller = _stage_both_claude_code_pendings(
+        launch_opener=launch_opener,
+        command_opener=lambda *args, **kwargs: pytest.fail("the command endpoint must not be called"),
+    )
+    try:
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        await handler._handle_completed_user_transcript("confirm launch Claude Code")
+        await _drain_claude_code_tasks(handler)
+
+        await handler.output_queue.get()  # user transcript echo
+        assistant_output = await handler.output_queue.get()
+        assert "launching" in assistant_output.args[0]["content"]
+        assert len(launch_calls) == 1
+        assert launch_controller.has_pending() is False
+        assert session_controller.has_pending() is True
+    finally:
+        reset_claude_code_launch_controller()
+        reset_claude_code_session_controller()
+
+
+@pytest.mark.asyncio
+async def test_garbled_confirmation_with_both_pending_mentions_both_phrases() -> None:
+    """A garbled attempt with both confirmations pending lists both exact phrases."""
+    launch_controller, session_controller = _stage_both_claude_code_pendings(
+        launch_opener=lambda *args, **kwargs: pytest.fail("the launch endpoint must not be called"),
+        command_opener=lambda *args, **kwargs: pytest.fail("the command endpoint must not be called"),
+    )
+    try:
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        await handler._handle_completed_user_transcript("Confirm the Claude thing.")
+        await _drain_claude_code_tasks(handler)
+
+        await handler.output_queue.get()  # user transcript echo
+        assistant_output = await handler.output_queue.get()
+        message = assistant_output.args[0]["content"]
+        assert "confirm launch claude code" in message
+        assert "confirm claude command" in message
+        # Both confirmations stay pending so either exact phrase still works.
+        assert launch_controller.has_pending() is True
+        assert session_controller.has_pending() is True
+    finally:
+        reset_claude_code_launch_controller()
+        reset_claude_code_session_controller()
+
+
 @pytest.mark.asyncio
 async def test_completed_user_transcript_ignored_while_asleep() -> None:
     """Straggler transcripts while asleep never enqueue a response."""
@@ -1888,9 +2027,9 @@ def test_transcript_requests_sleep_requires_bare_phrase() -> None:
     # Conversational containment must not, even with few surrounding words.
     assert not handler._transcript_requests_sleep("he wants to go to sleep")
     assert not handler._transcript_requests_sleep("Tell me a story about how bears go to sleep in winter")
-    # The Whisper-mishear variant ("got to sleep") is daemon-only; the
-    # gpt-4o-transcribe path deliberately skips it.
-    assert not handler._transcript_requests_sleep("Got to sleep.")
+    # The matcher is shared with the Mac wake daemon, so the near-exact
+    # Whisper-mishear variant ("got to sleep") counts as a command here too.
+    assert handler._transcript_requests_sleep("Got to sleep.")
     assert not handler._transcript_requests_sleep("")
 
 

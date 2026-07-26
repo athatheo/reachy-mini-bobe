@@ -22,6 +22,13 @@ REMOTE_WAKE_KEYS = (
     "BOBE_WAKE_ALLOWED_HOSTS",
 )
 
+# BOBE_WAKE_ALLOWED_HOSTS is intentionally never seeded into the instance .env:
+# a pinned copy goes stale when the Mac's IP changes and would override a
+# republished .env.example forever. wake_allowed_hosts() instead unions the
+# packaged defaults and the configured remote URL host at read time, so the
+# value is only persisted when the user explicitly submits it via /wake-config.
+_SEEDABLE_WAKE_KEYS = tuple(key for key in REMOTE_WAKE_KEYS if key != "BOBE_WAKE_ALLOWED_HOSTS")
+
 _PACKAGED_ENV_EXAMPLE = Path(__file__).parent / ".env.example"
 
 
@@ -38,7 +45,7 @@ def _hostname_from_ws_url(url: str) -> str | None:
 
 
 def default_wake_allowed_hosts() -> frozenset[str]:
-    """Hostnames allowed when BOBE_WAKE_ALLOWED_HOSTS is unset (from packaged .env.example)."""
+    """Hostnames from the packaged .env.example, always part of the effective allowlist."""
     if not _PACKAGED_ENV_EXAMPLE.exists():
         return frozenset()
     hosts: set[str] = set()
@@ -61,11 +68,21 @@ def default_wake_allowed_hosts() -> frozenset[str]:
 
 
 def wake_allowed_hosts() -> frozenset[str]:
-    """Return the configured allowlist of remote wake daemon hostnames."""
+    """Return the effective allowlist of remote wake daemon hostnames.
+
+    The union of the configured BOBE_WAKE_ALLOWED_HOSTS, the packaged
+    .env.example defaults, and the host of the currently configured
+    BOBE_WAKE_REMOTE_URL, so a stale configured allowlist can never lock out
+    either recovery path (a republished app or the active daemon URL).
+    """
+    hosts: set[str] = set(default_wake_allowed_hosts())
     raw = (os.getenv("BOBE_WAKE_ALLOWED_HOSTS") or "").strip()
     if raw:
-        return frozenset(part.strip().casefold() for part in raw.split(",") if part.strip())
-    return default_wake_allowed_hosts()
+        hosts.update(part.strip().casefold() for part in raw.split(",") if part.strip())
+    url_host = _hostname_from_ws_url(os.getenv("BOBE_WAKE_REMOTE_URL") or "")
+    if url_host:
+        hosts.add(url_host)
+    return frozenset(hosts)
 
 
 def is_wake_remote_host_allowed(hostname: str) -> bool:
@@ -163,7 +180,10 @@ def persist_wake_env(
 
 
 def merge_packaged_wake_defaults(instance_path: str | Path) -> bool:
-    """Copy missing remote wake keys from packaged ``.env.example`` into instance ``.env``."""
+    """Copy missing remote wake keys from packaged ``.env.example`` into instance ``.env``.
+
+    BOBE_WAKE_ALLOWED_HOSTS is never seeded; see ``_SEEDABLE_WAKE_KEYS``.
+    """
     example = Path(__file__).parent / ".env.example"
     if not example.exists():
         return False
@@ -174,7 +194,7 @@ def merge_packaged_wake_defaults(instance_path: str | Path) -> bool:
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
         key, _, value = stripped.partition("=")
-        if key in REMOTE_WAKE_KEYS and value.strip():
+        if key in _SEEDABLE_WAKE_KEYS and value.strip():
             example_values[key] = value.strip().strip('"').strip("'")
 
     if example_values.get("BOBE_WAKE_BACKEND") != "remote":
@@ -198,7 +218,7 @@ def merge_packaged_wake_defaults(instance_path: str | Path) -> bool:
         # the packaged example defaults.
         missing = {
             key: example_values[key]
-            for key in REMOTE_WAKE_KEYS
+            for key in _SEEDABLE_WAKE_KEYS
             if not current.get(key)
             and not (os.getenv(key) or "").strip()
             and example_values.get(key)

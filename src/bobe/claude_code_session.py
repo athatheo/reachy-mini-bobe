@@ -21,6 +21,7 @@ from bobe.claude_code_client import (
 
 
 COMMAND_CONFIRMATION_PHRASE = "confirm claude command"
+COMMAND_CONFIRMATION_INSTRUCTION = f"To send the command, say exactly: {COMMAND_CONFIRMATION_PHRASE}."
 CONTROL_PATH = "/v1/claude-code"
 
 # After the daemon accepts a command (202-style), poll briefly for a fast
@@ -104,17 +105,29 @@ class ClaudeCodeSessionController:
             "message": f"To send that to Claude Code, say exactly: {COMMAND_CONFIRMATION_PHRASE}.",
         }
 
-    async def maybe_confirm_from_transcript(self, transcript: str | None) -> dict[str, Any] | None:
-        """Send a pending command only after the exact confirmation phrase."""
+    async def maybe_confirm_from_transcript(
+        self,
+        transcript: str | None,
+        *,
+        correct_mismatch: bool = True,
+    ) -> dict[str, Any] | None:
+        """Send a pending command only after the exact confirmation phrase.
+
+        With ``correct_mismatch`` (the default), a garbled confirmation attempt
+        while a command is pending returns a corrective ``confirmation_mismatch``
+        response instead of failing silently. Orchestrators coordinating several
+        pending confirmations pass ``False`` so a corrective reply here can never
+        shadow another controller's exactly-spoken phrase; they build the
+        correction themselves once every exact match has failed.
+        """
         if not command_confirmation_phrase_matches(transcript):
-            if self.has_pending() and transcript_attempts_confirmation(transcript):
+            if correct_mismatch and self.has_pending() and transcript_attempts_confirmation(transcript):
                 # Don't fail silently while a command is pending: keep the pending
                 # command alive and tell the user the exact phrase to repeat.
                 return {
                     "status": "confirmation_mismatch",
                     "message": (
-                        "That wasn't the exact confirmation phrase. "
-                        f"To send the command, say exactly: {COMMAND_CONFIRMATION_PHRASE}."
+                        f"That wasn't the exact confirmation phrase. {COMMAND_CONFIRMATION_INSTRUCTION}"
                     ),
                 }
             return None
@@ -288,9 +301,18 @@ def reset_claude_code_session_controller(controller: ClaudeCodeSessionController
     _controller = controller or ClaudeCodeSessionController()
 
 
-async def maybe_confirm_claude_code_command(transcript: str | None) -> dict[str, Any] | None:
+async def maybe_confirm_claude_code_command(
+    transcript: str | None,
+    *,
+    correct_mismatch: bool = True,
+) -> dict[str, Any] | None:
     """Confirm a pending Claude Code command from a completed transcript."""
-    return await _controller.maybe_confirm_from_transcript(transcript)
+    return await _controller.maybe_confirm_from_transcript(transcript, correct_mismatch=correct_mismatch)
+
+
+def pending_command_confirmation_instruction() -> str | None:
+    """Return the exact-phrase instruction while a command confirmation is pending."""
+    return COMMAND_CONFIRMATION_INSTRUCTION if _controller.has_pending() else None
 
 
 def _missing_config() -> dict[str, Any]:

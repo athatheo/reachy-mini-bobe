@@ -10,7 +10,7 @@ from dataclasses import field, dataclass
 
 import numpy as np
 
-from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_phrase
+from bobe.wake.phrases import DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_command
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake_daemon.config import WakeDaemonConfig
 
@@ -217,7 +217,10 @@ class WhisperWakeSession:
     def _maybe_emit_sleep(self, transcript: str, *, latency_ms: float) -> dict[str, Any] | None:
         if self._listen_mode != "sleep":
             return None
-        if not matches_sleep_phrase(transcript, self._sleep_phrases):
+        # Strict command match: sleep phrases are ordinary n-grams, and a
+        # substring match would put BoBe to sleep mid-conversation ("my
+        # toddler won't go to sleep, any tips?").
+        if not matches_sleep_command(transcript, self._sleep_phrases):
             return None
         if time.monotonic() - self._last_sleep_at < self.config.refractory_s:
             return None

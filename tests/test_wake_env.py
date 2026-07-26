@@ -123,12 +123,15 @@ def test_merge_packaged_wake_defaults(tmp_path: Path, monkeypatch):
     assert "BOBE_WAKE_BACKEND=remote" in env
 
 
-def test_merge_packaged_wake_defaults_seeds_allowed_hosts(tmp_path: Path, monkeypatch):
+def test_merge_packaged_wake_defaults_does_not_seed_allowed_hosts(tmp_path: Path, monkeypatch):
+    """The allowlist must stay unpinned so republished packaged defaults keep applying."""
     _clear_wake_env(monkeypatch)
     changed = merge_packaged_wake_defaults(tmp_path)
     assert changed is True
     env = (tmp_path / ".env").read_text(encoding="utf-8")
-    assert "BOBE_WAKE_ALLOWED_HOSTS=" in env
+    assert "BOBE_WAKE_BACKEND=remote" in env
+    assert "BOBE_WAKE_ALLOWED_HOSTS=" not in env
+    assert os.getenv("BOBE_WAKE_ALLOWED_HOSTS") is None
 
 
 def test_merge_packaged_wake_defaults_respects_live_env(tmp_path: Path, monkeypatch):
@@ -149,12 +152,26 @@ def test_default_wake_allowed_hosts_from_packaged_example():
     assert "mac.local" in hosts
 
 
-def test_wake_allowed_hosts_env_override(monkeypatch):
-    monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "Mac.local, robot.local")
-    assert wake_allowed_hosts() == frozenset({"mac.local", "robot.local"})
+def test_wake_allowed_hosts_env_extends_defaults(monkeypatch):
+    """A configured allowlist adds casefolded hosts without hiding the packaged defaults."""
+    _clear_wake_env(monkeypatch)
+    monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "Custom-Host.local, robot.local")
+    hosts = wake_allowed_hosts()
+    assert {"custom-host.local", "robot.local"} <= hosts
+    assert hosts >= default_wake_allowed_hosts()
+
+
+def test_wake_allowed_hosts_always_includes_remote_url_host(monkeypatch):
+    """The configured daemon URL host is allowed even when a stale allowlist omits it."""
+    _clear_wake_env(monkeypatch)
+    monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "10.0.0.5")
+    monkeypatch.setenv("BOBE_WAKE_REMOTE_URL", "ws://New-Mac.local:8765/v1/stream")
+    assert "new-mac.local" in wake_allowed_hosts()
+    assert is_wake_remote_host_allowed("New-Mac.local")
 
 
 def test_is_wake_remote_host_allowed(monkeypatch):
+    _clear_wake_env(monkeypatch)
     monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "192.168.1.114")
     assert is_wake_remote_host_allowed("192.168.1.114")
     assert not is_wake_remote_host_allowed("evil.example")

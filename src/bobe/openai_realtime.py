@@ -28,14 +28,27 @@ from bobe.wake_word import (
     wake_detector_error,
     create_wake_detector,
 )
-from bobe.wake.phrases import normalize_transcript
+from bobe.env_file import (
+    ENV_FILE_LOCK,
+    read_env_lines,
+    write_env_lines,
+    upsert_env_keys,
+)
+from bobe.wake.phrases import matches_sleep_command
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
-from bobe.claude_code_launch import maybe_confirm_claude_code_launch
-from bobe.claude_code_session import maybe_confirm_claude_code_command
+from bobe.claude_code_client import transcript_attempts_confirmation
+from bobe.claude_code_launch import (
+    maybe_confirm_claude_code_launch,
+    pending_launch_confirmation_instruction,
+)
+from bobe.claude_code_session import (
+    maybe_confirm_claude_code_command,
+    pending_command_confirmation_instruction,
+)
 from bobe.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -68,62 +81,6 @@ _SLEEP_HEAD_Z_OFFSET_MM: Final[float] = 30.0
 # must never run once per mic frame, and the mic loop must never stall on them.
 _WAKE_RETRY_INITIAL_DELAY_S: Final[float] = 2.0
 _WAKE_RETRY_MAX_DELAY_S: Final[float] = 30.0
-# Filler words allowed around a sleep phrase without turning it into ordinary
-# conversation ("okay bobe, please go to sleep now" sleeps; "my toddler won't
-# go to sleep, any tips?" must not).
-_SLEEP_FILLER_WORDS: Final[frozenset[str]] = frozenset(
-    {
-        "please",
-        "now",
-        "ok",
-        "okay",
-        "hey",
-        "bobe",
-        "thanks",
-        "thank",
-        "you",
-        "and",
-        "παρακαλώ",
-        "τώρα",
-        "εντάξει",
-    }
-)
-# Beyond this many non-phrase words, treat the transcript as conversation.
-_MAX_SLEEP_TRANSCRIPT_EXTRA_WORDS: Final[int] = 4
-
-
-def _transcript_is_sleep_command(transcript: str, phrases: tuple[str, ...]) -> bool:
-    """Return True when a transcript is essentially just a sleep phrase.
-
-    The configured sleep phrases are ordinary English n-grams ("go to sleep")
-    that occur naturally inside sentences, so substring containment over full
-    conversational transcripts would put the robot to sleep mid-conversation.
-    A transcript only counts as a sleep command when, after normalization, it
-    is the phrase itself surrounded by nothing but a few filler words. Unlike
-    the daemon's Whisper path, this deliberately skips the ASR mishear
-    variants ("got to sleep"): gpt-4o-transcribe does not need them.
-    """
-    normalized = normalize_transcript(transcript)
-    if not normalized:
-        return False
-    words = normalized.split()
-    for phrase in phrases:
-        candidate = normalize_transcript(phrase)
-        if not candidate:
-            continue
-        phrase_words = candidate.split()
-        extra_count = len(words) - len(phrase_words)
-        if extra_count < 0 or extra_count > _MAX_SLEEP_TRANSCRIPT_EXTRA_WORDS:
-            continue
-        for start in range(extra_count + 1):
-            if words[start : start + len(phrase_words)] != phrase_words:
-                continue
-            extras = words[:start] + words[start + len(phrase_words) :]
-            if all(word in _SLEEP_FILLER_WORDS for word in extras):
-                return True
-    return False
-
-
 class RealtimeSessionError(Exception):
     """Retryable failure while establishing or updating a realtime session."""
 
@@ -704,11 +661,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Return True when a transcript is essentially a configured sleep phrase.
 
         Conversational transcripts that merely CONTAIN a sleep phrase
-        ("my toddler won't go to sleep") must never trigger sleep; see
-        _transcript_is_sleep_command.
+        ("my toddler won't go to sleep") must never trigger sleep; the strict
+        matcher is shared with the Mac wake daemon, see
+        bobe.wake.phrases.matches_sleep_command.
         """
         return bool(
-            transcript and _transcript_is_sleep_command(transcript, self.wake_config.sleep_phrases),
+            transcript and matches_sleep_command(transcript, self.wake_config.sleep_phrases),
         )
 
     async def _cancel_in_flight_response(self) -> None:
@@ -740,19 +698,44 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         return True
 
     async def _maybe_launch_claude_code_from_transcript(self, transcript: str | None) -> bool:
-        """Return True after handling a local Claude Code launch confirmation."""
-        result = await maybe_confirm_claude_code_launch(transcript)
+        """Return True after handling an exact Claude Code launch confirmation."""
+        result = await maybe_confirm_claude_code_launch(transcript, correct_mismatch=False)
         return await self._handle_claude_code_confirmation_result(
             result,
             fallback_message="Claude Code launch request handled.",
         )
 
     async def _maybe_send_claude_code_command_from_transcript(self, transcript: str | None) -> bool:
-        """Return True after handling a local Claude Code command confirmation."""
-        result = await maybe_confirm_claude_code_command(transcript)
+        """Return True after handling an exact Claude Code command confirmation."""
+        result = await maybe_confirm_claude_code_command(transcript, correct_mismatch=False)
         return await self._handle_claude_code_confirmation_result(
             result,
             fallback_message="Claude Code command request handled.",
+        )
+
+    async def _maybe_correct_claude_code_confirmation(self, transcript: str) -> bool:
+        """Return True after correcting a garbled confirmation attempt.
+
+        Runs only once the transcript matched NEITHER exact confirmation
+        phrase, and mentions every phrase still pending so the user knows what
+        to repeat even when a launch and a command are pending at once.
+        """
+        if not transcript_attempts_confirmation(transcript):
+            return False
+        instructions = [
+            instruction
+            for instruction in (
+                pending_launch_confirmation_instruction(),
+                pending_command_confirmation_instruction(),
+            )
+            if instruction
+        ]
+        if not instructions:
+            return False
+        message = " ".join(("That wasn't the exact confirmation phrase.", *instructions))
+        return await self._handle_claude_code_confirmation_result(
+            {"status": "confirmation_mismatch", "message": message},
+            fallback_message=message,
         )
 
     def _start_claude_code_confirmation(self, transcript: str) -> None:
@@ -774,9 +757,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     async def _run_claude_code_confirmation(self, transcript: str) -> None:
         """Handle launch then command confirmations, surfacing results when done."""
         try:
+            # Exact matches on BOTH controllers first: with a launch and a
+            # command pending at once, one controller's corrective mismatch
+            # reply must never intercept the other's exactly-spoken phrase.
             if await self._maybe_launch_claude_code_from_transcript(transcript):
                 return
-            await self._maybe_send_claude_code_command_from_transcript(transcript)
+            if await self._maybe_send_claude_code_command_from_transcript(transcript):
+                return
+            await self._maybe_correct_claude_code_confirmation(transcript)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1465,7 +1453,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         - Only runs in Gradio mode when key came from the textbox and is non-empty.
         - Only saves if `self.instance_path` is not None.
         - Writes `.env` to `instance_path/.env` (does not overwrite if it already exists).
-        - If `instance_path/.env.example` exists, copies its contents while overriding OPENAI_API_KEY.
+        - Persists ONLY the OPENAI_API_KEY line: seeding the rest of the file
+          from a `.env.example` template would bake template values (example
+          wake URL/gain) that later override live tuned env values.
         """
         try:
             if not self.gradio_mode:
@@ -1487,35 +1477,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             # Update the current process environment for downstream consumers
             os.environ["OPENAI_API_KEY"] = key
 
-            target_dir = Path(self.instance_path)
-            env_path = target_dir / ".env"
+            env_path = Path(self.instance_path) / ".env"
             if env_path.exists():
                 # Respect existing user configuration
                 logger.info(".env already exists at %s; not overwriting.", env_path)
                 return
 
-            example_path = target_dir / ".env.example"
-            content_lines: list[str] = []
-            if example_path.exists():
-                try:
-                    content = example_path.read_text(encoding="utf-8")
-                    content_lines = content.splitlines()
-                except Exception as e:
-                    logger.warning("Failed to read .env.example at %s: %s", example_path, e)
-
-            # Replace or append the OPENAI_API_KEY line
-            replaced = False
-            for i, line in enumerate(content_lines):
-                if line.strip().startswith("OPENAI_API_KEY="):
-                    content_lines[i] = f"OPENAI_API_KEY={key}"
-                    replaced = True
-                    break
-            if not replaced:
-                content_lines.append(f"OPENAI_API_KEY={key}")
-
-            # Ensure file ends with newline
-            final_text = "\n".join(content_lines) + "\n"
-            env_path.write_text(final_text, encoding="utf-8")
+            with ENV_FILE_LOCK:
+                lines = upsert_env_keys(read_env_lines(env_path), {"OPENAI_API_KEY": key})
+                write_env_lines(env_path, lines)
             logger.info("Created %s and stored OPENAI_API_KEY for future runs.", env_path)
         except Exception as e:
             # Never crash the app for QoL persistence; just log.

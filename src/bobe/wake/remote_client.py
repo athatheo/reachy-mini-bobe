@@ -15,7 +15,7 @@ from collections import deque
 import numpy as np
 from numpy.typing import NDArray
 
-from bobe.wake.phrases import WAKE_PHRASE, DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_phrase
+from bobe.wake.phrases import WAKE_PHRASE, DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_command
 from bobe.wake.protocol import hello_message, listen_message
 from bobe.wake.constants import WAKE_SAMPLE_RATE, DEBUG_WINDOW_SECONDS
 
@@ -62,9 +62,13 @@ class RemoteWakeClient:
         self._gain = gain
         self._sample_rate = sample_rate
         self._audio_queue: queue.Queue[NDArray[np.int16] | None] = queue.Queue(maxsize=128)
-        self._control_queue: queue.Queue[tuple[str, dict[str, object]]] = queue.Queue(maxsize=8)
         self._stop_event = threading.Event()
+        # Desired listen mode, guarded by its lock. The send loop resolves the
+        # mode at send time (latest-wins), so concurrent mode changes and
+        # reconnect replays can never deliver a stale mode to the daemon.
+        self._mode_lock = threading.Lock()
         self._listen_mode = "wake"
+        self._mode_send_pending = threading.Event()
         self._thread: threading.Thread | None = None
         self._stats_lock = threading.Lock()
         self._recent_stats: deque[tuple[float, float, str]] = deque()
@@ -117,27 +121,23 @@ class RemoteWakeClient:
 
     def listen_for_sleep(self) -> None:
         """Listen for sleep phrases while BoBe is awake."""
-        self._listen_mode = "sleep"
-        self._queue_listen_mode("sleep")
+        self._set_listen_mode("sleep")
 
     def listen_for_wake(self) -> None:
         """Listen for wake phrases while BoBe is asleep."""
-        self._listen_mode = "wake"
-        self._queue_listen_mode("wake")
+        self._set_listen_mode("wake")
 
-    def _queue_listen_mode(self, mode: str) -> None:
-        payload = listen_message(mode=mode, sleep_phrases=self._sleep_phrases if mode == "sleep" else None)
-        # Listen mode is idempotent state — only the latest request matters, so
-        # coalesce pending entries instead of dropping new ones on queue.Full.
-        while True:
-            try:
-                self._control_queue.get_nowait()
-            except queue.Empty:
-                break
-        try:
-            self._control_queue.put_nowait((mode, payload))
-        except queue.Full:
-            pass
+    def _set_listen_mode(self, mode: str) -> None:
+        with self._mode_lock:
+            self._listen_mode = mode
+        # Listen mode is idempotent state — only the latest request matters.
+        # The flag just says "a send is due"; the payload is built from the
+        # current desired mode when the send loop gets to it.
+        self._mode_send_pending.set()
+
+    def _current_listen_mode(self) -> str:
+        with self._mode_lock:
+            return self._listen_mode
 
     def _drain_audio_queue(self) -> None:
         while True:
@@ -148,6 +148,7 @@ class RemoteWakeClient:
 
     def debug_state(self) -> dict[str, Any]:
         now = time.monotonic()
+        listen_mode = self._current_listen_mode()
         with self._stats_lock:
             while self._recent_stats and now - self._recent_stats[0][0] > DEBUG_WINDOW_SECONDS:
                 self._recent_stats.popleft()
@@ -173,8 +174,8 @@ class RemoteWakeClient:
             "transcript_display": display_lines[-20:],
             "connected": self._connected,
             "auth_error": self._auth_error,
-            "listen_mode": self._listen_mode,
-            "paused": self._listen_mode == "sleep",
+            "listen_mode": listen_mode,
+            "paused": listen_mode == "sleep",
             "thread_alive": self.is_running(),
             "daemon_engine": daemon_engine,
             "remote_stats": remote_stats,
@@ -289,8 +290,10 @@ class RemoteWakeClient:
         self._drain_audio_queue()
         # The daemon starts every connection in wake mode, so always replay the
         # current listen mode — a reconnect while BoBe is awake must restore
-        # sleep-phrase detection.
-        self._queue_listen_mode(self._listen_mode)
+        # sleep-phrase detection. Only the flag is set here; the send loop
+        # reads the desired mode at send time, so a concurrent mode change
+        # cannot be clobbered by this replay.
+        self._mode_send_pending.set()
         self._connected = True
         logger.info("Remote wake client connected to %s", self._url)
         self._log_event("info", f"Connected to {self._url}")
@@ -324,25 +327,29 @@ class RemoteWakeClient:
     async def _send_loop(self, ws: Any) -> None:
         loop = asyncio.get_running_loop()
         while not self._stop_event.is_set():
-            while True:
-                try:
-                    _mode, payload = self._control_queue.get_nowait()
-                except queue.Empty:
-                    break
+            if self._mode_send_pending.is_set():
+                # Clear before reading the mode: a concurrent change after the
+                # read re-flags the send, so the daemon always converges to
+                # the latest requested mode.
+                self._mode_send_pending.clear()
+                mode = self._current_listen_mode()
+                payload = listen_message(
+                    mode=mode,
+                    sleep_phrases=self._sleep_phrases if mode == "sleep" else None,
+                )
                 try:
                     await ws.send(json.dumps(payload))
                 except Exception:
-                    # Keep the mode change for the reconnect: requeue it so it
+                    # Keep the mode change for the reconnect: re-flag it so it
                     # is not silently lost when the socket is already dead.
-                    try:
-                        self._control_queue.put_nowait((_mode, payload))
-                    except queue.Full:
-                        pass
+                    self._mode_send_pending.set()
                     raise
-                if _mode == "sleep":
+                if mode == "sleep":
                     self._log_event("info", "Listening for sleep phrases (BoBe awake)")
                 else:
                     self._log_event("info", "Listening for wake phrase (BoBe asleep)")
+                # Re-check for an even newer mode before blocking on audio.
+                continue
 
             try:
                 frame = await loop.run_in_executor(
@@ -393,7 +400,9 @@ class RemoteWakeClient:
         transcript = str(payload.get("transcript") or "")
         latency_ms = payload.get("latency_ms")
         self._apply_remote_stats(payload)
-        if not matches_sleep_phrase(transcript, self._sleep_phrases):
+        # Strict command re-validation: a substring match would put BoBe to
+        # sleep mid-conversation ("my toddler won't go to sleep, any tips?").
+        if not matches_sleep_command(transcript, self._sleep_phrases):
             self._log_event(
                 "warn",
                 f"Ignored sleep without phrase match: {transcript!r}",
