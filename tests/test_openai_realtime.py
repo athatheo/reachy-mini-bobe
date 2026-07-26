@@ -1353,6 +1353,114 @@ async def test_non_camera_tool_result_output_is_unchanged() -> None:
     assert [i for i in connection.items if i.get("type") == "message"] == []
 
 
+class RaisingItemConnection:
+    """Connection stub whose conversation.item.create raises a scripted exception."""
+
+    def __init__(self, exc: BaseException) -> None:
+        """Initialize with the exception every create() call raises."""
+        outer_exc = exc
+
+        class _Item:
+            async def create(self, **_kw: Any) -> None:
+                raise outer_exc
+
+        class _Conversation:
+            item = _Item()
+
+        self.conversation = _Conversation()
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_survives_cleanly_closed_socket() -> None:
+    """ConnectionClosedOK (a sibling of ConnectionClosedError) must not escape.
+
+    A cleanly-closed websocket (code 1000, e.g. after a session restart) raises
+    ConnectionClosedOK, which is NOT a ConnectionClosedError. If it escaped, it
+    would kill the notification listener and silently drop every subsequent
+    tool result for the rest of the session.
+    """
+    from websockets.frames import Close
+    from websockets.exceptions import ConnectionClosedOK
+
+    handler = _build_wake_enabled_handler()
+    handler._connected_event.set()
+    handler._response_done_event.clear()
+    handler.connection = RaisingItemConnection(
+        ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True),
+    )
+
+    notification = btm_mod.ToolNotification(
+        id="call_1",
+        tool_name="move_head",
+        status=ToolState.COMPLETED,
+        result={"ok": True},
+    )
+
+    await handler._handle_tool_result(notification)  # must not raise
+
+    assert handler.connection is None
+    assert not handler._connected_event.is_set()
+    assert handler._response_done_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_result_swallows_unexpected_send_errors(caplog: Any) -> None:
+    """Non-connection send failures are logged, not propagated to the listener."""
+    caplog.set_level(logging.ERROR)
+    handler = _build_wake_enabled_handler()
+    connection = RaisingItemConnection(RuntimeError("send failed (simulated)"))
+    handler.connection = connection
+
+    notification = btm_mod.ToolNotification(
+        id="call_1",
+        tool_name="move_head",
+        status=ToolState.COMPLETED,
+        result={"ok": True},
+    )
+
+    await handler._handle_tool_result(notification)  # must not raise
+
+    # A non-connection error keeps the (possibly healthy) connection in place.
+    assert handler.connection is connection
+    assert any("Failed to deliver result" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_session_finally_does_not_shut_down_newer_tool_listener(monkeypatch: Any) -> None:
+    """A dying session's tool-manager teardown is generation-scoped.
+
+    If a newer session already ran tool_manager.start_up, the old session's
+    finally must not cancel the new listener — otherwise every tool result in
+    the new session would silently never reach the model.
+    """
+    _install_supervisor_fakes(monkeypatch, ["hold"])
+
+    handler = _build_wake_enabled_handler()
+    handler.client = rt_mod.AsyncOpenAI(api_key="DUMMY")
+
+    session_task = asyncio.create_task(handler._run_realtime_session())
+    try:
+        await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
+
+        # A newer session takes over the shared tool manager in the meantime.
+        handler.tool_manager.start_up(tool_callbacks=[handler._handle_tool_result])
+        newer_tasks = list(handler.tool_manager._lifecycle_tasks)
+        assert newer_tasks
+
+        session_task.cancel()
+        try:
+            await session_task
+        except asyncio.CancelledError:
+            pass
+
+        # The old session's finally ran, but the newer listener survives.
+        assert all(not t.done() for t in newer_tasks)
+    finally:
+        if not session_task.done():
+            session_task.cancel()
+        await handler.shutdown()
+
+
 # ---- Stress test: response.create rejection + retry ----
 
 
@@ -1746,3 +1854,194 @@ def test_sleep_cue_translates_head_on_z_axis() -> None:
     wake_move = movement_manager.queue_move.call_args[0][0]
     assert wake_move.target_head_pose[2, 3] == pytest.approx(0.0)
     assert wake_move.target_antennas == (-0.5, 0.5)
+
+
+# ---- Conversational sleep-phrase gating ----
+
+
+@pytest.mark.asyncio
+async def test_sleep_phrase_inside_conversation_does_not_sleep() -> None:
+    """A sleep phrase buried inside an ordinary sentence must not end the session."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+
+    assert not await handler._maybe_sleep_from_transcript("My toddler won't go to sleep, any tips?")
+    assert not await handler._maybe_sleep_from_transcript("I've got to sleep more, what do you think?")
+
+    assert handler.wake_session.awake
+
+
+def test_transcript_requests_sleep_requires_bare_phrase() -> None:
+    """Only transcripts that are essentially the sleep phrase count as commands."""
+    handler = _build_wake_enabled_handler()
+
+    # The phrase itself, optionally wrapped in a few polite fillers, sleeps.
+    assert handler._transcript_requests_sleep("Go to sleep.")
+    assert handler._transcript_requests_sleep("Okay BoBe, please go to sleep now.")
+    assert handler._transcript_requests_sleep("Κοιμήσου!")
+
+    # Conversational containment must not, even with few surrounding words.
+    assert not handler._transcript_requests_sleep("he wants to go to sleep")
+    assert not handler._transcript_requests_sleep("Tell me a story about how bears go to sleep in winter")
+    # The Whisper-mishear variant ("got to sleep") is daemon-only; the
+    # gpt-4o-transcribe path deliberately skips it.
+    assert not handler._transcript_requests_sleep("Got to sleep.")
+    assert not handler._transcript_requests_sleep("")
+
+
+def test_partial_conversational_transcript_does_not_flag_sleep_pending() -> None:
+    """Partial transcripts of ordinary sentences never pre-arm the sleep preemption."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+
+    handler._record_user_transcript("my toddler won't go to sleep")
+
+    assert not handler._sleep_pending
+
+
+# ---- Listening freeze release on sleep / session teardown ----
+
+
+@pytest.mark.asyncio
+async def test_transition_to_sleep_releases_listening_freeze() -> None:
+    """Sleeping mid-utterance must undo speech_started's motion freeze.
+
+    After sleep no audio reaches OpenAI, so server VAD can never deliver the
+    speech_stopped that normally releases the freeze; without an explicit
+    reset the antennas stay frozen and breathing suppressed all sleep long.
+    """
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler.deps.movement_manager.set_listening(True)  # speech_started arrived
+    handler.deps.movement_manager.set_listening.reset_mock()
+
+    await handler._transition_to_sleep("test")
+
+    handler.deps.movement_manager.set_listening.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_session_teardown_releases_listening_freeze(monkeypatch: Any) -> None:
+    """A session dying between speech_started and speech_stopped releases the freeze."""
+    _install_supervisor_fakes(monkeypatch, ["hold"])
+
+    handler = _build_wake_enabled_handler()
+    handler.client = rt_mod.AsyncOpenAI(api_key="DUMMY")
+
+    session_task = asyncio.create_task(handler._run_realtime_session())
+    try:
+        await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
+        handler.deps.movement_manager.set_listening(True)  # speech_started arrived
+        handler.deps.movement_manager.set_listening.reset_mock()
+
+        # The websocket drops mid-utterance: the session task dies.
+        session_task.cancel()
+        try:
+            await session_task
+        except asyncio.CancelledError:
+            pass
+
+        handler.deps.movement_manager.set_listening.assert_called_once_with(False)
+    finally:
+        if not session_task.done():
+            session_task.cancel()
+        await handler.shutdown()
+
+
+# ---- Output queue flush / partial-transcript debouncer ----
+
+
+@pytest.mark.asyncio
+async def test_partial_transcripts_survive_queue_flush() -> None:
+    """After a barge-in flush, debounced partials still reach the live queue.
+
+    clear_audio_queue must drain the queue in place (not swap the object) and
+    the debouncer must resolve the handler's CURRENT queue at emit time —
+    otherwise the first interruption orphans every later partial transcript.
+    """
+    from bobe.console import LocalStream
+
+    handler = _build_wake_enabled_handler()
+    stream = LocalStream(handler, MagicMock())
+    handler._partial_debouncer._delay = 0.01
+
+    original_queue = handler.output_queue
+    await handler.output_queue.put((24000, MagicMock()))  # queued assistant audio
+
+    stream.clear_audio_queue()
+
+    assert handler.output_queue is original_queue  # drained in place, not swapped
+    assert handler.output_queue.empty()
+
+    await handler._partial_debouncer.schedule("hello there")
+    output = await asyncio.wait_for(handler.output_queue.get(), timeout=2.0)
+    assert output.args[0] == {"role": "user_partial", "content": "hello there"}
+
+
+@pytest.mark.asyncio
+async def test_debouncer_resolves_current_output_queue() -> None:
+    """Even if the queue object is replaced, partials land on the current one."""
+    handler = _build_wake_enabled_handler()
+    handler._partial_debouncer._delay = 0.01
+
+    replacement: "asyncio.Queue[Any]" = asyncio.Queue()
+    handler.output_queue = replacement
+
+    await handler._partial_debouncer.schedule("still visible")
+
+    output = await asyncio.wait_for(replacement.get(), timeout=2.0)
+    assert output.args[0] == {"role": "user_partial", "content": "still visible"}
+
+
+# ---- LocalStream.close() thread-safety ----
+
+
+def test_localstream_close_signals_loop_thread_safely() -> None:
+    """close() from a foreign thread stops the loops via call_soon_threadsafe.
+
+    close() runs on the dashboard stop-poller thread (main.py); neither
+    asyncio.Event.set() nor Task.cancel() is thread-safe, so both must be
+    marshalled onto the stored asyncio loop, ending even a parked task.
+    """
+    from bobe.console import LocalStream
+
+    stream = LocalStream(MagicMock(), MagicMock())
+
+    started = threading.Event()
+    results: dict[str, Any] = {}
+
+    async def runner() -> None:
+        stream._asyncio_loop = asyncio.get_running_loop()
+
+        async def park() -> None:
+            await asyncio.Event().wait()  # only a cancel can end this
+
+        stream._tasks = [asyncio.create_task(park(), name="parked")]
+        started.set()
+        try:
+            await asyncio.gather(*stream._tasks)
+        except asyncio.CancelledError:
+            results["cancelled"] = True
+        results["stop_set"] = stream._stop_event.is_set()
+
+    thread = threading.Thread(target=lambda: asyncio.run(runner()))
+    thread.start()
+    assert started.wait(timeout=2.0)
+
+    stream.close()  # foreign thread, like main.py's poll_stop_event
+
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "close() failed to end the loop's parked tasks"
+    assert results.get("cancelled") is True
+    assert results.get("stop_set") is True
+
+
+def test_localstream_close_without_running_loop() -> None:
+    """close() before launch() started the loop must not crash."""
+    from bobe.console import LocalStream
+
+    stream = LocalStream(MagicMock(), MagicMock())
+
+    stream.close()
+
+    assert stream._stop_event.is_set()

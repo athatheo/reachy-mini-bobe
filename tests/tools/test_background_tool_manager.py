@@ -33,9 +33,9 @@ def _make_routine(
     If *delay* > 0, the routine will sleep for that many seconds before
     returning / raising so we can test cancellation and progress.
 
-    Mirrors the contract of ``_dispatch_tool_call`` in core_tools: exceptions
-    (including ``CancelledError``) are caught and returned as
-    ``{"error": "..."}`` dicts so that ``_run_tool`` never sees a raw raise.
+    Mirrors the contract of ``_dispatch_tool_call`` in core_tools: normal
+    exceptions are caught and returned as ``{"error": "..."}`` dicts, while
+    ``CancelledError`` re-raises so task cancellation propagates to the task.
     """
     routine = MagicMock(spec=ToolCallRoutine)
     routine.tool_name = tool_name
@@ -49,7 +49,7 @@ def _make_routine(
                 raise error
             return result or {"ok": True}
         except asyncio.CancelledError:
-            return {"error": "Tool cancelled"}
+            raise
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
 
@@ -537,3 +537,194 @@ class TestNotificationQueue:
         n = manager._notification_queue.get_nowait()
         assert n.status == ToolState.FAILED
         assert "RuntimeError: oops" in (n.error or "")
+
+    @pytest.mark.asyncio
+    async def test_legacy_cancelled_result_dict_still_marks_cancelled(self, manager: BackgroundToolManager) -> None:
+        """Routines returning {"error": "Tool cancelled"} keep the CANCELLED status."""
+        routine = MagicMock(spec=ToolCallRoutine)
+        routine.tool_name = "legacy"
+        routine.args_json_str = "{}"
+
+        async def _call(_manager: BackgroundToolManager) -> dict[str, Any]:
+            return {"error": "Tool cancelled"}
+
+        routine.side_effect = _call
+
+        bg = await manager.start_tool("c1", routine)
+        await asyncio.sleep(0.05)
+
+        assert bg.status == ToolState.CANCELLED
+        n = manager._notification_queue.get_nowait()
+        assert n.status == ToolState.CANCELLED
+
+
+class TestListenerResilience:
+    """Finding #4: the listener must survive callback exceptions."""
+
+    @pytest.mark.asyncio
+    async def test_listener_survives_callback_exception(self, manager: BackgroundToolManager) -> None:
+        """A raising callback must not kill delivery for later notifications."""
+        calls: list[ToolNotification] = []
+
+        async def flaky(notification: ToolNotification) -> None:
+            calls.append(notification)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+
+        manager.start_up(tool_callbacks=[flaky])
+        try:
+            await manager.start_tool("c1", _make_routine("first"))
+            await asyncio.sleep(0.05)
+            await manager.start_tool("c2", _make_routine("second"))
+            await asyncio.sleep(0.05)
+
+            # The second notification is still delivered after the first raised.
+            assert [n.tool_name for n in calls] == ["first", "second"]
+            listener_tasks = [t for t in manager._lifecycle_tasks if "listener" in t.get_name()]
+            assert listener_tasks and not listener_tasks[0].done()
+        finally:
+            await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_swallows_listener_stored_exception(self, manager: BackgroundToolManager) -> None:
+        """A lifecycle task that died with a stored exception must not re-raise out of shutdown."""
+        manager.start_up(tool_callbacks=[AsyncMock()])
+
+        async def _dead() -> None:
+            raise RuntimeError("listener died (simulated)")
+
+        dead_task = asyncio.get_running_loop().create_task(_dead(), name="bg-tool-listener-callback")
+        await asyncio.sleep(0)
+        assert dead_task.done()
+        manager._lifecycle_tasks.append(dead_task)
+
+        await manager.shutdown()  # must not raise
+
+        assert manager._lifecycle_tasks == []
+
+
+class TestShutdownOrdering:
+    """Finding #6: tools stop before the listener; nothing replays into the next session."""
+
+    @pytest.mark.asyncio
+    async def test_shutdown_awaits_cancelled_tools_and_drains_notifications(
+        self, manager: BackgroundToolManager
+    ) -> None:
+        """Cancelled-tool notifications never survive shutdown into the queue."""
+        manager.start_up(tool_callbacks=[AsyncMock()])
+        bg = await manager.start_tool("c1", _make_routine("slow", delay=10.0))
+        await asyncio.sleep(0.02)
+
+        await manager.shutdown()
+
+        assert bg.status == ToolState.CANCELLED
+        assert bg._task is not None and bg._task.done()
+        assert manager._notification_queue.empty()
+        assert manager._lifecycle_tasks == []
+
+        # A fresh session's listener must never see the dead session's
+        # cancelled-tool notification.
+        replay_callback = AsyncMock()
+        manager.start_up(tool_callbacks=[replay_callback])
+        try:
+            await asyncio.sleep(0.05)
+            assert replay_callback.await_count == 0
+        finally:
+            await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_start_up_drains_stranded_notifications(self, manager: BackgroundToolManager) -> None:
+        """Notifications stranded without a listener are dropped by the next start_up."""
+        await manager.start_tool("c1", _make_routine("orphan"))
+        await asyncio.sleep(0.05)
+        assert not manager._notification_queue.empty()
+
+        callback = AsyncMock()
+        manager.start_up(tool_callbacks=[callback])
+        try:
+            await asyncio.sleep(0.05)
+            assert callback.await_count == 0
+            assert manager._notification_queue.empty()
+        finally:
+            await manager.shutdown()
+
+
+class TestGenerationScopedLifecycle:
+    """A stale session's shutdown must never tear down a newer session's listener."""
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_shutdown_is_a_noop(self, manager: BackgroundToolManager) -> None:
+        """shutdown(generation=old) after a newer start_up leaves the new session intact."""
+        old_generation = manager.start_up(tool_callbacks=[AsyncMock()])
+
+        new_callback = AsyncMock()
+        manager.start_up(tool_callbacks=[new_callback])
+        new_tasks = list(manager._lifecycle_tasks)
+        bg = await manager.start_tool("c1", _make_routine("live", delay=10.0))
+
+        # The old session's teardown arrives late: it must not cancel the new
+        # session's lifecycle tasks or its running tools.
+        await manager.shutdown(generation=old_generation)
+
+        assert all(not t.done() for t in new_tasks)
+        assert bg.status == ToolState.RUNNING
+
+        # The new listener still delivers results.
+        await manager.start_tool("c2", _make_routine("quick"))
+        await asyncio.sleep(0.05)
+        assert new_callback.await_count == 1
+
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_start_up_cancels_previous_lifecycle_tasks(self, manager: BackgroundToolManager) -> None:
+        """start_up is an idempotent takeover: old lifecycle tasks never linger."""
+        manager.start_up(tool_callbacks=[AsyncMock()])
+        old_tasks = list(manager._lifecycle_tasks)
+
+        manager.start_up(tool_callbacks=[AsyncMock()])
+        await asyncio.sleep(0.02)
+
+        assert all(t.done() for t in old_tasks)
+        assert all(not t.done() for t in manager._lifecycle_tasks)
+
+        await manager.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_matching_generation_shutdown_stops_lifecycle(self, manager: BackgroundToolManager) -> None:
+        """shutdown(generation=current) still performs a full teardown."""
+        generation = manager.start_up(tool_callbacks=[AsyncMock()])
+        tasks = list(manager._lifecycle_tasks)
+
+        await manager.shutdown(generation=generation)
+
+        assert all(t.done() for t in tasks)
+        assert manager._lifecycle_tasks == []
+
+
+class TestDispatchCancellationContract:
+    """core_tools dispatch must propagate CancelledError, not convert it to a result."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_tool_call_reraises_cancellation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cancelling a dispatched tool cancels the task instead of completing it."""
+        from bobe.tools import core_tools
+
+        started = asyncio.Event()
+
+        async def _sleepy_tool(deps: Any, **kwargs: Any) -> dict[str, Any]:
+            started.set()
+            await asyncio.sleep(10.0)
+            return {"ok": True}
+
+        monkeypatch.setitem(core_tools.ALL_TOOLS, "sleepy_test_tool", _sleepy_tool)
+
+        task = asyncio.create_task(
+            core_tools.dispatch_tool_call(tool_name="sleepy_test_tool", args_json="{}", deps=MagicMock()),
+        )
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()

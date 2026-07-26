@@ -60,7 +60,7 @@ class LocalStream:
         self._instance_path: Optional[str] = instance_path
         self._app_stop_event = app_stop_event
         self._settings_initialized = False
-        self._asyncio_loop = None
+        self._asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # ---- Settings UI (only when API key is missing) ----
     def _required_api_keys_configured(self) -> bool:
@@ -125,7 +125,7 @@ class LocalStream:
         time.sleep(1)  # give some time to the pipelines to start
 
         async def runner() -> None:
-            self._asyncio_loop = asyncio.get_running_loop()  # type: ignore[assignment]
+            self._asyncio_loop = asyncio.get_running_loop()
             self._tasks = [
                 asyncio.create_task(self.handler.start_up(), name="openai-handler"),
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),
@@ -163,13 +163,24 @@ class LocalStream:
         except Exception as e:
             logger.debug(f"Error stopping playback (may already be stopped): {e}")
 
-        # Now signal async loops to stop
-        self._stop_event.set()
-
-        # Cancel all running tasks
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
+        # Now signal async loops to stop and cancel the running tasks.
+        # close() is invoked from a foreign thread (e.g. the dashboard stop
+        # poller in main.py), and neither asyncio.Event.set() nor Task.cancel()
+        # is thread-safe: both must be marshalled onto the loop thread.
+        loop = self._asyncio_loop
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(self._stop_event.set)
+                for task in self._tasks:
+                    if not task.done():
+                        loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError as e:
+                # The loop finished between the is_closed() check and the call.
+                logger.debug(f"Event loop already closed while stopping: {e}")
+        else:
+            # The asyncio runner never started (or already finished); there is
+            # no loop thread to race with.
+            self._stop_event.set()
 
     def clear_audio_queue(self) -> None:
         """Flush the player's appsrc to drop any queued audio immediately."""
@@ -179,7 +190,15 @@ class LocalStream:
             self._robot.media.audio.clear_player()
         elif self._robot.media.backend == MediaBackend.DEFAULT or self._robot.media.backend == MediaBackend.DEFAULT_NO_VIDEO:
             self._robot.media.audio.clear_output_buffer()
-        self.handler.output_queue = asyncio.Queue()
+        # Drain the handler's queue IN PLACE: replacing the object would leave
+        # producers that captured the old reference (e.g. the partial-transcript
+        # debouncer) feeding an orphaned queue nobody reads anymore.
+        queue = self.handler.output_queue
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler."""

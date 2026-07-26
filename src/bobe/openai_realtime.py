@@ -6,7 +6,7 @@ import base64
 import random
 import asyncio
 import logging
-from typing import Any, Final, Tuple, Literal, Optional
+from typing import Any, Final, Tuple, Literal, Callable, Optional
 from pathlib import Path
 
 import cv2
@@ -28,7 +28,7 @@ from bobe.wake_word import (
     wake_detector_error,
     create_wake_detector,
 )
-from bobe.wake.phrases import matches_sleep_phrase
+from bobe.wake.phrases import normalize_transcript
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.tools.core_tools import (
     ToolDependencies,
@@ -68,6 +68,60 @@ _SLEEP_HEAD_Z_OFFSET_MM: Final[float] = 30.0
 # must never run once per mic frame, and the mic loop must never stall on them.
 _WAKE_RETRY_INITIAL_DELAY_S: Final[float] = 2.0
 _WAKE_RETRY_MAX_DELAY_S: Final[float] = 30.0
+# Filler words allowed around a sleep phrase without turning it into ordinary
+# conversation ("okay bobe, please go to sleep now" sleeps; "my toddler won't
+# go to sleep, any tips?" must not).
+_SLEEP_FILLER_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "please",
+        "now",
+        "ok",
+        "okay",
+        "hey",
+        "bobe",
+        "thanks",
+        "thank",
+        "you",
+        "and",
+        "παρακαλώ",
+        "τώρα",
+        "εντάξει",
+    }
+)
+# Beyond this many non-phrase words, treat the transcript as conversation.
+_MAX_SLEEP_TRANSCRIPT_EXTRA_WORDS: Final[int] = 4
+
+
+def _transcript_is_sleep_command(transcript: str, phrases: tuple[str, ...]) -> bool:
+    """Return True when a transcript is essentially just a sleep phrase.
+
+    The configured sleep phrases are ordinary English n-grams ("go to sleep")
+    that occur naturally inside sentences, so substring containment over full
+    conversational transcripts would put the robot to sleep mid-conversation.
+    A transcript only counts as a sleep command when, after normalization, it
+    is the phrase itself surrounded by nothing but a few filler words. Unlike
+    the daemon's Whisper path, this deliberately skips the ASR mishear
+    variants ("got to sleep"): gpt-4o-transcribe does not need them.
+    """
+    normalized = normalize_transcript(transcript)
+    if not normalized:
+        return False
+    words = normalized.split()
+    for phrase in phrases:
+        candidate = normalize_transcript(phrase)
+        if not candidate:
+            continue
+        phrase_words = candidate.split()
+        extra_count = len(words) - len(phrase_words)
+        if extra_count < 0 or extra_count > _MAX_SLEEP_TRANSCRIPT_EXTRA_WORDS:
+            continue
+        for start in range(extra_count + 1):
+            if words[start : start + len(phrase_words)] != phrase_words:
+                continue
+            extras = words[:start] + words[start + len(phrase_words) :]
+            if all(word in _SLEEP_FILLER_WORDS for word in extras):
+                return True
+    return False
 
 
 class RealtimeSessionError(Exception):
@@ -81,10 +135,13 @@ class PartialTranscriptDebouncer:
 
     def __init__(
         self,
-        output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]",
+        queue_provider: "Callable[[], asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]]",
         delay: float = 0.5,
     ) -> None:
-        self._output_queue = output_queue
+        # A provider, not a queue: the handler's output queue may be swapped
+        # over the debouncer's lifetime, and a cached reference would keep
+        # feeding an orphaned queue nobody reads anymore.
+        self._queue_provider = queue_provider
         self._delay = delay
         self._task: asyncio.Task[None] | None = None
         self._sequence = 0
@@ -107,7 +164,8 @@ class PartialTranscriptDebouncer:
         try:
             await asyncio.sleep(self._delay)
             if self._sequence == sequence:
-                await self._output_queue.put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
+                # Resolve the CURRENT queue at emit time (see __init__).
+                await self._queue_provider().put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
                 logger.debug(f"Debounced partial emitted: {transcript}")
         except asyncio.CancelledError:
             logger.debug("Debounced partial cancelled")
@@ -155,7 +213,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._key_source: Literal["env", "textbox"] = "env"
         self._provided_api_key: str | None = None
 
-        self._partial_debouncer = PartialTranscriptDebouncer(self.output_queue)
+        self._partial_debouncer = PartialTranscriptDebouncer(lambda: self.output_queue)
 
         self._connected_event: asyncio.Event = asyncio.Event()
 
@@ -643,9 +701,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             )
 
     def _transcript_requests_sleep(self, transcript: str | None) -> bool:
-        """Return True when a transcript contains a configured sleep phrase."""
+        """Return True when a transcript is essentially a configured sleep phrase.
+
+        Conversational transcripts that merely CONTAIN a sleep phrase
+        ("my toddler won't go to sleep") must never trigger sleep; see
+        _transcript_is_sleep_command.
+        """
         return bool(
-            transcript and matches_sleep_phrase(transcript, self.wake_config.sleep_phrases),
+            transcript and _transcript_is_sleep_command(transcript, self.wake_config.sleep_phrases),
         )
 
     async def _cancel_in_flight_response(self) -> None:
@@ -1027,6 +1090,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                # The session can die between speech_started and speech_stopped;
+                # never leave the listening freeze (frozen antennas, suppressed
+                # breathing) stuck across a session restart.
+                try:
+                    self.deps.movement_manager.set_listening(False)
+                except Exception:
+                    logger.debug("Could not release listening freeze on session teardown", exc_info=True)
+
                 # This session owns its registration: clear the shared connection
                 # state only if it still refers to this session's connection.
                 if self.connection is conn:
@@ -1197,6 +1268,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.wake_session.sleep()
         self._sleep_pending = False
         logger.info("Going to sleep (%s): audio stays local until the wake word", reason)
+
+        # Release the listening freeze: once asleep no audio reaches OpenAI, so
+        # server VAD can never deliver the speech_stopped that normally undoes
+        # speech_started's freeze (frozen antennas, suppressed breathing).
+        self.deps.movement_manager.set_listening(False)
 
         # Stop any in-flight answer (e.g. the auto-response to "go to sleep").
         if self.connection:
