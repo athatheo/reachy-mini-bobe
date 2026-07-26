@@ -107,6 +107,22 @@ class AudioRingBuffer:
         wanted = int(seconds * self._sample_rate)
         return samples[-wanted:] if 0 < wanted < samples.size else samples
 
+    def restore(self, samples: NDArray[np.int16]) -> None:
+        """Put drained audio back at the FRONT of the buffer (oldest position).
+
+        Used when flushing drained audio upstream fails: frames captured while
+        the flush was in flight have already been appended, so the restored
+        tail must precede them to keep the audio time-ordered.
+        """
+        if samples.size == 0:
+            return
+        with self._lock:
+            self._chunks.appendleft(samples)
+            self._total_samples += samples.size
+            while self._total_samples > self._max_samples and len(self._chunks) > 1:
+                dropped = self._chunks.popleft()
+                self._total_samples -= dropped.size
+
 
 class WakeSession:
     """Thread-safe asleep/awake state with an inactivity timeout."""
@@ -160,6 +176,10 @@ class WakeSession:
         with self._lock:
             self._awake = True
             self._last_activity = self._clock()
+            # A sleep detected while we were still asleep must not survive
+            # into the fresh awake state and put us straight back to sleep
+            # (mirrors sleep() clearing _wake_requested).
+            self._sleep_requested = False
 
     def sleep(self) -> None:
         """Return to the asleep (local-only) state."""

@@ -1787,6 +1787,13 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     startup_task = asyncio.create_task(handler.start_up())
 
+    # Wait for the session to register its connection (and bump the tool
+    # manager's lifecycle generation) before starting tools, mirroring
+    # production where tools only ever start from events inside a running
+    # session; tools started before any session are stale-generation and
+    # their notifications are deliberately dropped.
+    await asyncio.wait_for(handler._connected_event.wait(), timeout=5.0)
+
     # ---- Start tools via the real BackgroundToolManager pipeline ----
     # start_tool → _run_tool → notification queue → listener → _handle_tool_result
 

@@ -81,6 +81,9 @@ class BackgroundTool(ToolNotification):
 
     # The async tool execution task.
     _task: Optional[asyncio.Task[None]] = PrivateAttr(default=None)
+    # Lifecycle generation current when the tool was started; a zombie tool
+    # that outlives its session's shutdown must not notify a newer session.
+    _generation: int = PrivateAttr(default=0)
 
     @property
     def tool_id(self) -> str:
@@ -167,6 +170,7 @@ class BackgroundToolManager(BaseModel):
             progress=ToolProgress(progress=0.0) if with_progress else None,
             status=ToolState.RUNNING,
         )
+        bg_tool._generation = self._lifecycle_generation
         self._tools[bg_tool.tool_id] = bg_tool
 
         async_task = asyncio.create_task(
@@ -194,7 +198,8 @@ class BackgroundToolManager(BaseModel):
             bg_tool.completed_at = time.monotonic()
             bg_tool.status = ToolState.CANCELLED
             bg_tool.error = "Tool cancelled"
-            self._notification_queue.put_nowait(bg_tool.get_notification())
+            if bg_tool._generation == self._lifecycle_generation:
+                self._notification_queue.put_nowait(bg_tool.get_notification())
             logger.debug(f"Background tool cancelled: {bg_tool.tool_name} (id={bg_tool.id})")
             raise
         bg_tool.completed_at = time.monotonic()
@@ -214,6 +219,16 @@ class BackgroundToolManager(BaseModel):
             bg_tool.status = ToolState.COMPLETED
             logger.debug(f"Background tool completed: {bg_tool.tool_name} (id={bg_tool.id})")
 
+        if bg_tool._generation != self._lifecycle_generation:
+            # A zombie tool that survived its session's shutdown timeout must
+            # not deliver a function_call_output for a dead conversation's
+            # call_id into the new session.
+            logger.warning(
+                "Dropping notification from stale-generation tool: %s (id=%s)",
+                bg_tool.tool_name,
+                bg_tool.id,
+            )
+            return
         await self._notification_queue.put(bg_tool.get_notification())
         logger.debug(f"Queued notification for tool: {bg_tool.tool_name} (id={bg_tool.id})")
 

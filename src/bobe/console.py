@@ -161,7 +161,21 @@ class LocalStream:
                 # Ensure handler connection is closed
                 await self.handler.shutdown()
 
-        asyncio.run(runner())
+        try:
+            asyncio.run(runner())
+        finally:
+            # close() may have landed in the pre-media window, where its media
+            # stops were no-ops on pipelines we had not started yet. launch()
+            # owns the pipelines it started, so stop them on every exit path
+            # (idempotent; a second stop from close() is harmless).
+            try:
+                self._robot.media.stop_recording()
+            except Exception as e:
+                logger.debug(f"Error stopping recording on launch exit: {e}")
+            try:
+                self._robot.media.stop_playing()
+            except Exception as e:
+                logger.debug(f"Error stopping playback on launch exit: {e}")
 
     def close(self) -> None:
         """Stop the stream and underlying media pipelines.

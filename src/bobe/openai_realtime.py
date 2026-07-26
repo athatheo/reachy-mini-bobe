@@ -1215,6 +1215,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         while a failed attempt is backing off, the wake request stays queued so
         a later frame retries it once the window elapses.
         """
+        if self._shutdown_requested:
+            # A late frame (gradio mode) must not spawn a transition that
+            # shutdown() has already passed over and will never cancel.
+            return
         if self._wake_transition_active():
             # The running transition already opens the streaming window.
             return
@@ -1256,6 +1260,31 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.error("Wake ignored: OpenAI Realtime unavailable")
             return False
 
+        # Flush the buffered audio that arrived with/after the wake phrase so a
+        # one-breath request like "hey bobe, what's the weather" is not lost.
+        # This runs BEFORE any user-visible wake cue because it doubles as a
+        # liveness probe: _ensure_openai_connection can see a just-died socket
+        # the session task has not deregistered yet, and chiming success while
+        # destroying the buffered utterance is the worst possible outcome. On
+        # failure the tail goes back into the ring buffer, a fresh session is
+        # requested, and the retry/backoff machinery re-runs the transition.
+        tail = self._wake_buffer.drain_tail(DEFAULT_FLUSH_SECONDS)
+        if tail.size:
+            conn = self.connection
+            flush_error: Exception | None = None
+            if conn is None:
+                flush_error = RealtimeSessionError("connection lost before pre-wake flush")
+            else:
+                try:
+                    await conn.input_audio_buffer.append(audio=base64.b64encode(tail.tobytes()).decode("utf-8"))
+                except Exception as e:
+                    flush_error = e
+            if flush_error is not None:
+                logger.warning("Could not flush pre-wake audio; retrying wake: %s", flush_error)
+                self._wake_buffer.restore(tail)
+                await self._restart_session()
+                return False
+
         # Clear any stale in-flight response state so server VAD is not suppressed.
         self._response_done_event.set()
         self._last_assistant_audio_at = 0.0
@@ -1266,15 +1295,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         logger.info("Wake word heard: streaming audio to OpenAI until timeout or sleep phrase")
         await self._play_chime(ascending=True)
         self._queue_antenna_cue(awake=True)
-
-        # Flush the buffered audio that arrived with/after the wake phrase so a
-        # one-breath request like "hey bobe, what's the weather" is not lost.
-        tail = self._wake_buffer.drain_tail(DEFAULT_FLUSH_SECONDS)
-        if tail.size and self.connection:
-            try:
-                await self.connection.input_audio_buffer.append(audio=base64.b64encode(tail.tobytes()).decode("utf-8"))
-            except Exception as e:
-                logger.warning("Could not flush pre-wake audio: %s", e)
         return True
 
     async def _transition_to_sleep(self, reason: str) -> None:
