@@ -1,7 +1,7 @@
 import os
 
 from bobe.config import config
-from bobe.instance import _migrate_legacy_env, load_instance_env, resolve_instance_path
+from bobe.instance import load_instance_env, _migrate_legacy_env, resolve_instance_path
 
 
 def test_resolve_instance_path_creates_dir(tmp_path, monkeypatch):

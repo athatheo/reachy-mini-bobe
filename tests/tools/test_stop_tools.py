@@ -14,15 +14,25 @@ from bobe.profiles._bobe_locked_profile.sweep_look import SweepLook
 
 
 class FakeMovementManager:
-    def __init__(self):
+    def __init__(self, body_yaw=0.0, antennas=(0.0, 0.0), head_pose=None):
         self.clear_count = 0
         self.queued = []
+        self._body_yaw = body_yaw
+        self._antennas = antennas
+        self._head_pose = np.eye(4) if head_pose is None else head_pose
 
     def clear_move_queue(self):
         self.clear_count += 1
 
     def queue_move(self, move):
         self.queued.append(move)
+
+    def get_primary_target_pose(self):
+        return (
+            self._head_pose.copy(),
+            (float(self._antennas[0]), float(self._antennas[1])),
+            float(self._body_yaw),
+        )
 
 
 class FakeReachyMini:
@@ -65,8 +75,8 @@ async def test_stop_tools_clear_move_queue_without_arguments(tool_cls):
 
 @pytest.mark.asyncio
 async def test_move_head_starts_body_yaw_from_head_joints():
-    """move_head must not use the antenna joint angle as body yaw (finding #30)."""
-    movement_manager = FakeMovementManager()
+    """move_head must interpolate from the primary pose's body yaw, never the antenna angle (findings #30/#33)."""
+    movement_manager = FakeMovementManager(body_yaw=0.3, antennas=(-0.5, 0.5))
     deps = SimpleNamespace(
         movement_manager=movement_manager,
         reachy_mini=FakeReachyMini(body_yaw=0.3, antennas=(-0.5, 0.5)),
@@ -86,7 +96,7 @@ async def test_move_head_starts_body_yaw_from_head_joints():
 @pytest.mark.asyncio
 async def test_sweep_look_uses_bounded_lockstep_yaw_legs():
     """sweep_look legs must be bounded and keep head/body yaw consistent (finding #12)."""
-    movement_manager = FakeMovementManager()
+    movement_manager = FakeMovementManager(body_yaw=0.4, antennas=(-0.5, 0.5))
     deps = SimpleNamespace(
         movement_manager=movement_manager,
         reachy_mini=FakeReachyMini(body_yaw=0.4, antennas=(-0.5, 0.5)),

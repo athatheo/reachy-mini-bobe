@@ -10,11 +10,11 @@ from fastapi.testclient import TestClient
 from bobe.config import config
 from bobe.console import LocalStream
 from bobe.env_file import (
+    read_env_lines,
+    upsert_env_keys,
     persist_api_settings,
     is_plausible_openai_key,
     is_plausible_anthropic_key,
-    read_env_lines,
-    upsert_env_keys,
 )
 from bobe.wake_env import REMOTE_WAKE_KEYS, persist_wake_env
 from bobe.settings_server import SettingsUIServer, _redact_wake_debug_for_public

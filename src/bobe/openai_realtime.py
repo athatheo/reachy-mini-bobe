@@ -658,7 +658,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     np_img = self.deps.camera_worker.get_latest_frame()
                     if np_img is not None:
                         # Camera frames are BGR from OpenCV; convert so Gradio displays correct colors.
-                        rgb_frame = cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB)
+                        rgb_frame = await asyncio.to_thread(cv2.cvtColor, np_img, cv2.COLOR_BGR2RGB)
                     else:
                         rgb_frame = None
                     img = gr.Image(value=rgb_frame)
@@ -1166,9 +1166,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             from reachy_mini.utils.interpolation import compose_world_offset
             from bobe.dance_emotion_moves import GotoQueueMove
 
-            robot = self.deps.reachy_mini
-            head_pose = robot.get_current_head_pose()
-            head_joints, antennas = robot.get_current_joint_positions()
+            # Snapshot the PRIMARY (offset-free) target pose, not the measured
+            # pose: the measured pose already contains speech-sway and
+            # face-tracking offsets, and using it as the goto target would bake
+            # those offsets into the primary pose permanently (finding #33).
+            head_pose, antennas, body_yaw = self.deps.movement_manager.get_primary_target_pose()
             # Mirrored joints: (-, +) perks both antennas outward; (+, -) crosses them.
             target = (-0.5, 0.5) if awake else (0.0, 0.0)
             z_offset_mm = _SLEEP_HEAD_Z_OFFSET_MM if awake else -_SLEEP_HEAD_Z_OFFSET_MM
@@ -1178,9 +1180,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 target_head_pose=target_head_pose,
                 start_head_pose=head_pose,
                 target_antennas=target,
-                start_antennas=(float(antennas[0]), float(antennas[1])),
-                target_body_yaw=float(head_joints[0]),
-                start_body_yaw=float(head_joints[0]),
+                start_antennas=antennas,
+                target_body_yaw=body_yaw,
+                start_body_yaw=body_yaw,
                 duration=0.6,
             )
             self.deps.movement_manager.queue_move(move)

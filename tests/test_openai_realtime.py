@@ -1836,10 +1836,11 @@ def test_sleep_cue_translates_head_on_z_axis() -> None:
 
     neutral = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True, mm=True)
     robot = MagicMock()
-    robot.get_current_head_pose.return_value = neutral
-    robot.get_current_joint_positions.return_value = ((0.0,), (0.2, -0.2))
 
     movement_manager = MagicMock()
+    # The cue snapshots the PRIMARY (offset-free) pose from the manager, not
+    # the measured robot pose (finding #33).
+    movement_manager.get_primary_target_pose.return_value = (neutral, (0.2, -0.2), 0.0)
     deps = ToolDependencies(reachy_mini=robot, movement_manager=movement_manager)
     handler = rt_mod.OpenaiRealtimeHandler(deps)
 
@@ -1848,7 +1849,11 @@ def test_sleep_cue_translates_head_on_z_axis() -> None:
     assert sleep_move.target_head_pose[2, 3] == pytest.approx(-0.03)
     assert sleep_move.target_antennas == (0.0, 0.0)
 
-    robot.get_current_head_pose.return_value = sleep_move.target_head_pose
+    movement_manager.get_primary_target_pose.return_value = (
+        sleep_move.target_head_pose,
+        (0.0, 0.0),
+        0.0,
+    )
     movement_manager.reset_mock()
     handler._queue_antenna_cue(awake=True)
     wake_move = movement_manager.queue_move.call_args[0][0]

@@ -51,21 +51,18 @@ class MoveHead(Tool):
         try:
             movement_manager = deps.movement_manager
 
-            # Get current state for interpolation
-            current_head_pose = deps.reachy_mini.get_current_head_pose()
-            head_joints, current_antennas = deps.reachy_mini.get_current_joint_positions()
+            # Interpolate from the primary (offset-free) target pose so speech
+            # sway / face tracking offsets aren't applied twice during the move.
+            current_head_pose, current_antennas, current_body_yaw = movement_manager.get_primary_target_pose()
 
             # Create goto move
             goto_move = GotoQueueMove(
                 target_head_pose=target,
                 start_head_pose=current_head_pose,
                 target_antennas=(0, 0),  # Reset antennas to default
-                start_antennas=(
-                    current_antennas[0],
-                    current_antennas[1],
-                ),
+                start_antennas=current_antennas,
                 target_body_yaw=0,  # Reset body yaw
-                start_body_yaw=float(head_joints[0]),  # body_yaw is the first head joint
+                start_body_yaw=current_body_yaw,
                 duration=deps.motion_duration_s,
             )
 
