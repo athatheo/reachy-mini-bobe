@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import asyncio
@@ -2137,47 +2138,153 @@ async def test_debouncer_resolves_current_output_queue() -> None:
     assert output.args[0] == {"role": "user_partial", "content": "still visible"}
 
 
-# ---- LocalStream.close() thread-safety ----
+# ---- LocalStream.close() thread-safety / startup-window handling ----
+
+
+class _RecordingLoop:
+    """Fake asyncio loop recording call_soon_threadsafe callbacks without running them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def is_closed(self) -> bool:
+        return False
+
+    def call_soon_threadsafe(self, callback: Any, *args: Any) -> None:
+        self.calls.append((callback, args))
+
+
+class _ParkedHandler:
+    """Minimal realtime-handler stand-in whose start_up never returns on its own."""
+
+    def __init__(self) -> None:
+        self.shutdowns = 0
+
+    async def start_up(self) -> None:
+        await asyncio.Event().wait()  # parks forever, like the supervised session
+
+    async def shutdown(self) -> None:
+        self.shutdowns += 1
+
+    async def receive(self, _frame: Any) -> None:
+        return None
+
+    async def emit(self) -> Any:
+        await asyncio.Event().wait()
 
 
 def test_localstream_close_signals_loop_thread_safely() -> None:
-    """close() from a foreign thread stops the loops via call_soon_threadsafe.
+    """close() with a live loop marshals Event.set/Task.cancel via call_soon_threadsafe.
 
     close() runs on the dashboard stop-poller thread (main.py); neither
-    asyncio.Event.set() nor Task.cancel() is thread-safe, so both must be
-    marshalled onto the stored asyncio loop, ending even a parked task.
+    asyncio.Event.set() nor Task.cancel() is thread-safe, so close() must not
+    invoke them directly. A recording fake loop proves the marshalling: the
+    old close() set the event and cancelled tasks straight from the caller
+    thread, which this test rejects.
     """
     from bobe.console import LocalStream
 
     stream = LocalStream(MagicMock(), MagicMock())
+    fake_loop = _RecordingLoop()
+    stream._asyncio_loop = fake_loop  # type: ignore[assignment]
 
-    started = threading.Event()
-    results: dict[str, Any] = {}
+    pending = MagicMock()
+    pending.done.return_value = False
+    finished = MagicMock()
+    finished.done.return_value = True
+    stream._tasks = [pending, finished]
 
-    async def runner() -> None:
-        stream._asyncio_loop = asyncio.get_running_loop()
+    stream.close()
 
-        async def park() -> None:
-            await asyncio.Event().wait()  # only a cancel can end this
+    # Nothing may run directly on the caller thread...
+    assert not stream._stop_event.is_set(), "Event.set() ran on the caller thread (not thread-safe)"
+    pending.cancel.assert_not_called()
 
-        stream._tasks = [asyncio.create_task(park(), name="parked")]
-        started.set()
-        try:
-            await asyncio.gather(*stream._tasks)
-        except asyncio.CancelledError:
-            results["cancelled"] = True
-        results["stop_set"] = stream._stop_event.is_set()
+    # ...both operations must be handed to the loop instead.
+    callbacks = [cb for cb, _args in fake_loop.calls]
+    assert stream._stop_event.set in callbacks
+    assert pending.cancel in callbacks
+    assert finished.cancel not in callbacks  # done tasks are not re-cancelled
 
-    thread = threading.Thread(target=lambda: asyncio.run(runner()))
+    for cb, args in fake_loop.calls:  # what the loop thread would then do
+        cb(*args)
+    assert stream._stop_event.is_set()
+    pending.cancel.assert_called_once()
+
+
+def test_localstream_close_before_launch_prevents_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A close() that lands before launch() aborts it before media starts.
+
+    The dashboard Stop poller can fire at any time; without a persistent
+    close flag, launch() clears the stop event and starts a full session
+    that nothing ever terminates.
+    """
+    from bobe.console import LocalStream
+
+    robot = MagicMock()
+    stream = LocalStream(_ParkedHandler(), robot)
+    monkeypatch.setattr(stream, "_required_api_keys_configured", lambda: True)
+
+    stream.close()
+
+    thread = threading.Thread(target=stream.launch, daemon=True)
     thread.start()
-    assert started.wait(timeout=2.0)
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive(), "launch() ran despite a prior close()"
+    robot.media.start_recording.assert_not_called()
+    robot.media.start_playing.assert_not_called()
+
+
+def test_localstream_close_during_key_wait_terminates_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """close() while launch() is polling for API keys ends the wait.
+
+    The key-wait loop must honor close() itself, not only the app stop event
+    (which may be absent, or fire before close() is observable).
+    """
+    from bobe.console import LocalStream
+
+    robot = MagicMock()
+    stream = LocalStream(_ParkedHandler(), robot)
+    monkeypatch.setattr(stream, "_required_api_keys_configured", lambda: False)  # keys never arrive
+
+    thread = threading.Thread(target=stream.launch, daemon=True)
+    thread.start()
+    time.sleep(0.3)  # let launch() enter the key-wait poll
+    assert thread.is_alive()
 
     stream.close()  # foreign thread, like main.py's poll_stop_event
 
     thread.join(timeout=5.0)
-    assert not thread.is_alive(), "close() failed to end the loop's parked tasks"
-    assert results.get("cancelled") is True
-    assert results.get("stop_set") is True
+    assert not thread.is_alive(), "close() did not end the API-key wait"
+    robot.media.start_recording.assert_not_called()
+
+
+def test_localstream_close_in_preloop_window_terminates_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A close() in the media-start window (loop not yet registered) is not lost.
+
+    The 'openai-handler' task never returns on its own, so if close() lands
+    between the key check and runner() registering the loop, launch() must
+    still terminate (runner replays the cancellation) instead of hanging
+    forever with a live session.
+    """
+    from bobe.console import LocalStream
+
+    handler = _ParkedHandler()
+    robot = MagicMock()
+    stream = LocalStream(handler, robot)
+    monkeypatch.setattr(stream, "_required_api_keys_configured", lambda: True)
+
+    # The Stop arrives exactly in the pre-loop window: media is starting but
+    # self._asyncio_loop is still None, so close() cannot marshal anything.
+    robot.media.start_playing.side_effect = lambda: stream.close()
+
+    thread = threading.Thread(target=stream.launch, daemon=True)
+    thread.start()
+    thread.join(timeout=10.0)
+
+    assert not thread.is_alive(), "launch() hung: pre-loop close() was lost"
+    assert handler.shutdowns == 1  # runner's cancellation path shut the handler down
 
 
 def test_localstream_close_without_running_loop() -> None:
@@ -2189,3 +2296,61 @@ def test_localstream_close_without_running_loop() -> None:
     stream.close()
 
     assert stream._stop_event.is_set()
+    assert stream._close_requested.is_set()
+
+
+def test_localstream_double_close_before_loop_is_harmless() -> None:
+    """A second close() after a pre-loop close() must not raise or regress state."""
+    from bobe.console import LocalStream
+
+    stream = LocalStream(MagicMock(), MagicMock())
+
+    stream.close()
+    stream.close()  # e.g. stop poller and a finally-block both closing
+
+    assert stream._stop_event.is_set()
+    assert stream._close_requested.is_set()
+
+
+# ---- API key persistence ----
+
+
+def _build_persisting_handler(instance_path: str) -> rt_mod.OpenaiRealtimeHandler:
+    """Build a Gradio-mode handler holding a textbox-provided API key."""
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps, gradio_mode=True, instance_path=instance_path)
+    handler._key_source = "textbox"
+    handler._provided_api_key = "sk-test-persisted-key"
+    return handler
+
+
+def test_persist_api_key_writes_only_the_key_line(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh instance .env gets ONLY the API key, never .env.example template values.
+
+    Baking the template (example wake URL, BOBE_WAKE_GAIN=1.75) into the
+    instance .env would silently override live tuned env values on later loads.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-before")
+    (tmp_path / ".env.example").write_text(
+        "OPENAI_API_KEY=\nBOBE_WAKE_GAIN=1.75\nBOBE_WAKE_REMOTE_URL=ws://Mac.local:8765/v1/stream\n",
+        encoding="utf-8",
+    )
+    handler = _build_persisting_handler(str(tmp_path))
+
+    handler._persist_api_key_if_needed()
+
+    content = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert content == "OPENAI_API_KEY=sk-test-persisted-key\n"
+    assert os.environ["OPENAI_API_KEY"] == "sk-test-persisted-key"
+
+
+def test_persist_api_key_never_overwrites_existing_env(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An existing instance .env (user configuration) is left untouched."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-before")
+    existing = "OPENAI_API_KEY=sk-user-key\nBOBE_WAKE_GAIN=2.5\n"
+    (tmp_path / ".env").write_text(existing, encoding="utf-8")
+    handler = _build_persisting_handler(str(tmp_path))
+
+    handler._persist_api_key_if_needed()
+
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == existing

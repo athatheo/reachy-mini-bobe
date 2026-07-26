@@ -20,6 +20,12 @@ from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
 from bobe.config import config, set_custom_profile
 from bobe.prompts import get_session_voice, get_realtime_session_instructions
+from bobe.env_file import (
+    ENV_FILE_LOCK,
+    read_env_lines,
+    upsert_env_keys,
+    write_env_lines,
+)
 from bobe.wake_word import (
     DEFAULT_FLUSH_SECONDS,
     WakeSession,
@@ -27,12 +33,6 @@ from bobe.wake_word import (
     load_wake_config,
     wake_detector_error,
     create_wake_detector,
-)
-from bobe.env_file import (
-    ENV_FILE_LOCK,
-    read_env_lines,
-    write_env_lines,
-    upsert_env_keys,
 )
 from bobe.wake.phrases import matches_sleep_command
 from bobe.wake.constants import WAKE_SAMPLE_RATE
@@ -81,6 +81,8 @@ _SLEEP_HEAD_Z_OFFSET_MM: Final[float] = 30.0
 # must never run once per mic frame, and the mic loop must never stall on them.
 _WAKE_RETRY_INITIAL_DELAY_S: Final[float] = 2.0
 _WAKE_RETRY_MAX_DELAY_S: Final[float] = 30.0
+
+
 class RealtimeSessionError(Exception):
     """Retryable failure while establishing or updating a realtime session."""
 

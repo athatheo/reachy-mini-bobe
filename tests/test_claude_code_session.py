@@ -256,6 +256,28 @@ async def test_garbled_command_confirmation_prompts_correction_and_keeps_pending
 
 
 @pytest.mark.asyncio
+async def test_garbled_command_attempt_is_silent_when_mismatch_correction_disabled():
+    """With correct_mismatch=False only the exact command phrase produces a result.
+
+    Orchestrators coordinating several pending confirmations disable the
+    corrective reply here so it can never shadow another controller's
+    exactly-spoken confirmation phrase.
+    """
+    controller = ClaudeCodeSessionController(
+        settings_loader=_settings,
+        opener=lambda *args, **kwargs: pytest.fail("must not post on a mismatch"),
+    )
+    controller.request_send("run tests")
+
+    result = await controller.maybe_confirm_from_transcript(
+        "Confirm the Claude command.", correct_mismatch=False
+    )
+
+    assert result is None
+    assert controller.has_pending() is True
+
+
+@pytest.mark.asyncio
 async def test_expired_command_confirmation_does_not_post():
     now = {"value": 10.0}
     calls = []

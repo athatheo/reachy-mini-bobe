@@ -149,6 +149,31 @@ async def test_garbled_confirmation_attempt_prompts_correction_and_keeps_pending
 
 
 @pytest.mark.asyncio
+async def test_garbled_attempt_is_silent_when_mismatch_correction_disabled():
+    """With correct_mismatch=False only exact phrases produce a result.
+
+    Orchestrators coordinating several pending confirmations disable the
+    corrective reply here so it can never shadow another controller's
+    exactly-spoken confirmation phrase.
+    """
+    controller = ClaudeCodeLaunchController(
+        settings_loader=lambda: ClaudeCodeLaunchSettings(
+            launch_url="http://mac.local:8765/v1/launch/claude-code",
+            launch_token="launch-token",
+        ),
+        opener=lambda *args, **kwargs: pytest.fail("must not post on a mismatch"),
+    )
+    controller.request()
+
+    result = await controller.maybe_confirm_from_transcript(
+        "Confirm launching Claude Code.", correct_mismatch=False
+    )
+
+    assert result is None
+    assert controller.has_pending() is True
+
+
+@pytest.mark.asyncio
 async def test_unrelated_transcript_is_not_consumed_while_pending():
     controller = ClaudeCodeLaunchController(
         settings_loader=lambda: ClaudeCodeLaunchSettings(

@@ -61,6 +61,10 @@ class LocalStream:
         self._app_stop_event = app_stop_event
         self._settings_initialized = False
         self._asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Set by close(). launch() checks it at every stage (start, key-wait
+        # poll, pre-media, and right after the loop is registered in runner)
+        # so a stop that lands before the asyncio loop exists is never lost.
+        self._close_requested = threading.Event()
 
     # ---- Settings UI (only when API key is missing) ----
     def _required_api_keys_configured(self) -> bool:
@@ -85,6 +89,10 @@ class LocalStream:
         If the OpenAI key is missing, expose a tiny settings UI via the
         Reachy Mini settings server to collect it before starting streams.
         """
+        if self._close_requested.is_set():
+            logger.info("Close already requested; not starting LocalStream.")
+            return
+
         self._stop_event.clear()
 
         # Try to load an existing instance .env first (covers subsequent runs);
@@ -106,6 +114,9 @@ class LocalStream:
             warned_at = time.monotonic()
             try:
                 while not self._required_api_keys_configured():
+                    if self._close_requested.is_set():
+                        logger.info("Close requested while waiting for API keys.")
+                        return
                     if self._app_stop_event is not None and self._app_stop_event.is_set():
                         logger.info("Stop requested while waiting for API keys.")
                         return
@@ -119,6 +130,10 @@ class LocalStream:
                 logger.info("Interrupted while waiting for API keys.")
                 return
 
+        if self._close_requested.is_set():
+            logger.info("Close requested before media startup; aborting launch.")
+            return
+
         # Start media after key is set/available
         self._robot.media.start_recording()
         self._robot.media.start_playing()
@@ -131,6 +146,13 @@ class LocalStream:
                 asyncio.create_task(self.record_loop(), name="stream-record-loop"),
                 asyncio.create_task(self.play_loop(), name="stream-play-loop"),
             ]
+            # A close() that landed before the loop was registered could not
+            # be marshalled onto it; replay its cancellation path here, on the
+            # loop thread, so the stop request is never lost.
+            if self._close_requested.is_set():
+                self._stop_event.set()
+                for task in self._tasks:
+                    task.cancel()
             try:
                 await asyncio.gather(*self._tasks)
             except asyncio.CancelledError:
@@ -148,8 +170,17 @@ class LocalStream:
         - Stops audio recording and playback first
         - Sets the stop event to signal async loops to terminate
         - Cancels all pending async tasks (openai-handler, record-loop, play-loop)
+
+        Safe to call from any thread, at any point in the lifecycle (before
+        launch(), while waiting for API keys, during media startup, or with
+        the asyncio loop running), and safe to call more than once.
         """
         logger.info("Stopping LocalStream...")
+
+        # Record the request FIRST: launch() checks this flag at every stage,
+        # and runner() re-checks it right after registering the loop, so a
+        # close that lands before the loop exists still terminates launch().
+        self._close_requested.set()
 
         # Stop media pipelines FIRST before cancelling async tasks
         # This ensures clean shutdown before PortAudio cleanup
@@ -179,7 +210,9 @@ class LocalStream:
                 logger.debug(f"Event loop already closed while stopping: {e}")
         else:
             # The asyncio runner never started (or already finished); there is
-            # no loop thread to race with.
+            # no loop thread to race with. _close_requested (set above) makes
+            # launch() abort or runner() cancel its tasks; setting the stop
+            # event here additionally unblocks the record/play loops.
             self._stop_event.set()
 
     def clear_audio_queue(self) -> None:
