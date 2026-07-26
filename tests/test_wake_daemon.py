@@ -1,10 +1,18 @@
 # ruff: noqa: D103
+import sys
+import time
+import types
+import logging
+import threading
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
+from bobe.wake_daemon import engine as engine_module
 from bobe.wake_daemon.config import load_wake_daemon_config
-from bobe.wake_daemon.engine import WhisperWakeEngine
+from bobe.wake_daemon.engine import WhisperWakeEngine, warn_if_phrases_unsupported
 
 
 _TEST_ENV = {"BOBE_WAKE_TOKEN": "test-token"}
@@ -39,9 +47,16 @@ def test_load_wake_daemon_config_defaults():
 
     assert config.phrase == "hey bobe"
     assert config.whisper_model == "distil-small.en"
+    assert config.whisper_language is None
     assert config.whisper_initial_prompt is None
     assert config.whisper_hotwords is None
     assert config.port == 8765
+
+
+def test_whisper_language_env_override():
+    assert load_wake_daemon_config({**_TEST_ENV, "WHISPER_LANGUAGE": "EL"}).whisper_language == "el"
+    assert load_wake_daemon_config({**_TEST_ENV, "WHISPER_LANGUAGE": ""}).whisper_language is None
+    assert load_wake_daemon_config({**_TEST_ENV, "WHISPER_LANGUAGE": "auto"}).whisper_language is None
 
 
 def test_whisper_prompt_helpers():
@@ -144,6 +159,102 @@ def test_whisper_engine_detects_sleep_phrase(monkeypatch):
     assert event["type"] == "sleep"
 
 
+def test_transcribe_passes_configured_language():
+    captured = {}
+
+    class FakeModel:
+        def transcribe(self, audio, **kwargs):
+            captured.update(kwargs)
+            return ([], None)
+
+    engine = WhisperWakeEngine(load_wake_daemon_config({**_TEST_ENV, "WHISPER_LANGUAGE": "el"}))
+    engine._model = FakeModel()
+
+    engine.transcribe(np.zeros(1600, dtype=np.int16))
+
+    assert captured["language"] == "el"
+
+
+def test_transcribe_defaults_to_language_autodetect():
+    captured = {}
+
+    class FakeModel:
+        def transcribe(self, audio, **kwargs):
+            captured.update(kwargs)
+            return ([], None)
+
+    engine = WhisperWakeEngine(load_wake_daemon_config(_TEST_ENV))
+    engine._model = FakeModel()
+
+    engine.transcribe(np.zeros(1600, dtype=np.int16))
+
+    assert captured["language"] is None
+
+
+def test_partial_throttle_measured_from_transcribe_completion(monkeypatch):
+    """Chunks buffered behind a slow transcribe must not each re-transcribe the utterance."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(engine_module.time, "monotonic", lambda: clock["now"])
+    calls = {"count": 0}
+
+    def slow_transcribe(_audio):
+        calls["count"] += 1
+        clock["now"] += 0.6  # slower than PARTIAL_TRANSCRIBE_INTERVAL_S (0.45s)
+        return "hello there"
+
+    session = _session(monkeypatch=monkeypatch, transcribe=slow_transcribe)
+
+    chunk = np.full(1600, 5000, dtype=np.int16)  # 0.1s of voiced audio at 16 kHz
+    for _ in range(20):
+        # No wall time passes between feeds: this models the backlog of frames
+        # that buffered up while the slow transcribe blocked the handler.
+        assert session.feed(chunk) is None
+
+    assert calls["count"] == 1
+
+    clock["now"] += 0.5  # real quiet time elapses -> the next partial may run
+    session.feed(chunk)
+    assert calls["count"] == 2
+
+
+def test_whisper_model_load_is_single_flight_across_threads(monkeypatch):
+    created = []
+
+    class FakeWhisperModel:
+        def __init__(self, *args, **kwargs):
+            time.sleep(0.05)
+            created.append(self)
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeWhisperModel))
+    engine = WhisperWakeEngine(load_wake_daemon_config(_TEST_ENV))
+
+    results: list[object] = []
+    threads = [threading.Thread(target=lambda: results.append(engine._load_model())) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(created) == 1
+    assert results == [created[0]] * 4
+
+
+def test_engine_preload_loads_model_once(monkeypatch):
+    created = []
+
+    class FakeWhisperModel:
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=FakeWhisperModel))
+    engine = WhisperWakeEngine(load_wake_daemon_config(_TEST_ENV))
+
+    engine.preload()
+    engine.preload()
+
+    assert len(created) == 1
+
+
 def test_whisper_engine_loads_model_once(monkeypatch):
     config = load_wake_daemon_config(_TEST_ENV)
     engine = WhisperWakeEngine(config)
@@ -175,6 +286,72 @@ def test_wake_daemon_app_starts_with_empty_engine_pool():
     config = load_wake_daemon_config(_TEST_ENV)
     app = create_app(config)
     assert app.state.wake_engines == {}
+
+
+def test_create_app_preloads_whisper_model_on_startup(monkeypatch):
+    from bobe.wake_daemon.server import create_app
+
+    preloaded = []
+    monkeypatch.setattr(WhisperWakeEngine, "preload", lambda self: preloaded.append(self))
+    app = create_app(load_wake_daemon_config(_TEST_ENV))
+
+    with TestClient(app):
+        app.state.whisper_preload_thread.join(timeout=5)
+
+    assert len(preloaded) == 1
+    assert list(app.state.wake_engines.values()) == preloaded
+
+
+def test_create_app_warns_when_english_only_model_meets_non_ascii_phrase(caplog):
+    from bobe.wake_daemon.server import create_app
+
+    config = load_wake_daemon_config({**_TEST_ENV, "WHISPER_MODEL": "medium.en"})
+    with caplog.at_level(logging.WARNING, logger="bobe.wake_daemon.engine"):
+        create_app(config)
+
+    assert any("English-only" in record.getMessage() for record in caplog.records)
+
+
+def test_no_language_warning_with_multilingual_model(caplog):
+    config = load_wake_daemon_config({**_TEST_ENV, "WHISPER_MODEL": "small"})
+    with caplog.at_level(logging.WARNING, logger="bobe.wake_daemon.engine"):
+        warn_if_phrases_unsupported(config)
+
+    assert not [record for record in caplog.records if "never be detected" in record.getMessage()]
+
+
+def test_warns_when_language_forced_english_with_non_ascii_phrase(caplog):
+    config = load_wake_daemon_config({**_TEST_ENV, "WHISPER_MODEL": "small", "WHISPER_LANGUAGE": "en"})
+    with caplog.at_level(logging.WARNING, logger="bobe.wake_daemon.engine"):
+        warn_if_phrases_unsupported(config)
+
+    assert any("WHISPER_LANGUAGE=en" in record.getMessage() for record in caplog.records)
+
+
+def test_stream_rejects_invalid_hello_token():
+    from bobe.wake_daemon.server import create_app
+
+    client = TestClient(create_app(load_wake_daemon_config(_TEST_ENV)))
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "wrong-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            ws.receive_json()
+
+    assert excinfo.value.code == 1008
+
+
+def test_stream_accepts_valid_hello_token():
+    from bobe.wake_daemon.server import create_app
+
+    client = TestClient(create_app(load_wake_daemon_config(_TEST_ENV)))
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        ready = ws.receive_json()
+
+    assert ready["type"] == "ready"
+    assert ready["phrase"] == "hey bobe"
 
 
 def test_claude_code_launch_endpoint_disabled_by_default():

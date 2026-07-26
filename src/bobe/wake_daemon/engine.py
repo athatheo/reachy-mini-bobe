@@ -3,6 +3,7 @@
 from __future__ import annotations
 import time
 import logging
+import threading
 from typing import Any, Literal
 from collections import deque
 from dataclasses import field, dataclass
@@ -33,16 +34,46 @@ def whisper_engine_key(config: WakeDaemonConfig) -> tuple[str, str, str, str | N
     )
 
 
+def warn_if_phrases_unsupported(
+    config: WakeDaemonConfig,
+    sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
+) -> None:
+    """Log a loud warning when English-only Whisper settings meet non-ASCII phrases."""
+    phrases = (config.phrase, *sleep_phrases)
+    non_ascii = sorted({phrase for phrase in phrases if phrase and not phrase.isascii()})
+    if not non_ascii:
+        return
+    if config.whisper_model.casefold().endswith(".en"):
+        logger.warning(
+            "Whisper model %r is English-only but non-ASCII wake/sleep phrases are configured (%s); "
+            "they can never be detected. Use a multilingual model (e.g. 'small' or 'medium') and "
+            "leave WHISPER_LANGUAGE empty for autodetect.",
+            config.whisper_model,
+            ", ".join(non_ascii),
+        )
+    elif (config.whisper_language or "").strip().casefold() == "en":
+        logger.warning(
+            "WHISPER_LANGUAGE=en forces English transcription but non-ASCII wake/sleep phrases "
+            "are configured (%s); they can never be detected. Leave WHISPER_LANGUAGE empty for autodetect.",
+            ", ".join(non_ascii),
+        )
+
+
 @dataclass
 class WhisperWakeEngine:
     """Shared faster-whisper model holder; use sessions for per-connection state."""
 
     config: WakeDaemonConfig
     _model: object | None = field(default=None, init=False, repr=False)
+    _load_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def session(self, config: WakeDaemonConfig | None = None) -> WhisperWakeSession:
         """Create an isolated VAD/transcript session backed by this shared model."""
         return WhisperWakeSession(engine=self, config=config or self.config)
+
+    def preload(self) -> None:
+        """Load the Whisper model now so the first utterance skips the load cost."""
+        self._load_model()
 
     def transcribe(self, pcm_i16: np.ndarray, *, config: WakeDaemonConfig | None = None) -> str:
         """Run Whisper on PCM audio using prompt settings from config."""
@@ -51,7 +82,7 @@ class WhisperWakeEngine:
         audio = pcm_i16.astype(np.float32) / 32768.0
         segments, _info = model.transcribe(  # type: ignore[attr-defined]
             audio,
-            language="en",
+            language=runtime.whisper_language,
             beam_size=1,
             best_of=1,
             temperature=0.0,
@@ -64,25 +95,32 @@ class WhisperWakeEngine:
         return " ".join(parts).strip()
 
     def _load_model(self) -> object:
-        if self._model is not None:
-            return self._model
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise RuntimeError("faster-whisper is not installed; install with: uv sync --extra wake-daemon") from exc
+        model = self._model
+        if model is not None:
+            return model
+        # Double-checked locking: the engine is shared across WebSocket
+        # connections, and concurrent first feeds must not each load a model.
+        with self._load_lock:
+            if self._model is None:
+                try:
+                    from faster_whisper import WhisperModel
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "faster-whisper is not installed; install with: uv sync --extra wake-daemon"
+                    ) from exc
 
-        logger.info(
-            "Loading Whisper model %r (device=%r, compute_type=%r)",
-            self.config.whisper_model,
-            self.config.whisper_device,
-            self.config.whisper_compute_type,
-        )
-        self._model = WhisperModel(
-            self.config.whisper_model,
-            device=self.config.whisper_device,
-            compute_type=self.config.whisper_compute_type,
-        )
-        return self._model
+                logger.info(
+                    "Loading Whisper model %r (device=%r, compute_type=%r)",
+                    self.config.whisper_model,
+                    self.config.whisper_device,
+                    self.config.whisper_compute_type,
+                )
+                self._model = WhisperModel(
+                    self.config.whisper_model,
+                    device=self.config.whisper_device,
+                    compute_type=self.config.whisper_compute_type,
+                )
+            return self._model
 
 
 @dataclass
@@ -234,7 +272,11 @@ class WhisperWakeSession:
                 partial = self.engine.transcribe(np.concatenate(self._speech_samples), config=self.config)
                 latency_ms = (time.monotonic() - started) * 1000.0
                 self._set_partial(partial)
-                self._last_partial_at = now
+                # Throttle from transcribe *completion*, not the pre-transcribe
+                # timestamp: chunks buffered while a slow transcribe ran arrive
+                # back-to-back, and the stale timestamp would let every one of
+                # them re-transcribe the whole utterance.
+                self._last_partial_at = time.monotonic()
                 # Wake/sleep on partials: finals often arrive late and re-transcribe
                 # trailing noise into junk ("Thank you."), wiping a good live match.
                 if partial:

@@ -5,7 +5,13 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
-from bobe.env_file import read_env_lines, upsert_env_keys, _read_lines_if_exists
+from bobe.env_file import (
+    ENV_FILE_LOCK,
+    read_env_lines,
+    upsert_env_keys,
+    write_env_lines,
+    _read_lines_if_exists,
+)
 
 
 REMOTE_WAKE_KEYS = (
@@ -13,6 +19,7 @@ REMOTE_WAKE_KEYS = (
     "BOBE_WAKE_REMOTE_URL",
     "BOBE_WAKE_TOKEN",
     "BOBE_WAKE_GAIN",
+    "BOBE_WAKE_ALLOWED_HOSTS",
 )
 
 _PACKAGED_ENV_EXAMPLE = Path(__file__).parent / ".env.example"
@@ -70,51 +77,88 @@ def is_wake_remote_host_allowed(hostname: str) -> bool:
     return bool(allowed) and normalized in allowed
 
 
+def _allowed_hosts_from_lines(lines: list[str]) -> set[str]:
+    """Parse the BOBE_WAKE_ALLOWED_HOSTS assignment from env file lines."""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("BOBE_WAKE_ALLOWED_HOSTS="):
+            continue
+        value = stripped.partition("=")[2].strip().strip('"').strip("'")
+        return {part.strip().casefold() for part in value.split(",") if part.strip()}
+    return set()
+
+
 def upsert_wake_env_lines(
     lines: list[str],
     *,
-    backend: str = "remote",
-    remote_url: str,
-    token: str,
-    gain: float = 1.75,
+    backend: str | None = "remote",
+    remote_url: str | None = None,
+    token: str | None = None,
+    gain: float | None = None,
+    allowed_hosts: str | None = None,
 ) -> None:
-    """Merge remote wake settings into env file lines."""
-    upsert_env_keys(
-        lines,
-        {
-            "BOBE_WAKE_BACKEND": backend,
-            "BOBE_WAKE_REMOTE_URL": remote_url,
-            "BOBE_WAKE_TOKEN": token,
-            "BOBE_WAKE_GAIN": str(gain),
-        },
-    )
+    """Merge remote wake settings into env file lines.
+
+    ``None`` values are left out entirely so existing entries are preserved.
+    """
+    values: dict[str, str] = {}
+    if backend is not None:
+        values["BOBE_WAKE_BACKEND"] = backend
+    if remote_url is not None:
+        values["BOBE_WAKE_REMOTE_URL"] = remote_url
+    if token is not None:
+        values["BOBE_WAKE_TOKEN"] = token
+    if gain is not None:
+        values["BOBE_WAKE_GAIN"] = str(gain)
+    if allowed_hosts is not None:
+        values["BOBE_WAKE_ALLOWED_HOSTS"] = allowed_hosts
+    upsert_env_keys(lines, values)
 
 
 def persist_wake_env(
     instance_path: str | Path,
     *,
-    backend: str = "remote",
-    remote_url: str,
-    token: str,
-    gain: float = 1.75,
+    backend: str | None = "remote",
+    remote_url: str | None = None,
+    token: str | None = None,
+    gain: float | None = None,
 ) -> Path:
-    """Write remote wake settings to ``instance_path/.env``."""
-    env_path = Path(instance_path) / ".env"
-    lines = read_env_lines(env_path)
-    upsert_wake_env_lines(
-        lines,
-        backend=backend,
-        remote_url=remote_url,
-        token=token,
-        gain=gain,
-    )
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    """Write remote wake settings to ``instance_path/.env``.
 
-    os.environ["BOBE_WAKE_BACKEND"] = backend
-    os.environ["BOBE_WAKE_REMOTE_URL"] = remote_url
-    os.environ["BOBE_WAKE_TOKEN"] = token
-    os.environ["BOBE_WAKE_GAIN"] = str(gain)
+    ``None`` keeps whatever is currently configured (tuned gain, daemon URL)
+    instead of resetting it to a default. When a new remote URL is supplied,
+    its just-validated hostname is merged into the persisted allowlist so the
+    stored BOBE_WAKE_ALLOWED_HOSTS never silently reverts.
+    """
+    env_path = Path(instance_path) / ".env"
+    with ENV_FILE_LOCK:
+        lines = read_env_lines(env_path)
+        allowed_hosts: str | None = None
+        if remote_url is not None:
+            host = _hostname_from_ws_url(remote_url)
+            if host:
+                merged = set(wake_allowed_hosts()) | _allowed_hosts_from_lines(lines) | {host}
+                allowed_hosts = ",".join(sorted(merged))
+        upsert_wake_env_lines(
+            lines,
+            backend=backend,
+            remote_url=remote_url,
+            token=token,
+            gain=gain,
+            allowed_hosts=allowed_hosts,
+        )
+        write_env_lines(env_path, lines)
+
+    env_updates = {
+        "BOBE_WAKE_BACKEND": backend,
+        "BOBE_WAKE_REMOTE_URL": remote_url,
+        "BOBE_WAKE_TOKEN": token,
+        "BOBE_WAKE_GAIN": str(gain) if gain is not None else None,
+        "BOBE_WAKE_ALLOWED_HOSTS": allowed_hosts,
+    }
+    for key, value in env_updates.items():
+        if value is not None:
+            os.environ[key] = value
     return env_path
 
 
@@ -139,25 +183,30 @@ def merge_packaged_wake_defaults(instance_path: str | Path) -> bool:
         return False
 
     env_path = Path(instance_path) / ".env"
-    lines = _read_lines_if_exists(env_path) or []
-    current: dict[str, str] = {}
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, _, value = stripped.partition("=")
-        current[key] = value.strip().strip('"').strip("'")
+    with ENV_FILE_LOCK:
+        lines = _read_lines_if_exists(env_path) or []
+        current: dict[str, str] = {}
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, value = stripped.partition("=")
+            current[key] = value.strip().strip('"').strip("'")
 
-    missing = {
-        key: example_values[key]
-        for key in REMOTE_WAKE_KEYS
-        if not current.get(key) and example_values.get(key)
-    }
-    if not missing:
-        return False
+        # Only seed keys with no configured value anywhere: an already-tuned
+        # value (instance .env or live environment) must never be reset to
+        # the packaged example defaults.
+        missing = {
+            key: example_values[key]
+            for key in REMOTE_WAKE_KEYS
+            if not current.get(key)
+            and not (os.getenv(key) or "").strip()
+            and example_values.get(key)
+        }
+        if not missing:
+            return False
 
-    upsert_env_keys(lines, missing)
-    os.environ.update(missing)
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        upsert_env_keys(lines, missing)
+        os.environ.update(missing)
+        write_env_lines(env_path, lines)
     return True

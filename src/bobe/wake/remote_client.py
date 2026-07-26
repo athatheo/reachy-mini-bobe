@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BASE_S = 0.5
 RECONNECT_MAX_S = 10.0
+# A 1008 (policy violation) close means the daemon rejected our handshake —
+# usually a bad/missing BOBE_WAKE_TOKEN. Fast retries can never succeed.
+AUTH_RETRY_S = 60.0
+
+
+def _close_code(exc: BaseException) -> int | None:
+    """Extract the websocket close code from a ConnectionClosed exception."""
+    rcvd = getattr(exc, "rcvd", None)
+    code = getattr(rcvd, "code", None)
+    if code is None:
+        code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
 
 
 class RemoteWakeClient:
@@ -60,6 +72,7 @@ class RemoteWakeClient:
         self._remote_stats: dict[str, float | int | str | bool] = {}
         self._daemon_engine = ""
         self._connected = False
+        self._auth_error: str | None = None
         self._last_transcript = ""
         self._transcript_stream: list[dict[str, float | int | str | bool]] = []
         self._display_lines: list[str] = []
@@ -77,6 +90,8 @@ class RemoteWakeClient:
             return
         self._thread = None
         self._stop_event.clear()
+        # Remove stale frames and stop sentinels left over from a previous run.
+        self._drain_audio_queue()
         self._thread = threading.Thread(target=self._run, name="remote-wake-client", daemon=True)
         self._thread.start()
 
@@ -112,10 +127,24 @@ class RemoteWakeClient:
 
     def _queue_listen_mode(self, mode: str) -> None:
         payload = listen_message(mode=mode, sleep_phrases=self._sleep_phrases if mode == "sleep" else None)
+        # Listen mode is idempotent state — only the latest request matters, so
+        # coalesce pending entries instead of dropping new ones on queue.Full.
+        while True:
+            try:
+                self._control_queue.get_nowait()
+            except queue.Empty:
+                break
         try:
             self._control_queue.put_nowait((mode, payload))
         except queue.Full:
             pass
+
+    def _drain_audio_queue(self) -> None:
+        while True:
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def debug_state(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -143,6 +172,7 @@ class RemoteWakeClient:
             "transcript_stream": transcript_stream[-12:],
             "transcript_display": display_lines[-20:],
             "connected": self._connected,
+            "auth_error": self._auth_error,
             "listen_mode": self._listen_mode,
             "paused": self._listen_mode == "sleep",
             "thread_alive": self.is_running(),
@@ -229,32 +259,63 @@ class RemoteWakeClient:
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(self._url, open_timeout=5.0, ping_interval=20.0) as ws:
-                    await ws.send(
-                        json.dumps(
-                            hello_message(sample_rate=self._sample_rate, token=self._token, phrase=self._phrase)
-                        )
-                    )
-                    self._connected = True
                     backoff = RECONNECT_BASE_S
-                    logger.info("Remote wake client connected to %s", self._url)
-                    self._log_event("info", f"Connected to {self._url}")
-                    await self._session(ws)
+                    await self._run_connection(ws)
             except Exception as exc:
                 self._connected = False
                 if self._stop_event.is_set():
                     break
+                if _close_code(exc) == 1008:
+                    self._auth_error = (
+                        "Wake daemon rejected the handshake (close code 1008); check BOBE_WAKE_TOKEN"
+                    )
+                    self._log_event("error", self._auth_error)
+                    logger.error("%s. Retrying in %.0fs.", self._auth_error, AUTH_RETRY_S)
+                    await self._sleep_unless_stopped(AUTH_RETRY_S)
+                    continue
                 self._log_event("warn", f"Connection failed: {exc}")
                 logger.warning("Remote wake connection failed (%s); retrying in %.1fs", exc, backoff)
-                await asyncio.sleep(backoff)
+                await self._sleep_unless_stopped(backoff)
                 backoff = min(backoff * 2.0, RECONNECT_MAX_S)
             finally:
                 self._connected = False
+
+    async def _run_connection(self, ws: Any) -> None:
+        await ws.send(
+            json.dumps(hello_message(sample_rate=self._sample_rate, token=self._token, phrase=self._phrase))
+        )
+        # Drop mic audio queued while disconnected: replaying it into the fresh
+        # (no-refractory) daemon session would fire delayed ghost wakes.
+        self._drain_audio_queue()
+        # The daemon starts every connection in wake mode, so always replay the
+        # current listen mode — a reconnect while BoBe is awake must restore
+        # sleep-phrase detection.
+        self._queue_listen_mode(self._listen_mode)
+        self._connected = True
+        logger.info("Remote wake client connected to %s", self._url)
+        self._log_event("info", f"Connected to {self._url}")
+        await self._session(ws)
+
+    async def _sleep_unless_stopped(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.25, remaining))
 
     async def _session(self, ws: Any) -> None:
         sender = asyncio.create_task(self._send_loop(ws), name="remote-wake-send")
         receiver = asyncio.create_task(self._recv_loop(ws), name="remote-wake-recv")
         try:
-            await asyncio.gather(sender, receiver)
+            # Either loop finishing must end the session: after the stop
+            # sentinel the recv loop would otherwise sit in `async for`
+            # forever and stop() would always hit its join timeout.
+            done, _pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
         finally:
             sender.cancel()
             receiver.cancel()
@@ -268,7 +329,16 @@ class RemoteWakeClient:
                     _mode, payload = self._control_queue.get_nowait()
                 except queue.Empty:
                     break
-                await ws.send(json.dumps(payload))
+                try:
+                    await ws.send(json.dumps(payload))
+                except Exception:
+                    # Keep the mode change for the reconnect: requeue it so it
+                    # is not silently lost when the socket is already dead.
+                    try:
+                        self._control_queue.put_nowait((_mode, payload))
+                    except queue.Full:
+                        pass
+                    raise
                 if _mode == "sleep":
                     self._log_event("info", "Listening for sleep phrases (BoBe awake)")
                 else:
@@ -363,6 +433,7 @@ class RemoteWakeClient:
             if msg_type == "ready":
                 engine = str(payload.get("engine") or "")
                 phrase = str(payload.get("phrase") or self._phrase)
+                self._auth_error = None
                 with self._stats_lock:
                     self._daemon_engine = engine
                 self._log_event("info", f"Daemon ready ({engine})", phrase=phrase)

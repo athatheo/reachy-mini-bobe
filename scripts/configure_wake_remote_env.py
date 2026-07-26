@@ -30,6 +30,28 @@ def _upsert(lines: list[str], key: str, value: str) -> None:
     lines.append(replacement)
 
 
+def _existing_value(lines: list[str], key: str) -> str | None:
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(f"{key}="):
+            value = stripped.partition("=")[2].strip().strip('"').strip("'")
+            return value or None
+    return None
+
+
+def _template_lines(example: Path) -> list[str]:
+    """Template lines minus empty KEY= placeholders (never bake empty values)."""
+    lines: list[str] = []
+    for line in example.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            value = stripped.partition("=")[2].strip().strip('"').strip("'")
+            if not value:
+                continue
+        lines.append(line)
+    return lines
+
+
 def _remote_url(mac_host: str, port: int) -> str:
     host = mac_host.strip()
     if "." in host and not host.endswith(".local"):
@@ -42,29 +64,38 @@ def _remote_url(mac_host: str, port: int) -> str:
 def configure_env(
     env_path: Path,
     *,
-    mac_host: str,
+    mac_host: str | None,
     port: int,
     token: str,
-    gain: float,
+    gain: float | None,
 ) -> None:
+    """Merge remote wake settings into env_path; None keeps the current values."""
     if env_path.exists():
         lines = env_path.read_text(encoding="utf-8").splitlines()
     else:
         example = env_path.parent / ".env.example"
         if example.exists():
-            lines = example.read_text(encoding="utf-8").splitlines()
+            lines = _template_lines(example)
         else:
             lines = []
 
-    remote_url = _remote_url(mac_host, port)
+    existing_url = _existing_value(lines, "BOBE_WAKE_REMOTE_URL")
+    remote_url: str | None = None
+    if mac_host:
+        remote_url = _remote_url(mac_host, port)
+    elif not existing_url:
+        remote_url = _remote_url(_detect_host("Mac"), port)
+
     _upsert(lines, "BOBE_WAKE_BACKEND", "remote")
-    _upsert(lines, "BOBE_WAKE_REMOTE_URL", remote_url)
+    if remote_url is not None:
+        _upsert(lines, "BOBE_WAKE_REMOTE_URL", remote_url)
     _upsert(lines, "BOBE_WAKE_TOKEN", token)
-    _upsert(lines, "BOBE_WAKE_GAIN", str(gain))
+    if gain is not None:
+        _upsert(lines, "BOBE_WAKE_GAIN", str(gain))
 
     env_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     print(f"Updated {env_path}")
-    print(f"  BOBE_WAKE_REMOTE_URL={remote_url}")
+    print(f"  BOBE_WAKE_REMOTE_URL={remote_url or existing_url}")
 
 
 def main() -> None:
@@ -81,9 +112,18 @@ def main() -> None:
         default=Path("config/wake-daemon.env"),
         help="Mac wake daemon env file with BOBE_WAKE_TOKEN",
     )
-    parser.add_argument("--mac-host", default=_detect_host("Mac"), help="Mac Bonjour hostname")
+    parser.add_argument(
+        "--mac-host",
+        default=None,
+        help="Mac Bonjour hostname (default: keep the existing BOBE_WAKE_REMOTE_URL, or detect)",
+    )
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--gain", type=float, default=1.75)
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=None,
+        help="Wake mic gain (default: keep the existing BOBE_WAKE_GAIN)",
+    )
     args = parser.parse_args()
 
     token = _read_token(args.daemon_env)

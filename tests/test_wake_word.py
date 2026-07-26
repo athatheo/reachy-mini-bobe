@@ -150,6 +150,16 @@ def test_create_wake_detector_remote_requires_url():
     assert create_wake_detector(lambda: None, config) is None
 
 
+def test_create_wake_detector_remote_requires_token():
+    config = load_wake_config(
+        {
+            "BOBE_WAKE_BACKEND": "remote",
+            "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
+        }
+    )
+    assert create_wake_detector(lambda: None, config) is None
+
+
 def test_wake_session_sleep_request():
     session = WakeSession(timeout_s=60.0)
     session.wake()
@@ -182,6 +192,13 @@ def test_create_wake_detector_rejects_deprecated_backends(backend):
     ("env", "expected_substring"),
     [
         ({"BOBE_WAKE_BACKEND": "remote"}, "BOBE_WAKE_REMOTE_URL"),
+        (
+            {
+                "BOBE_WAKE_BACKEND": "remote",
+                "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
+            },
+            "BOBE_WAKE_TOKEN",
+        ),
         ({"BOBE_WAKE_BACKEND": "heed"}, "no longer supported"),
         ({"BOBE_WAKE_BACKEND": "bogus"}, "Unknown wake backend"),
     ],
@@ -198,6 +215,7 @@ def test_wake_detector_error_none_when_remote_configured():
         {
             "BOBE_WAKE_BACKEND": "remote",
             "BOBE_WAKE_REMOTE_URL": "ws://mac-mini.local:8765/v1/stream",
+            "BOBE_WAKE_TOKEN": "secret",
         }
     )
     assert wake_detector_error(config) is None

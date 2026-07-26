@@ -45,6 +45,7 @@ class WakeDaemonConfig:
     whisper_model: str = DEFAULT_WHISPER_MODEL
     whisper_device: str = DEFAULT_WHISPER_DEVICE
     whisper_compute_type: str = DEFAULT_WHISPER_COMPUTE_TYPE
+    whisper_language: str | None = None
     whisper_initial_prompt: str | None = None
     whisper_hotwords: str | None = None
     end_silence_ms: int = DEFAULT_END_SILENCE_MS
@@ -95,6 +96,11 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
         initial_prompt = None
     hotwords = _optional("WHISPER_HOTWORDS")
 
+    # Transcription language pin (e.g. "en", "el"); empty/"auto" = autodetect.
+    # English-only ".en" models ignore this and always transcribe English.
+    raw_language = (source.get("WHISPER_LANGUAGE") or "").strip().casefold()
+    language = None if raw_language in {"", "auto"} else raw_language
+
     return WakeDaemonConfig(
         host=(source.get("WAKE_DAEMON_HOST") or DEFAULT_HOST).strip() or DEFAULT_HOST,
         port=_int("WAKE_DAEMON_PORT", DEFAULT_PORT),
@@ -104,6 +110,7 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
         whisper_device=(source.get("WHISPER_DEVICE") or DEFAULT_WHISPER_DEVICE).strip() or DEFAULT_WHISPER_DEVICE,
         whisper_compute_type=(source.get("WHISPER_COMPUTE_TYPE") or DEFAULT_WHISPER_COMPUTE_TYPE).strip()
         or DEFAULT_WHISPER_COMPUTE_TYPE,
+        whisper_language=language,
         whisper_initial_prompt=initial_prompt,
         whisper_hotwords=hotwords,
         end_silence_ms=max(50, _int("VAD_END_SILENCE_MS", DEFAULT_END_SILENCE_MS)),

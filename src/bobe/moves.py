@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
 # Configuration constants
 CONTROL_LOOP_FREQUENCY_HZ = 100.0  # Hz - Target frequency for the movement control loop
 
+# Safety bounds for the fused secondary offsets (speech sway + face tracking).
+# Speech sway alone peaks near 0.2 rad / 7 mm per axis, so these limits leave
+# headroom for face tracking while preventing compounded offsets from pushing
+# the head past its mechanical range. Non-finite values are zeroed.
+SECONDARY_TRANSLATION_LIMIT_M = 0.015
+SECONDARY_ROTATION_LIMIT_RAD = 0.35
+
 # Type definitions
 FullBodyPose = Tuple[NDArray[np.float32], Tuple[float, float], float]  # (head_pose_4x4, antennas, body_yaw)
 
@@ -166,6 +173,13 @@ def clone_full_body_pose(pose: FullBodyPose) -> FullBodyPose:
     """Create a deep copy of a full body pose tuple."""
     head, antennas, body_yaw = pose
     return (head.copy(), (float(antennas[0]), float(antennas[1])), float(body_yaw))
+
+
+def clamp_secondary_offset(value: float, limit: float) -> float:
+    """Clamp a secondary offset to [-limit, +limit]; non-finite values become 0."""
+    if not np.isfinite(value):
+        return 0.0
+    return float(min(limit, max(-limit, value)))
 
 
 @dataclass
@@ -281,9 +295,14 @@ class MovementManager:
         self._breathing_active = False  # true when breathing move is running or queued
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
+        self._pending_listening_state: bool | None = None
+        self._last_requested_listening = self._is_listening
         self._last_set_target_err = 0.0
         self._set_target_err_interval = 1.0  # seconds between error logs
         self._set_target_err_suppressed = 0
+        self._last_tick_err = 0.0
+        self._tick_err_interval = 1.0  # seconds between tick-error logs
+        self._tick_err_suppressed = 0
 
         # Cross-thread signalling
         self._command_queue: "Queue[Tuple[str, Any]]" = Queue()
@@ -301,6 +320,7 @@ class MovementManager:
         self._shared_state_lock = threading.Lock()
         self._shared_last_activity_time = self.state.last_activity_time
         self._shared_is_listening = self._is_listening
+        self._shared_primary_pose = clone_full_body_pose(self.state.last_primary_pose)
         self._status_lock = threading.Lock()
         self._freq_stats = LoopFrequencyStats()
         self._freq_snapshot = LoopFrequencyStats()
@@ -340,9 +360,12 @@ class MovementManager:
 
         Thread-safe: the change is posted to the worker command queue.
         """
+        # Dedupe against the last REQUESTED state (the applied state lags one
+        # worker tick, so comparing against it can drop a genuine toggle).
         with self._shared_state_lock:
-            if self._shared_is_listening == listening:
+            if self._last_requested_listening == listening:
                 return
+            self._last_requested_listening = listening
         self._command_queue.put(("set_listening", listening))
 
     def _poll_signals(self, current_time: float) -> None:
@@ -355,6 +378,8 @@ class MovementManager:
             except Empty:
                 break
             self._handle_command(command, payload, current_time)
+
+        self._flush_pending_listening()
 
     def _apply_pending_offsets(self) -> None:
         """Apply the most recent speech offset update.
@@ -400,30 +425,52 @@ class MovementManager:
             self._breathing_active = False
             logger.info("Cleared move queue and stopped current move")
         elif command == "set_listening":
-            desired_state = bool(payload)
-            now = self._now()
-            if now - self._last_listening_toggle_time < self._listening_debounce_s:
-                return
-            self._last_listening_toggle_time = now
-
-            if self._is_listening == desired_state:
-                return
-
-            self._is_listening = desired_state
-            self._last_listening_blend_time = now
-            if desired_state:
-                # Freeze: snapshot current commanded antennas and reset blend
-                self._listening_antennas = (
-                    float(self._last_commanded_pose[1][0]),
-                    float(self._last_commanded_pose[1][1]),
-                )
-                self._antenna_unfreeze_blend = 0.0
-            else:
-                # Unfreeze: restart blending from frozen pose
-                self._antenna_unfreeze_blend = 0.0
-            self.state.update_activity()
+            self._request_listening(bool(payload))
         else:
             logger.warning("Unknown command received by MovementManager: %s", command)
+
+    def _request_listening(self, desired_state: bool) -> None:
+        """Apply a listening toggle, deferring (never dropping) it while debounced."""
+        now = self._now()
+        if now - self._last_listening_toggle_time < self._listening_debounce_s:
+            # Coalesce burst toggles to the LATEST requested state; it is
+            # applied by _flush_pending_listening once the window expires.
+            self._pending_listening_state = desired_state
+            return
+        self._pending_listening_state = None
+        self._apply_listening(desired_state, now)
+
+    def _flush_pending_listening(self) -> None:
+        """Apply a deferred listening toggle once the debounce window has expired."""
+        if self._pending_listening_state is None:
+            return
+        now = self._now()
+        if now - self._last_listening_toggle_time < self._listening_debounce_s:
+            return
+        desired_state = self._pending_listening_state
+        self._pending_listening_state = None
+        self._apply_listening(desired_state, now)
+
+    def _apply_listening(self, desired_state: bool, now: float) -> None:
+        """Immediately apply a listening state change (worker thread only)."""
+        self._last_listening_toggle_time = now
+
+        if self._is_listening == desired_state:
+            return
+
+        self._is_listening = desired_state
+        self._last_listening_blend_time = now
+        if desired_state:
+            # Freeze: snapshot current commanded antennas and reset blend
+            self._listening_antennas = (
+                float(self._last_commanded_pose[1][0]),
+                float(self._last_commanded_pose[1][1]),
+            )
+            self._antenna_unfreeze_blend = 0.0
+        else:
+            # Unfreeze: restart blending from frozen pose
+            self._antenna_unfreeze_blend = 0.0
+        self.state.update_activity()
 
     def _publish_shared_state(self) -> None:
         """Expose idle-related state for external threads."""

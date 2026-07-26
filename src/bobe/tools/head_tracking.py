@@ -22,9 +22,17 @@ class HeadTracking(Tool):
         """Enable or disable head tracking."""
         enable = bool(kwargs.get("start"))
 
+        if deps.camera_worker is None:
+            logger.warning("Tool call: head_tracking requested but camera is disabled")
+            return {"error": "camera is not available, so head tracking cannot be used"}
+
+        tracker = deps.camera_worker.head_tracker
+        if tracker is None or not getattr(tracker, "available", True):
+            logger.warning("Tool call: head_tracking requested but no head tracker is configured")
+            return {"error": "no head tracker is configured; the app must be launched with --head-tracker yolo or mediapipe"}
+
         # Update camera worker head tracking state
-        if deps.camera_worker is not None:
-            deps.camera_worker.set_head_tracking_enabled(enable)
+        deps.camera_worker.set_head_tracking_enabled(enable)
 
         status = "started" if enable else "stopped"
         logger.info("Tool call: head_tracking %s", status)

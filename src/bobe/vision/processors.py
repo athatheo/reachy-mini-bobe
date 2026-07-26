@@ -2,6 +2,7 @@ import os
 import time
 import base64
 import logging
+import threading
 from typing import Any, Dict
 from dataclasses import dataclass
 
@@ -67,6 +68,9 @@ class VisionProcessor:
         self.processor = None
         self.model = None
         self._initialized = False
+        # Serializes inference: concurrent model.generate calls on the same
+        # model instance corrupt state / crash on MPS and CUDA.
+        self._inference_lock = threading.Lock()
 
     def _determine_device(self) -> str:
         pref = self.vision_config.device_preference
@@ -130,72 +134,79 @@ class VisionProcessor:
 
         for attempt in range(self.vision_config.max_retries):
             try:
-                # Convert to JPEG bytes
-                success, jpeg_buffer = cv2.imencode(
-                    ".jpg",
-                    cv2_image,
-                    [cv2.IMWRITE_JPEG_QUALITY, self.vision_config.jpeg_quality],
-                )
-                if not success:
-                    return "Failed to encode image"
+                # Serialize encode+generate+decode: concurrent generate calls on
+                # one model instance are unsafe (Metal command-buffer assertions
+                # on MPS, interleaved cache state on CUDA/CPU).
+                with self._inference_lock:
+                    # Convert to JPEG bytes
+                    success, jpeg_buffer = cv2.imencode(
+                        ".jpg",
+                        cv2_image,
+                        [cv2.IMWRITE_JPEG_QUALITY, self.vision_config.jpeg_quality],
+                    )
+                    if not success:
+                        return "Failed to encode image"
 
-                # Convert to base64
-                image_base64 = base64.b64encode(jpeg_buffer.tobytes()).decode("utf-8")
+                    # Convert to base64
+                    image_base64 = base64.b64encode(jpeg_buffer.tobytes()).decode("utf-8")
 
-                messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "url": f"data:image/jpeg;base64,{image_base64}",
-                            },
-                            {"type": "text", "text": prompt},
-                        ],
-                    },
-                ]
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "url": f"data:image/jpeg;base64,{image_base64}",
+                                },
+                                {"type": "text", "text": prompt},
+                            ],
+                        },
+                    ]
 
-                inputs = self.processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                )
-
-                # Move tensors to device WITHOUT forcing dtype (keeps input_ids as torch.long)
-                inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
-
-                with torch.no_grad():
-                    generated_ids = self.model.generate(
-                        **inputs,
-                        do_sample=False,
-                        max_new_tokens=self.vision_config.max_new_tokens,
-                        pad_token_id=self.processor.tokenizer.eos_token_id,
+                    inputs = self.processor.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt",
                     )
 
-                generated_texts = self.processor.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True,
-                )
+                    # Move tensors to device WITHOUT forcing dtype (keeps input_ids as torch.long)
+                    inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
-                # Extract just the response part
-                full_text = generated_texts[0]
-                response = self._extract_response(full_text)
+                    with torch.no_grad():
+                        generated_ids = self.model.generate(
+                            **inputs,
+                            do_sample=False,
+                            max_new_tokens=self.vision_config.max_new_tokens,
+                            pad_token_id=self.processor.tokenizer.eos_token_id,
+                        )
 
-                # Clean up GPU memory if using CUDA
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
-                elif self.device == "mps":
-                    torch.mps.empty_cache()
+                    generated_texts = self.processor.batch_decode(
+                        generated_ids,
+                        skip_special_tokens=True,
+                    )
 
-                return response.replace(chr(10), " ").strip()
+                    # Extract just the response part
+                    full_text = generated_texts[0]
+                    response = self._extract_response(full_text)
+
+                    # Clean up GPU memory if using CUDA
+                    if self.device == "cuda":
+                        torch.cuda.empty_cache()
+                    elif self.device == "mps":
+                        torch.mps.empty_cache()
+
+                    return response.replace(chr(10), " ").strip()
 
             except Exception as e:
                 if _is_cuda_oom(e):
                     logger.error("CUDA OOM on attempt %d: %s", attempt + 1, e)
                     if self.device == "cuda":
-                        torch.cuda.empty_cache()
+                        # Re-acquire the lock so we don't yank memory from
+                        # under another in-flight inference.
+                        with self._inference_lock:
+                            torch.cuda.empty_cache()
                     if attempt < self.vision_config.max_retries - 1:
                         time.sleep(self.vision_config.retry_delay * (attempt + 1))
                     else:

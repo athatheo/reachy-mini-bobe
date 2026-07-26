@@ -11,6 +11,14 @@ from bobe.tools.core_tools import Tool, ToolDependencies
 logger = logging.getLogger(__name__)
 
 
+def _encode_frame_jpeg_b64(frame: Any) -> str:
+    """Encode a BGR frame to a base64 JPEG string (CPU-bound; run in a thread)."""
+    success, buffer = cv2.imencode('.jpg', frame)
+    if not success:
+        raise RuntimeError("Failed to encode frame as JPEG")
+    return base64.b64encode(buffer.tobytes()).decode("utf-8")
+
+
 class Camera(Tool):
     """Take a picture with the camera and ask a question about it."""
 
@@ -40,8 +48,8 @@ class Camera(Tool):
         if deps.camera_worker is not None:
             frame = deps.camera_worker.get_latest_frame()
             if frame is None:
-                logger.error("No frame available from camera worker")
-                return {"error": "No frame available"}
+                logger.error("No fresh frame available from camera worker")
+                return {"error": "No recent camera frame available; the camera may be stalled or disconnected"}
         else:
             logger.error("Camera worker not available")
             return {"error": "Camera worker not available"}
@@ -59,10 +67,8 @@ class Camera(Tool):
                 else {"error": "vision returned non-string"}
             )
 
-        # Encode image directly to JPEG bytes without writing to file
-        success, buffer = cv2.imencode('.jpg', frame)
-        if not success:
-            raise RuntimeError("Failed to encode frame as JPEG")
-
-        b64_encoded = base64.b64encode(buffer.tobytes()).decode("utf-8")
+        # Encode image directly to JPEG bytes without writing to file. Run in a
+        # worker thread: encoding a full frame takes tens of milliseconds and
+        # would otherwise stall the realtime audio event loop.
+        b64_encoded = await asyncio.to_thread(_encode_frame_jpeg_b64, frame)
         return {"b64_im": b64_encoded}

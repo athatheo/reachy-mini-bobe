@@ -1,6 +1,7 @@
 """Wake phrase matching for BoBe."""
 
 from __future__ import annotations
+import unicodedata
 
 
 WAKE_PHRASE = "hey bobe"
@@ -26,6 +27,9 @@ FALSE_WAKE_SUBSTRINGS: tuple[str, ...] = (
 
 def normalize_transcript(text: str) -> str:
     """Normalize ASR text for wake phrase comparison."""
+    # Recompose first: decomposed (NFD) accents are combining marks that the
+    # punctuation filter below would turn into spaces, splitting words apart.
+    text = unicodedata.normalize("NFKC", text)
     # Strip punctuation inside tokens too — Whisper often emits "Hey, Bobby."
     cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.casefold())
     return " ".join(cleaned.split())
@@ -50,7 +54,9 @@ def matches_wake_phrase(text: str, *, phrase: str = WAKE_PHRASE) -> bool:
     normalized = normalize_transcript(text)
     if not normalized:
         return False
-    wake = phrase.casefold().strip()
+    # Normalize the phrase side too — a punctuated custom phrase ("hey, bobe")
+    # could otherwise never match the punctuation-stripped transcript.
+    wake = normalize_transcript(phrase)
     if not wake:
         return False
     if normalized == wake or normalized.startswith(wake + " ") or f" {wake} " in f" {normalized} ":
@@ -58,7 +64,7 @@ def matches_wake_phrase(text: str, *, phrase: str = WAKE_PHRASE) -> bool:
     # Near-miss variants apply only for the default BoBe phrase.
     if wake == WAKE_PHRASE:
         for variant in WAKE_PHRASE_ASR_VARIANTS:
-            candidate = variant.casefold().strip()
+            candidate = normalize_transcript(variant)
             if not candidate:
                 continue
             if (
@@ -78,5 +84,7 @@ def matches_sleep_phrase(
     normalized = normalize_transcript(text)
     if not normalized:
         return False
-    candidates = (*phrases, *SLEEP_PHRASE_ASR_VARIANTS)
-    return any(phrase.casefold() in normalized for phrase in candidates if phrase.strip())
+    # Normalize the phrase side too so punctuated/decomposed custom phrases
+    # can match the normalized transcript.
+    candidates = (normalize_transcript(phrase) for phrase in (*phrases, *SLEEP_PHRASE_ASR_VARIANTS))
+    return any(candidate in normalized for candidate in candidates if candidate)

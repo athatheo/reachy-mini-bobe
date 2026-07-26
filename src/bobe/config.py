@@ -3,7 +3,7 @@ import sys
 import logging
 from pathlib import Path
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import dotenv_values
 
 
 # Locked profile: set to a profile name (e.g., "astronomer") to lock the app
@@ -85,17 +85,47 @@ if LOCKED_PROFILE is not None:
         print(f"Error: LOCKED_PROFILE '{LOCKED_PROFILE}' has no instructions.txt", file=sys.stderr)
         sys.exit(1)
 
+def _find_config_dotenv() -> Path | None:
+    """Locate the project .env anchored to the package/repo, never the launch CWD.
+
+    Searching upward from the CWD made the loaded config depend on where the
+    process was started (shell vs dashboard vs systemd). Only the packaged
+    directory and, for repo checkouts, the repo root are considered.
+    """
+    package_dir = Path(__file__).resolve().parent
+    candidates = [package_dir / ".env"]
+    if package_dir.parent.name == "src":
+        candidates.append(package_dir.parent.parent / ".env")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _apply_dotenv_values(dotenv_path: Path | str) -> None:
+    """Apply .env values without clobbering the process environment.
+
+    Values already exported in the environment win, and empty ``KEY=``
+    placeholder lines never erase exported values.
+    """
+    for key, value in dotenv_values(dotenv_path).items():
+        if value is None or not value.strip():
+            continue
+        if (os.environ.get(key) or "").strip():
+            continue
+        os.environ[key] = value
+
+
 _skip_dotenv = _env_flag("REACHY_MINI_SKIP_DOTENV", default=False)
 
 if _skip_dotenv:
     logger.info("Skipping .env loading because REACHY_MINI_SKIP_DOTENV is set")
 else:
-    # Locate .env file (search upward from current working directory)
-    dotenv_path = find_dotenv(usecwd=True)
+    # Locate .env file anchored to the package/repo (not the launch CWD)
+    dotenv_path = _find_config_dotenv()
 
     if dotenv_path:
-        # Load .env and override environment variables
-        load_dotenv(dotenv_path=dotenv_path, override=True)
+        _apply_dotenv_values(dotenv_path)
         logger.info(f"Configuration loaded from {dotenv_path}")
     else:
         logger.warning("No .env file found, using environment variables")

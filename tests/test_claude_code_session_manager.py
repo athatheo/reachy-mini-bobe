@@ -1,6 +1,8 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import json
+import time
+import threading
 import subprocess
 
 from bobe.wake_daemon import claude_session as session_module
@@ -139,6 +141,63 @@ def test_session_manager_times_out_and_clears_running(tmp_path, monkeypatch):
 
     assert result["ok"] is False
     assert result["error"] == "timeout"
+    assert manager.status()["running"] is False
+
+
+def test_session_manager_status_is_not_blocked_while_send_spawns(tmp_path, monkeypatch):
+    """status() must never wait on a lock held across the slow claude spawn."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+
+    def blocking_popen(args, **kwargs):
+        spawn_started.set()
+        assert release_spawn.wait(timeout=5)
+        return FakeProcess(json.dumps({"result": "done"}))
+
+    manager = ClaudeCodeSessionManager(WakeDaemonConfig(token="wake-token"), popen_factory=blocking_popen)
+    worker = threading.Thread(target=lambda: manager.send("task"))
+    worker.start()
+    try:
+        assert spawn_started.wait(timeout=5)
+        started = time.monotonic()
+        status = manager.status()
+        elapsed = time.monotonic() - started
+    finally:
+        release_spawn.set()
+        worker.join(timeout=5)
+
+    assert status["ok"] is True
+    assert status["running"] is True
+    assert elapsed < 1.0
+
+
+def test_session_manager_send_aborts_when_stopped_during_spawn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+
+    def blocking_popen(args, **kwargs):
+        spawn_started.set()
+        assert release_spawn.wait(timeout=5)
+        process = FakeProcess(json.dumps({"result": "done"}))
+        process.pid = 0  # keep the abort path away from os.killpg
+        return process
+
+    manager = ClaudeCodeSessionManager(WakeDaemonConfig(token="wake-token"), popen_factory=blocking_popen)
+    results: list[dict] = []
+    worker = threading.Thread(target=lambda: results.append(manager.send("task")))
+    worker.start()
+    assert spawn_started.wait(timeout=5)
+    stop_result = manager.stop()
+    release_spawn.set()
+    worker.join(timeout=5)
+
+    assert stop_result["ok"] is True
+    assert results[0]["ok"] is False
+    assert results[0]["error"] == "stopped"
     assert manager.status()["running"] is False
 
 

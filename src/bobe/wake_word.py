@@ -190,6 +190,11 @@ def wake_detector_error(config: WakeConfig) -> str | None:
     if backend == "remote":
         if not config.remote_url:
             return "BOBE_WAKE_REMOTE_URL is required when BOBE_WAKE_BACKEND=remote"
+        if not config.remote_token:
+            # The daemon refuses to start without a token and closes token-less
+            # handshakes with 1008, so a missing token can never connect —
+            # surface it here instead of reconnect-looping forever.
+            return "BOBE_WAKE_TOKEN is required when BOBE_WAKE_BACKEND=remote"
         return None
     return f"Unknown wake backend {backend!r}; wake-word detection disabled"
 

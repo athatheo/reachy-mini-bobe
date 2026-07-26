@@ -5,17 +5,24 @@ import hmac
 import time
 import asyncio
 import logging
+import threading
+from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from bobe.wake.phrases import matches_wake_phrase
 from bobe.wake.protocol import parse_json, wake_message, ready_message, sleep_message, stats_message
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake_daemon.config import WakeDaemonConfig, load_wake_daemon_config
-from bobe.wake_daemon.engine import WhisperWakeEngine, WhisperWakeSession, whisper_engine_key
-from bobe.wake.phrases import matches_wake_phrase
+from bobe.wake_daemon.engine import (
+    WhisperWakeEngine,
+    WhisperWakeSession,
+    whisper_engine_key,
+    warn_if_phrases_unsupported,
+)
 from bobe.wake_daemon.launcher import ClaudeCodeLauncher
 from bobe.wake_daemon.claude_session import ClaudeCodeSessionManager
 
@@ -28,6 +35,7 @@ _CLAUDE_CODE_ERROR_STATUS = {
     "disabled": 403,
     "empty_command": 400,
     "invalid_config": 400,
+    "stopped": 409,
 }
 
 
@@ -36,11 +44,8 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
     runtime = config or load_wake_daemon_config()
     if not (runtime.token or "").strip():
         raise ValueError("BOBE_WAKE_TOKEN must be set to a non-empty value")
-    app = FastAPI(title="BoBe Wake Daemon", version="0.1.0")
+    warn_if_phrases_unsupported(runtime)
     engines: dict[tuple[str, str, str, str | None, str | None], WhisperWakeEngine] = {}
-    app.state.wake_engines = engines
-    app.state.claude_code_launcher = ClaudeCodeLauncher(runtime)
-    app.state.claude_code_session_manager = ClaudeCodeSessionManager(runtime)
 
     def shared_engine() -> WhisperWakeEngine:
         key = whisper_engine_key(runtime)
@@ -49,6 +54,27 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
             engine = WhisperWakeEngine(runtime)
             engines[key] = engine
         return engine
+
+    def preload_whisper_model() -> None:
+        try:
+            shared_engine().preload()
+        except Exception:
+            logger.exception("Whisper model preload failed; the first utterance will retry the load")
+
+    @asynccontextmanager
+    async def lifespan(started_app: FastAPI):
+        # Preload in a background thread so the first wake never pays the
+        # model-load cost; the engine's load lock makes early feeds wait for
+        # this thread instead of loading a second model.
+        preload_thread = threading.Thread(target=preload_whisper_model, name="whisper-preload", daemon=True)
+        started_app.state.whisper_preload_thread = preload_thread
+        preload_thread.start()
+        yield
+
+    app = FastAPI(title="BoBe Wake Daemon", version="0.1.0", lifespan=lifespan)
+    app.state.wake_engines = engines
+    app.state.claude_code_launcher = ClaudeCodeLauncher(runtime)
+    app.state.claude_code_session_manager = ClaudeCodeSessionManager(runtime)
 
     @app.get("/status")
     def status() -> JSONResponse:
@@ -120,7 +146,10 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         if auth_error is not None:
             return auth_error
         manager: ClaudeCodeSessionManager = app.state.claude_code_session_manager
-        return JSONResponse(manager.status())
+        # Off the event loop: even a short manager lock acquire must not stall
+        # the wake stream if a command thread is mid-critical-section.
+        result = await asyncio.to_thread(manager.status)
+        return JSONResponse(result)
 
     @app.post("/v1/claude-code/session/stop")
     async def stop_claude_code_session(request: Request) -> JSONResponse:
@@ -166,7 +195,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 await websocket.close(code=1003)
                 return
             hello_token = str(hello.get("token") or "").strip()
-            if hello_token != runtime.token:
+            if not hello_token or not hmac.compare_digest(hello_token, runtime.token or ""):
                 logger.warning("Rejected wake stream with missing or invalid token")
                 await websocket.close(code=1008)
                 return

@@ -6,7 +6,7 @@ import shutil
 import logging
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from bobe.config import config
 
@@ -55,13 +55,21 @@ def _migrate_legacy_env(instance_dir: Path) -> None:
 
 
 def load_instance_env(instance_path: Path | str | None) -> Path | None:
-    """Load ``instance_path/.env`` into the process environment."""
+    """Load ``instance_path/.env`` into the process environment.
+
+    Non-empty values override the process environment (persisted settings are
+    explicit user intent), but empty ``KEY=`` placeholder lines are skipped so
+    they can never erase live values.
+    """
     if not instance_path:
         return None
     env_path = Path(instance_path) / ".env"
     if not env_path.exists():
         return None
-    load_dotenv(dotenv_path=str(env_path), override=True)
+    for key, value in dotenv_values(str(env_path)).items():
+        if value is None or not value.strip():
+            continue
+        os.environ[key] = value
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     if openai_key:
         config.OPENAI_API_KEY = openai_key

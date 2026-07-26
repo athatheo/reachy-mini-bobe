@@ -84,23 +84,52 @@ def deploy_robot_app(robot_host: str, app_name: str = "bobe", space_id: str = "a
     _request("POST", f"http://{robot_host}:8000/api/apps/start-app/{app_name}")
 
 
-def configure_remote_wake(robot_host: str, mac_host: str, token: str, port: int = 8765) -> None:
-    remote_url = f"ws://{mac_host}:{port}/v1/stream"
+def _fetch_wake_status(robot_host: str) -> dict:
+    """Best-effort read of the robot's current wake config from /status."""
+    try:
+        return _request("GET", f"http://{robot_host}:7860/status", timeout=10) or {}
+    except Exception:
+        return {}
+
+
+def configure_remote_wake(
+    robot_host: str,
+    mac_host: str | None,
+    token: str,
+    port: int = 8765,
+    gain: float | None = None,
+) -> None:
+    """POST /wake-config, overriding only what the operator explicitly passed.
+
+    Fields omitted from the payload are preserved server-side, so a deploy
+    never silently resets the robot's tuned gain or repoints its daemon URL.
+    """
+    status = _fetch_wake_status(robot_host)
+    current_url = status.get("wake_remote_url")
+    current_gain = (status.get("wake_debug") or {}).get("gain")
+
+    payload: dict = {"backend": "remote", "token": token}
+    if mac_host:
+        payload["remote_url"] = f"ws://{mac_host}:{port}/v1/stream"
+    elif current_url:
+        print(f"Keeping current wake URL: {current_url}")
+    else:
+        print("No current wake URL reported; pass --mac-host to set one.")
+    if gain is not None:
+        payload["gain"] = gain
+    elif current_gain is not None:
+        print(f"Keeping current wake gain: {current_gain}")
+
     deadline = time.time() + 120
     while time.time() < deadline:
         try:
             _request(
                 "POST",
                 f"http://{robot_host}:7860/wake-config",
-                {
-                    "backend": "remote",
-                    "remote_url": remote_url,
-                    "token": token,
-                    "gain": 1.75,
-                },
+                payload,
                 timeout=10,
             )
-            print(f"Configured wake-config: {remote_url}")
+            print(f"Configured wake-config: {payload.get('remote_url') or current_url or '(URL unchanged)'}")
             return
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -119,8 +148,18 @@ def restart_robot_app(robot_host: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Deploy BoBe and configure remote wake on Reachy")
     parser.add_argument("--robot-host", default="192.168.1.117")
-    parser.add_argument("--mac-host", default="Mac.local")
+    parser.add_argument(
+        "--mac-host",
+        default=None,
+        help="Wake daemon host to point the robot at (default: keep the robot's current URL)",
+    )
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--gain",
+        type=float,
+        default=None,
+        help="Wake mic gain override (default: keep the robot's current tuned gain)",
+    )
     parser.add_argument("--daemon-env", type=Path, default=Path("config/wake-daemon.env"))
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--skip-configure", action="store_true")
@@ -130,7 +169,7 @@ def main() -> None:
     if not args.skip_deploy:
         deploy_robot_app(args.robot_host)
     if not args.skip_configure:
-        configure_remote_wake(args.robot_host, args.mac_host, token, args.port)
+        configure_remote_wake(args.robot_host, args.mac_host, token, args.port, gain=args.gain)
         restart_robot_app(args.robot_host)
     print("Done.")
 

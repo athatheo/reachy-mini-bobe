@@ -49,6 +49,7 @@ class ClaudeCodeSessionManager:
         self._last_activity_at: float | None = None
         self._last_result: dict[str, Any] | None = None
         self._active_process: subprocess.Popen[str] | None = None
+        self._spawning = False
 
     def start(self) -> dict[str, Any]:
         """Create a daemon-owned Claude Code session id without sending a prompt."""
@@ -68,7 +69,7 @@ class ClaudeCodeSessionManager:
                 "ok": True,
                 "session_id": self._session_id,
                 "workdir": settings.workdir,
-                "running": self._active_process is not None,
+                "running": self._active_process is not None or self._spawning,
             }
 
     def send(self, command: str) -> dict[str, Any]:
@@ -83,21 +84,28 @@ class ClaudeCodeSessionManager:
         settings = self._settings()
 
         with self._lock:
-            if self._active_process is not None:
+            if self._active_process is not None or self._spawning:
                 return {"ok": False, "error": "busy"}
             session_id = self._session_id
             assert session_id is not None
-            args = [
-                settings.binary,
-                "-p",
-                "--session-id",
-                session_id,
-                "--output-format",
-                "json",
-                "--permission-mode",
-                settings.permission_mode,
-                clean_command,
-            ]
+            self._spawning = True
+            self._last_activity_at = self._clock()
+
+        args = [
+            settings.binary,
+            "-p",
+            "--session-id",
+            session_id,
+            "--output-format",
+            "json",
+            "--permission-mode",
+            settings.permission_mode,
+            clean_command,
+        ]
+        # Spawn outside the lock: fork/exec of the claude CLI can take seconds,
+        # and status() (served from the daemon event loop) must never wait on a
+        # lock held across it.
+        try:
             process = self._popen_factory(
                 args,
                 cwd=settings.workdir,
@@ -106,8 +114,21 @@ class ClaudeCodeSessionManager:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
-            self._active_process = process
-            self._last_activity_at = self._clock()
+        except Exception:
+            with self._lock:
+                self._spawning = False
+            raise
+
+        with self._lock:
+            self._spawning = False
+            stopped_while_spawning = self._session_id != session_id
+            if not stopped_while_spawning:
+                self._active_process = process
+                self._last_activity_at = self._clock()
+        if stopped_while_spawning:
+            # stop() raced the spawn; don't run the command under a dead session.
+            _terminate_process_group(process)
+            return {"ok": False, "error": "stopped"}
 
         try:
             stdout, stderr = process.communicate(timeout=settings.command_timeout_s)
@@ -141,13 +162,13 @@ class ClaudeCodeSessionManager:
             }
 
     def status(self) -> dict[str, Any]:
-        """Return current managed session status."""
+        """Return current managed session status (never blocks on a running command)."""
         with self._lock:
             return {
                 "ok": True,
                 "active": self._session_id is not None,
                 "session_id": self._session_id,
-                "running": self._active_process is not None,
+                "running": self._active_process is not None or self._spawning,
                 "started_at": self._started_at,
                 "last_activity_at": self._last_activity_at,
                 "last_result": self._last_result,

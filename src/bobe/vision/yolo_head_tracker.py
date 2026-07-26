@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 class HeadTracker:
     """Lightweight head tracker using YOLO for face detection."""
 
+    # Consumes OpenCV-native BGR frames directly (no RGB conversion needed).
+    expects_rgb = False
+
     def __init__(
         self,
         model_repo: str = "AdamCodd/YOLOv11n-face-detection",
@@ -31,6 +34,10 @@ class HeadTracker:
     ) -> None:
         """Initialize YOLO-based head tracker.
 
+        If the model cannot be downloaded/loaded (e.g. no internet and an empty
+        HuggingFace cache at startup), the tracker degrades to a no-op instead
+        of raising, so the app can still start with tracking disabled.
+
         Args:
             model_repo: HuggingFace model repository
             model_filename: Model file name
@@ -39,15 +46,20 @@ class HeadTracker:
 
         """
         self.confidence_threshold = confidence_threshold
+        self.model: YOLO | None = None
 
         try:
-            # Download and load YOLO model
+            # Download and load YOLO model (blocking; may hit the network)
             model_path = hf_hub_download(repo_id=model_repo, filename=model_filename)
             self.model = YOLO(model_path).to(device)
             logger.info(f"YOLO face detection model loaded from {model_repo}")
         except Exception as e:
-            logger.error(f"Failed to load YOLO model: {e}")
-            raise
+            logger.error(f"Failed to load YOLO model ({e}); head tracking disabled")
+
+    @property
+    def available(self) -> bool:
+        """Whether the tracker loaded successfully and can detect faces."""
+        return self.model is not None
 
     def _select_best_face(self, detections: Detections) -> int | None:
         """Select the best face based on confidence and area (largest face with highest confidence).
@@ -116,6 +128,9 @@ class HeadTracker:
             Tuple of (eye_center [-1,1], roll_angle)
 
         """
+        if self.model is None:
+            return None, None
+
         h, w = img.shape[:2]
 
         try:

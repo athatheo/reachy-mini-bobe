@@ -42,12 +42,12 @@ class ApiSettingsPayload(BaseModel):
 
 
 class WakeConfigPayload(BaseModel):
-    """POST /wake-config payload."""
+    """POST /wake-config payload. Omitted remote_url/gain preserve the current values."""
 
     backend: str = "remote"
-    remote_url: str
+    remote_url: str | None = None
     token: str
-    gain: float = 1.75
+    gain: float | None = None
 
 
 _settings_server: SettingsUIServer | None = None
@@ -142,18 +142,20 @@ class SettingsUIServer:
 
         @app.post("/wake-config")
         def _wake_config(payload: Annotated[WakeConfigPayload, Body()]) -> JSONResponse:
-            remote_url = (payload.remote_url or "").strip()
             token = (payload.token or "").strip()
             backend = (payload.backend or "remote").strip().lower()
             if backend != "remote":
                 return JSONResponse({"ok": False, "error": "unsupported_backend"}, status_code=400)
-            if not remote_url.startswith("ws://") and not remote_url.startswith("wss://"):
-                return JSONResponse({"ok": False, "error": "invalid_remote_url"}, status_code=400)
-            ws_scheme = "http://" if remote_url.startswith("ws://") else "https://"
-            ws_path = remote_url.split("://", 1)[1]
-            hostname = urlparse(ws_scheme + ws_path).hostname
-            if not hostname or not is_wake_remote_host_allowed(hostname):
-                return JSONResponse({"ok": False, "error": "remote_host_not_allowed"}, status_code=400)
+            remote_url: str | None = None
+            if payload.remote_url is not None:
+                remote_url = payload.remote_url.strip()
+                if not remote_url.startswith("ws://") and not remote_url.startswith("wss://"):
+                    return JSONResponse({"ok": False, "error": "invalid_remote_url"}, status_code=400)
+                ws_scheme = "http://" if remote_url.startswith("ws://") else "https://"
+                ws_path = remote_url.split("://", 1)[1]
+                hostname = urlparse(ws_scheme + ws_path).hostname
+                if not hostname or not is_wake_remote_host_allowed(hostname):
+                    return JSONResponse({"ok": False, "error": "remote_host_not_allowed"}, status_code=400)
             if not token:
                 return JSONResponse({"ok": False, "error": "missing_token"}, status_code=400)
             if self.instance_path is None:
@@ -164,7 +166,7 @@ class SettingsUIServer:
                     backend=backend,
                     remote_url=remote_url,
                     token=token,
-                    gain=max(1.0, float(payload.gain)),
+                    gain=max(1.0, float(payload.gain)) if payload.gain is not None else None,
                 )
             except Exception as exc:
                 logger.warning("Failed to persist wake config: %s", exc)
