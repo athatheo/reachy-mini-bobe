@@ -54,11 +54,30 @@ class HeadWobbler:
         logger.debug("Head wobbler started")
 
     def stop(self) -> None:
-        """Stop the head wobbler loop."""
+        """Stop the head wobbler loop.
+
+        The join is bounded so a worker mid-blocking-work can never hang the
+        shutdown path (the worker is a daemon thread anyway).
+        """
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                logger.warning("Head wobbler thread did not stop within 2s; continuing shutdown")
         logger.debug("Head wobbler stopped")
+
+    def _sleep_until(self, target_monotonic: float) -> bool:
+        """Sleep until ``target_monotonic`` in short slices.
+
+        Returns True if stop was requested while waiting so callers can bail
+        out instead of pacing through the remainder of the current chunk.
+        """
+        while True:
+            remaining = target_monotonic - time.monotonic()
+            if remaining <= 0.0:
+                return self._stop_event.is_set()
+            if self._stop_event.wait(min(remaining, 0.05)):
+                return True
 
     def working_loop(self) -> None:
         """Convert audio deltas into head movement offsets."""
@@ -70,8 +89,8 @@ class HeadWobbler:
             try:
                 chunk_generation, sr, chunk = queue_ref.get_nowait()  # (gen, sr, data)
             except queue.Empty:
-                # avoid while to never exit
-                time.sleep(MOVEMENT_LATENCY_S)
+                # avoid while to never exit; wake immediately on stop
+                self._stop_event.wait(MOVEMENT_LATENCY_S)
                 continue
 
             try:
@@ -118,7 +137,8 @@ class HeadWobbler:
                             continue
 
                     if target > now:
-                        time.sleep(target - now)
+                        if self._sleep_until(target):
+                            break
                         with self._state_lock:
                             if self._generation != current_generation:
                                 break
@@ -166,6 +186,11 @@ class HeadWobbler:
 
         with self._sway_lock:
             self.sway.reset()
+
+        # Push a neutral snapshot to the movement manager so the head does not
+        # stay frozen mid-sway after a barge-in or tool call (offsets are only
+        # updated when a new snapshot is applied).
+        self._apply_offsets((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
         if drained_any:
             logger.debug("Head wobbler queue drained during reset")

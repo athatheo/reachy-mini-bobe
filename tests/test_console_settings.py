@@ -1,6 +1,7 @@
 # ruff: noqa: D101,D102,D103,D107
 
 import os
+import threading
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -8,8 +9,21 @@ from fastapi.testclient import TestClient
 
 from bobe.config import config
 from bobe.console import LocalStream
-from bobe.env_file import persist_api_settings, is_plausible_openai_key, is_plausible_anthropic_key
+from bobe.env_file import (
+    persist_api_settings,
+    is_plausible_openai_key,
+    is_plausible_anthropic_key,
+    read_env_lines,
+    upsert_env_keys,
+)
+from bobe.wake_env import REMOTE_WAKE_KEYS, persist_wake_env
 from bobe.settings_server import SettingsUIServer, _redact_wake_debug_for_public
+
+
+def _clear_wake_env(monkeypatch) -> None:
+    """Unset wake env vars, registering restoration for values set by code under test."""
+    for key in REMOTE_WAKE_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_persist_api_settings_writes_explicit_provider_keys(tmp_path, monkeypatch):
@@ -34,6 +48,79 @@ def test_persist_api_settings_writes_explicit_provider_keys(tmp_path, monkeypatc
     assert "OPENAI_API_KEY=sk-proj-test-openai-key" in env_text
     assert "ANTHROPIC_API_KEY=sk-ant-test-anthropic-key" in env_text
     assert "CLAUDE_MODEL=claude-test" in env_text
+
+
+def test_persist_api_settings_does_not_bake_template_lines(tmp_path, monkeypatch):
+    """A missing instance .env must not be seeded from .env.example templates."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+    monkeypatch.setattr(config, "OPENAI_API_KEY", None)
+    (tmp_path / ".env.example").write_text(
+        "BOBE_WAKE_TOKEN=\nBOBE_WAKE_GAIN=1.75\nHF_TOKEN=\n", encoding="utf-8"
+    )
+
+    persist_api_settings(
+        str(tmp_path),
+        openai_api_key="sk-proj-test-openai-key",
+        anthropic_api_key="sk-ant-test-anthropic-key",
+        claude_model="claude-test",
+    )
+
+    env_text = (tmp_path / ".env").read_text()
+    assert "BOBE_WAKE_TOKEN" not in env_text
+    assert "BOBE_WAKE_GAIN" not in env_text
+    assert "HF_TOKEN" not in env_text
+    assert "OPENAI_API_KEY=sk-proj-test-openai-key" in env_text
+
+
+def test_read_env_lines_missing_file_ignores_templates(tmp_path):
+    (tmp_path / ".env.example").write_text("OPENAI_API_KEY=\nBOBE_WAKE_GAIN=1.75\n", encoding="utf-8")
+    assert read_env_lines(tmp_path / ".env") == []
+
+
+def test_upsert_env_keys_skips_empty_values():
+    lines = ["BOBE_WAKE_TOKEN=live-token"]
+    upsert_env_keys(lines, {"BOBE_WAKE_TOKEN": "", "OPENAI_API_KEY": " "})
+    assert lines == ["BOBE_WAKE_TOKEN=live-token"]
+
+
+def test_concurrent_api_and_wake_persist_keep_both_key_sets(tmp_path, monkeypatch):
+    """Serialized read-modify-write: neither writer may drop the other's keys."""
+    _clear_wake_env(monkeypatch)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+    monkeypatch.setattr(config, "OPENAI_API_KEY", None)
+
+    def write_api() -> None:
+        for _ in range(20):
+            persist_api_settings(
+                str(tmp_path),
+                openai_api_key="sk-proj-test-openai-key",
+                anthropic_api_key="sk-ant-test-anthropic-key",
+                claude_model="claude-test",
+            )
+
+    def write_wake() -> None:
+        for _ in range(20):
+            persist_wake_env(
+                tmp_path,
+                remote_url="ws://192.168.1.114:8765/v1/stream",
+                token="secret-token",
+            )
+
+    threads = [threading.Thread(target=write_api), threading.Thread(target=write_wake)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=sk-proj-test-openai-key" in env_text
+    assert "ANTHROPIC_API_KEY=sk-ant-test-anthropic-key" in env_text
+    assert "BOBE_WAKE_TOKEN=secret-token" in env_text
+    assert "BOBE_WAKE_REMOTE_URL=ws://192.168.1.114:8765/v1/stream" in env_text
 
 
 def test_required_api_keys_configured_requires_both_keys(monkeypatch):
@@ -159,6 +246,7 @@ def test_wake_config_rejects_disallowed_host(tmp_path, monkeypatch):
 
 
 def test_wake_config_accepts_allowed_host(tmp_path, monkeypatch):
+    _clear_wake_env(monkeypatch)
     monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "192.168.1.114")
     client, _ = _settings_client(tmp_path, monkeypatch)
     resp = client.post(
@@ -172,3 +260,52 @@ def test_wake_config_accepts_allowed_host(tmp_path, monkeypatch):
     )
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
+
+
+def test_wake_config_omitted_gain_and_url_preserve_tuned_values(tmp_path, monkeypatch):
+    """POST /wake-config without gain/remote_url must not reset the tuned config."""
+    _clear_wake_env(monkeypatch)
+    (tmp_path / ".env").write_text(
+        "BOBE_WAKE_REMOTE_URL=ws://192.168.1.172:8765/v1/stream\nBOBE_WAKE_GAIN=1.1\n",
+        encoding="utf-8",
+    )
+    client, _ = _settings_client(tmp_path, monkeypatch)
+    resp = client.post("/wake-config", json={"backend": "remote", "token": "secret-token"})
+    assert resp.status_code == 200
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "BOBE_WAKE_REMOTE_URL=ws://192.168.1.172:8765/v1/stream" in env_text
+    assert "BOBE_WAKE_GAIN=1.1" in env_text
+    assert "BOBE_WAKE_TOKEN=secret-token" in env_text
+
+
+def test_wake_config_persists_allowlist_with_accepted_host(tmp_path, monkeypatch):
+    """The just-validated hostname is persisted so the allowlist never reverts."""
+    _clear_wake_env(monkeypatch)
+    monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "192.168.1.114")
+    client, _ = _settings_client(tmp_path, monkeypatch)
+    resp = client.post(
+        "/wake-config",
+        json={
+            "backend": "remote",
+            "remote_url": "ws://192.168.1.114:8765/v1/stream",
+            "token": "secret-token",
+        },
+    )
+    assert resp.status_code == 200
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    hosts_line = next(
+        line for line in env_text.splitlines() if line.startswith("BOBE_WAKE_ALLOWED_HOSTS=")
+    )
+    assert "192.168.1.114" in hosts_line
+
+
+def test_wake_config_still_validates_provided_url(tmp_path, monkeypatch):
+    _clear_wake_env(monkeypatch)
+    monkeypatch.setenv("BOBE_WAKE_ALLOWED_HOSTS", "192.168.1.114")
+    client, _ = _settings_client(tmp_path, monkeypatch)
+    resp = client.post(
+        "/wake-config",
+        json={"backend": "remote", "remote_url": "http://192.168.1.114:8765", "token": "secret-token"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "invalid_remote_url"

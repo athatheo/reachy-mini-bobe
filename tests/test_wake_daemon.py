@@ -493,6 +493,50 @@ def test_claude_code_session_send_endpoint_passes_command():
     assert manager.commands == ["run tests"]
 
 
+def test_claude_code_session_send_endpoint_returns_202_for_accepted_command():
+    from bobe.wake_daemon.server import create_app
+
+    class FakeManager:
+        def send(self, command):
+            return {"ok": True, "accepted": True, "running": True, "session_id": "session-1"}
+
+    app = create_app(_claude_code_launch_config())
+    app.state.claude_code_session_manager = FakeManager()
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/claude-code/session/send",
+        headers={"X-BoBe-Launch-Token": "launch-token"},
+        json={"command": "run tests"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["accepted"] is True
+
+
+def test_wake_daemon_lifespan_shuts_down_claude_session_manager(monkeypatch):
+    """Daemon shutdown must terminate any active claude command (finding #25)."""
+    from bobe.wake_daemon.server import create_app
+
+    monkeypatch.setattr(WhisperWakeEngine, "preload", lambda self: None)
+
+    class FakeManager:
+        def __init__(self):
+            self.shutdowns = 0
+
+        def shutdown(self):
+            self.shutdowns += 1
+
+    app = create_app(load_wake_daemon_config(_TEST_ENV))
+    manager = FakeManager()
+    app.state.claude_code_session_manager = manager
+
+    with TestClient(app):
+        pass
+
+    assert manager.shutdowns == 1
+
+
 def test_claude_code_session_send_endpoint_rejects_empty_command():
     from bobe.wake_daemon.server import create_app
 

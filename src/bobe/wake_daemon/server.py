@@ -35,6 +35,7 @@ _CLAUDE_CODE_ERROR_STATUS = {
     "disabled": 403,
     "empty_command": 400,
     "invalid_config": 400,
+    "no_session": 409,
     "stopped": 409,
 }
 
@@ -69,7 +70,14 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         preload_thread = threading.Thread(target=preload_whisper_model, name="whisper-preload", daemon=True)
         started_app.state.whisper_preload_thread = preload_thread
         preload_thread.start()
-        yield
+        try:
+            yield
+        finally:
+            # Never orphan an active `claude -p` past daemon shutdown: kill its
+            # process group and reap the waiter so exit is prompt.
+            manager_shutdown = getattr(started_app.state.claude_code_session_manager, "shutdown", None)
+            if callable(manager_shutdown):
+                await asyncio.to_thread(manager_shutdown)
 
     app = FastAPI(title="BoBe Wake Daemon", version="0.1.0", lifespan=lifespan)
     app.state.wake_engines = engines
@@ -102,7 +110,9 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
 
     def response_for_result(result: dict[str, object]) -> JSONResponse:
         if result.get("ok"):
-            return JSONResponse(result)
+            # Accepted-but-still-running commands are 202-style: the result is
+            # retrievable later via /session/status.
+            return JSONResponse(result, status_code=202 if result.get("accepted") else 200)
 
         error = str(result.get("error") or "")
         status_code = _CLAUDE_CODE_ERROR_STATUS.get(error, 500)

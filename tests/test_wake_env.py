@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from bobe.wake_env import (
@@ -71,8 +72,6 @@ def test_persist_wake_env_preserves_tuned_gain_and_url(tmp_path: Path, monkeypat
     assert "BOBE_WAKE_REMOTE_URL=ws://192.168.1.172:8765/v1/stream" in text
     assert "BOBE_WAKE_GAIN=1.1" in text
     assert "BOBE_WAKE_TOKEN=new-token" in text
-    import os
-
     assert os.getenv("BOBE_WAKE_REMOTE_URL") is None
     assert os.getenv("BOBE_WAKE_GAIN") is None
 
@@ -142,8 +141,6 @@ def test_merge_packaged_wake_defaults_respects_live_env(tmp_path: Path, monkeypa
     env_file = tmp_path / ".env"
     text = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
     assert "BOBE_WAKE_GAIN=1.75" not in text
-    import os
-
     assert os.environ["BOBE_WAKE_GAIN"] == "1.1"
 
 

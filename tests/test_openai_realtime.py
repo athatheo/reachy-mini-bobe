@@ -25,12 +25,146 @@ from bobe.claude_code_session import (
 from bobe.tools.background_tool_manager import ToolCallRoutine
 
 
+# ---- Session supervisor fakes / helpers ----
+
+
+class SupervisorFakeConn:
+    """Realtime connection stub whose iteration behavior is scripted by ``mode``.
+
+    Modes:
+    - "clean": ends iteration immediately (graceful server close).
+    - "hold": stays connected until close()/server_close() is called.
+    - "iter_fail": raises ``fail_exc`` on the first iteration.
+    - "update_fail": session.update raises RuntimeError.
+    """
+
+    def __init__(self, mode: str, fail_exc: type[Exception] = RuntimeError) -> None:
+        """Initialize the stub with a scripted mode."""
+        self.mode = mode
+        self.fail_exc = fail_exc
+        self.closed = asyncio.Event()
+        self.response_creates: list[dict[str, Any]] = []
+        outer = self
+
+        class _Session:
+            async def update(self, **_kw: Any) -> None:
+                if outer.mode == "update_fail":
+                    raise RuntimeError("session.update failed (simulated)")
+
+        class _InputAudioBuffer:
+            async def append(self, **_kw: Any) -> None:
+                return None
+
+            async def clear(self) -> None:
+                return None
+
+        class _Item:
+            async def create(self, **_kw: Any) -> None:
+                return None
+
+        class _Conversation:
+            item = _Item()
+
+        class _Response:
+            async def create(self, **kw: Any) -> None:
+                outer.response_creates.append(kw)
+
+            async def cancel(self, **_kw: Any) -> None:
+                return None
+
+        self.session = _Session()
+        self.input_audio_buffer = _InputAudioBuffer()
+        self.conversation = _Conversation()
+        self.response = _Response()
+
+    async def __aenter__(self) -> "SupervisorFakeConn":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    async def close(self) -> None:
+        """End iteration as if the connection was closed locally."""
+        self.closed.set()
+
+    def server_close(self) -> None:
+        """End iteration as if the server closed the websocket cleanly."""
+        self.closed.set()
+
+    def __aiter__(self) -> "SupervisorFakeConn":
+        return self
+
+    async def __anext__(self) -> None:
+        if self.mode == "iter_fail":
+            raise self.fail_exc("abrupt close (simulated)")
+        if self.mode == "clean":
+            raise StopAsyncIteration
+        await self.closed.wait()
+        raise StopAsyncIteration
+
+
+def _install_supervisor_fakes(
+    monkeypatch: Any,
+    conn_modes: list[str],
+    fail_exc: type[Exception] = RuntimeError,
+) -> dict[str, Any]:
+    """Patch AsyncOpenAI so the Nth connect() yields a SupervisorFakeConn(conn_modes[N]).
+
+    Connects beyond the scripted list default to "hold". Also patches prompt
+    loaders and shrinks the retry backoff so supervised retries run instantly.
+    Returns a state dict with the connect count and created connections.
+    """
+    state: dict[str, Any] = {"connects": 0, "conns": []}
+
+    class _FakeRealtime:
+        def connect(self, **_kw: Any) -> SupervisorFakeConn:
+            index = state["connects"]
+            state["connects"] += 1
+            mode = conn_modes[index] if index < len(conn_modes) else "hold"
+            conn = SupervisorFakeConn(mode, fail_exc=fail_exc)
+            state["conns"].append(conn)
+            return conn
+
+    class _FakeClient:
+        def __init__(self, **_kw: Any) -> None:
+            self.realtime = _FakeRealtime()
+
+    monkeypatch.setattr(rt_mod, "AsyncOpenAI", _FakeClient)
+    monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
+    monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
+    monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(rt_mod, "_MAX_SESSION_RETRY_DELAY_S", 0.01)
+    return state
+
+
+async def _wait_until(predicate: Any, timeout: float = 2.0) -> None:
+    """Poll ``predicate`` until it is truthy or ``timeout`` elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met within timeout")
+
+
+async def _finish_supervisor(handler: Any, startup_task: "asyncio.Task[None]") -> None:
+    """Shut the handler down and reap the start_up supervisor task."""
+    await handler.shutdown()
+    if not startup_task.done():
+        startup_task.cancel()
+    try:
+        await startup_task
+    except asyncio.CancelledError:
+        pass
+
+
 @pytest.mark.asyncio
 async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -> None:
     """First connection dies with ConnectionClosedError during iteration -> retried.
 
-    Second connection iterates cleanly (no events) -> start_up returns without raising.
-    Ensures handler clears self.connection at the end.
+    The second connection iterates cleanly; the supervisor then stays alive
+    (parked, waiting for a restart request) and the finished session clears
+    self.connection itself.
     """
     caplog.set_level(logging.WARNING)
 
@@ -38,199 +172,254 @@ async def test_start_up_retries_on_abrupt_close(monkeypatch: Any, caplog: Any) -
     FakeCCE = type("FakeCCE", (Exception,), {})
     monkeypatch.setattr(rt_mod, "ConnectionClosedError", FakeCCE)
 
-    # Make asyncio.sleep return immediately (for backoff)
-    _real_sleep = asyncio.sleep
+    state = _install_supervisor_fakes(monkeypatch, ["iter_fail", "clean"], fail_exc=FakeCCE)
 
-    async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
-        await _real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
-
-    attempt_counter = {"n": 0}
-
-    class FakeConn:
-        """Minimal realtime connection stub."""
-
-        def __init__(self, mode: str):
-            self._mode = mode
-
-            class _Session:
-                async def update(self, **_kw: Any) -> None:
-                    return None
-
-            self.session = _Session()
-
-            class _InputAudioBuffer:
-                async def append(self, **_kw: Any) -> None:
-                    return None
-
-            self.input_audio_buffer = _InputAudioBuffer()
-
-            class _Item:
-                async def create(self, **_kw: Any) -> None:
-                    return None
-
-            class _Conversation:
-                item = _Item()
-
-            self.conversation = _Conversation()
-
-            class _Response:
-                async def create(self, **_kw: Any) -> None:
-                    return None
-
-                async def cancel(self, **_kw: Any) -> None:
-                    return None
-
-            self.response = _Response()
-
-        async def __aenter__(self) -> "FakeConn":
-            return self
-
-        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-            return False
-
-        async def close(self) -> None:
-            return None
-
-        # Async iterator protocol
-        def __aiter__(self) -> "FakeConn":
-            return self
-
-        async def __anext__(self) -> None:
-            if self._mode == "raise_on_iter":
-                raise FakeCCE("abrupt close (simulated)")
-            raise StopAsyncIteration  # clean exit (no events)
-
-    class FakeRealtime:
-        def connect(self, **_kw: Any) -> FakeConn:
-            attempt_counter["n"] += 1
-            mode = "raise_on_iter" if attempt_counter["n"] == 1 else "clean"
-            return FakeConn(mode)
-
-    class FakeClient:
-        def __init__(self, **_kw: Any) -> None:
-            self.realtime = FakeRealtime()
-
-    # Patch the OpenAI client used by the handler
-    monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
-
-    # Build handler with minimal deps
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._wake_detector = None
 
-    # Run: should retry once and exit cleanly
-    await handler.start_up()
+    startup_task = asyncio.create_task(handler.start_up())
+    try:
+        await _wait_until(
+            lambda: state["connects"] >= 2
+            and handler._realtime_session_task is not None
+            and handler._realtime_session_task.done()
+        )
 
-    # Validate: two attempts total (fail -> retry -> succeed), and connection cleared
-    assert attempt_counter["n"] == 2
-    assert handler.connection is None
+        # Two attempts total (fail -> retry -> succeed), and connection cleared
+        assert state["connects"] == 2
+        assert handler.connection is None
+        # The supervisor must survive the clean session end (no park-forever, no crash).
+        assert not startup_task.done()
 
-    # Optional: confirm we logged the unexpected close once
-    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "closed unexpectedly" in r.msg]
-    assert len(warnings) == 1
+        warnings = [r for r in caplog.records if r.levelname == "WARNING" and "closed unexpectedly" in r.msg]
+        assert len(warnings) == 1
+    finally:
+        await _finish_supervisor(handler, startup_task)
 
 
 @pytest.mark.asyncio
 async def test_start_up_retries_on_session_update_failure(monkeypatch: Any, caplog: Any) -> None:
-    """session.update failure raises RealtimeSessionError and retries without TypeError."""
+    """session.update failure raises RealtimeSessionError and the supervisor retries."""
     caplog.set_level(logging.WARNING)
 
-    _real_sleep = asyncio.sleep
-
-    async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
-        await _real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
-
-    attempt_counter = {"n": 0}
-
-    class FakeSession:
-        async def update(self, **_kw: Any) -> None:
-            attempt_counter["n"] += 1
-            if attempt_counter["n"] == 1:
-                raise RuntimeError("session.update failed (simulated)")
-
-    class FakeConn:
-        def __init__(self) -> None:
-            self.session = FakeSession()
-
-            class _InputAudioBuffer:
-                async def append(self, **_kw: Any) -> None:
-                    return None
-
-            self.input_audio_buffer = _InputAudioBuffer()
-
-            class _Item:
-                async def create(self, **_kw: Any) -> None:
-                    return None
-
-            class _Conversation:
-                item = _Item()
-
-            self.conversation = _Conversation()
-
-            class _Response:
-                async def create(self, **_kw: Any) -> None:
-                    return None
-
-                async def cancel(self, **_kw: Any) -> None:
-                    return None
-
-            self.response = _Response()
-
-        async def __aenter__(self) -> "FakeConn":
-            return self
-
-        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-            return False
-
-        async def close(self) -> None:
-            return None
-
-        def __aiter__(self) -> "FakeConn":
-            return self
-
-        async def __anext__(self) -> None:
-            raise StopAsyncIteration
-
-    class FakeRealtime:
-        def connect(self, **_kw: Any) -> FakeConn:
-            return FakeConn()
-
-    class FakeClient:
-        def __init__(self, **_kw: Any) -> None:
-            self.realtime = FakeRealtime()
-
-    monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
-    monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
-    monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
-    monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
+    state = _install_supervisor_fakes(monkeypatch, ["update_fail", "clean"])
 
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
     handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._wake_detector = None
 
-    await handler.start_up()
+    startup_task = asyncio.create_task(handler.start_up())
+    try:
+        await _wait_until(
+            lambda: state["connects"] >= 2
+            and handler._realtime_session_task is not None
+            and handler._realtime_session_task.done()
+        )
 
-    assert attempt_counter["n"] == 2
+        assert state["connects"] == 2
+        assert handler.connection is None
+        assert not startup_task.done()
+
+        retry_logs = [r for r in caplog.records if "closed unexpectedly" in getattr(r, "msg", "")]
+        assert len(retry_logs) == 1
+    finally:
+        await _finish_supervisor(handler, startup_task)
+
+
+@pytest.mark.asyncio
+async def test_start_up_retries_on_unexpected_exception_type(monkeypatch: Any) -> None:
+    """Non-ConnectionClosedError session failures are retried instead of escaping start_up."""
+
+    class WeirdSdkError(Exception):
+        """Stand-in for e.g. openai's WebSocketConnectionClosedError."""
+
+    state = _install_supervisor_fakes(monkeypatch, ["iter_fail", "hold"], fail_exc=WeirdSdkError)
+
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._wake_detector = None
+
+    startup_task = asyncio.create_task(handler.start_up())
+    try:
+        await _wait_until(lambda: state["connects"] >= 2 and handler.connection is not None)
+
+        # The unexpected exception type must not have escaped the supervisor.
+        assert not startup_task.done()
+        assert handler.connection is state["conns"][1]
+    finally:
+        await _finish_supervisor(handler, startup_task)
+
+
+@pytest.mark.asyncio
+async def test_start_up_keeps_retrying_past_three_consecutive_failures(monkeypatch: Any) -> None:
+    """The retry budget counts consecutive failures and never parks forever.
+
+    Five failing sessions in a row (well past the old process-lifetime budget
+    of 3) must still be followed by a successful reconnect, and a successful
+    connect resets the failure streak.
+    """
+    state = _install_supervisor_fakes(
+        monkeypatch,
+        ["iter_fail", "iter_fail", "iter_fail", "iter_fail", "iter_fail", "hold"],
+    )
+
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._wake_detector = None
+
+    startup_task = asyncio.create_task(handler.start_up())
+    try:
+        await _wait_until(lambda: state["connects"] >= 6 and handler.connection is not None, timeout=5.0)
+
+        assert state["connects"] == 6
+        assert not startup_task.done()
+        # A successful connect resets the consecutive-failure counter.
+        assert handler._session_failures == 0
+    finally:
+        await _finish_supervisor(handler, startup_task)
+
+
+@pytest.mark.asyncio
+async def test_clean_close_clears_state_and_supervisor_restarts_on_request(monkeypatch: Any) -> None:
+    """A graceful server close leaves no stale 'connected' state.
+
+    The session clears self.connection/_connected_event in its own finally;
+    the supervisor parks instead of reconnecting on its own, and a
+    _restart_session() request makes the supervisor (and only the supervisor)
+    create the next session task.
+    """
+    state = _install_supervisor_fakes(monkeypatch, ["hold", "hold"])
+    monkeypatch.setattr(rt_mod, "_RESTART_CONNECT_TIMEOUT_S", 2.0)
+
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler._wake_detector = None
+
+    startup_task = asyncio.create_task(handler.start_up())
+    try:
+        await _wait_until(lambda: handler.connection is not None)
+        first_task = handler._realtime_session_task
+        assert first_task is not None
+
+        # Server closes the websocket cleanly (e.g. session max duration).
+        state["conns"][0].server_close()
+        await _wait_until(lambda: first_task.done())
+
+        # No stale connected state survives the session (finding: stale connection).
+        assert handler.connection is None
+        assert not handler._connected_event.is_set()
+        # The supervisor parks; it does not stack a second session on its own.
+        assert state["connects"] == 1
+        assert not startup_task.done()
+
+        # A restart request is consumed by the supervisor, which owns task creation.
+        await handler._restart_session()
+        await _wait_until(lambda: handler.connection is not None)
+
+        assert state["connects"] == 2
+        assert handler.connection is state["conns"][1]
+        session_task = handler._realtime_session_task
+        assert session_task is not None
+        assert session_task is not first_task
+        assert session_task.get_name() == "openai-realtime-session"
+    finally:
+        await _finish_supervisor(handler, startup_task)
+
+
+@pytest.mark.asyncio
+async def test_restart_session_never_creates_session_tasks(monkeypatch: Any) -> None:
+    """_restart_session only signals the supervisor; it must not spawn session tasks."""
+    monkeypatch.setattr(rt_mod, "_RESTART_CONNECT_TIMEOUT_S", 0.05)
+
+    handler = _build_wake_enabled_handler()
+    handler.client = MagicMock()  # start_up ran once, but no supervisor is alive
+
+    await handler._restart_session()
+
+    assert handler._realtime_session_task is None
+    assert handler._restart_requested.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_realtime_session_resets_stale_response_state(monkeypatch: Any) -> None:
+    """A fresh session drains queued response.create kwargs and resets response flags.
+
+    Stale requests queued for a previous conversation must never replay, and a
+    cleared _response_done_event from a mid-response disconnect must not
+    suppress VAD handling in the new session.
+    """
+    state = _install_supervisor_fakes(monkeypatch, ["hold"])
+
+    handler = _build_wake_enabled_handler()
+    handler.client = rt_mod.AsyncOpenAI(api_key="DUMMY")
+
+    # Simulate leftovers from a session that died mid-response.
+    await handler._safe_response_create(response={"instructions": "stale tool follow-up"})
+    handler._response_done_event.clear()
+    handler._last_response_rejected = True
+
+    session_task = asyncio.create_task(handler._run_realtime_session())
+    try:
+        await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
+
+        assert handler._pending_responses.empty()
+        assert handler._response_done_event.is_set()
+        assert handler._last_response_rejected is False
+
+        # Give the sender a chance to (wrongly) send anything that survived.
+        await asyncio.sleep(0.05)
+        assert state["conns"][0].response_creates == []
+    finally:
+        session_task.cancel()
+        try:
+            await session_task
+        except asyncio.CancelledError:
+            pass
+        await handler.shutdown()
+
+    # The cancelled session cleaned up after itself.
     assert handler.connection is None
+    assert not handler._connected_event.is_set()
 
-    retry_logs = [r for r in caplog.records if "closed unexpectedly" in getattr(r, "msg", "")]
-    assert len(retry_logs) == 1
+
+@pytest.mark.asyncio
+async def test_session_finally_does_not_clobber_newer_connection(monkeypatch: Any) -> None:
+    """A dying session only clears self.connection if it still owns it."""
+    _install_supervisor_fakes(monkeypatch, ["hold"])
+
+    handler = _build_wake_enabled_handler()
+    handler.client = rt_mod.AsyncOpenAI(api_key="DUMMY")
+
+    session_task = asyncio.create_task(handler._run_realtime_session())
+    try:
+        await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
+
+        # A newer session has taken over the shared slot in the meantime.
+        newer_connection = MagicMock()
+        handler.connection = newer_connection
+
+        session_task.cancel()
+        try:
+            await session_task
+        except asyncio.CancelledError:
+            pass
+
+        assert handler.connection is newer_connection
+    finally:
+        if not session_task.done():
+            session_task.cancel()
+        await handler.shutdown()
 
 
 @pytest.mark.asyncio
 async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None:
-    """Append failure while awake closes the session and starts a fresh connection."""
-    _real_sleep = asyncio.sleep
-
-    async def _mock_sleep(*_a: Any, **_kw: Any) -> None:
-        await _real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", _mock_sleep, raising=False)
+    """Append failure while awake closes the session and the supervisor reconnects."""
     monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
     monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
     monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(rt_mod, "_MAX_SESSION_RETRY_DELAY_S", 0.01)
+    monkeypatch.setattr(rt_mod, "_RESTART_CONNECT_TIMEOUT_S", 2.0)
 
     session_attempts = {"n": 0}
     restart_calls = {"n": 0}
@@ -315,34 +504,25 @@ async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None
     monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
 
     handler = _build_wake_enabled_handler()
-    handler.client = FakeClient()
-    handler._wake_detector = None
     handler.wake_session.wake()
-    session_task: asyncio.Task[None] | None = None
 
+    startup_task = asyncio.create_task(handler.start_up())
     try:
-        session_task = asyncio.create_task(handler._run_realtime_session())
-        handler._realtime_session_task = session_task
         await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
 
         await handler.receive(_mic_frame())
 
         assert restart_calls["n"] >= 1
-        await asyncio.wait_for(handler._connected_event.wait(), timeout=2.0)
-        assert handler.connection is not None
+        await _wait_until(lambda: handler.connection is not None)
         assert not handler.connection.input_audio_buffer.fail_append
+        # The reconnect came from the supervisor, not from _restart_session.
+        assert handler._realtime_session_task is not None
+        assert handler._realtime_session_task.get_name() == "openai-realtime-session"
 
         await handler.receive(_mic_frame())
         assert len(handler.connection.input_audio_buffer.appended) == 1
     finally:
-        for task in {session_task, handler._realtime_session_task}:
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-        await handler.shutdown()
+        await _finish_supervisor(handler, startup_task)
 
 
 # ---- Cost calculation tests ----
@@ -1119,7 +1299,7 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
     handler = rt_mod.OpenaiRealtimeHandler(deps)
     handler_ref.append(handler)
 
-    asyncio.create_task(handler.start_up())
+    startup_task = asyncio.create_task(handler.start_up())
 
     # ---- Start tools via the real BackgroundToolManager pipeline ----
     # start_tool → _run_tool → notification queue → listener → _handle_tool_result
@@ -1141,7 +1321,7 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     await event_queue.put(None)  # sentinel stops event iteration
 
-    await handler.shutdown()
+    await _finish_supervisor(handler, startup_task)
 
     # ---- Assertions ----
 

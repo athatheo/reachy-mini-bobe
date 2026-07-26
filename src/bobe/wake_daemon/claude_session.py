@@ -50,6 +50,7 @@ class ClaudeCodeSessionManager:
         self._last_result: dict[str, Any] | None = None
         self._active_process: subprocess.Popen[str] | None = None
         self._spawning = False
+        self._waiter_thread: threading.Thread | None = None
 
     def start(self) -> dict[str, Any]:
         """Create a daemon-owned Claude Code session id without sending a prompt."""
@@ -73,21 +74,33 @@ class ClaudeCodeSessionManager:
             }
 
     def send(self, command: str) -> dict[str, Any]:
-        """Send one prompt to Claude Code using the managed session id."""
+        """Accept one prompt for Claude Code and run it in the background.
+
+        Returns promptly with ``{"ok": True, "accepted": True, ...}``; the
+        command's result is published to :meth:`status` as ``last_result`` when
+        the subprocess finishes, so callers never block behind a long command.
+        """
         clean_command = command.strip()
         if not clean_command:
             return {"ok": False, "error": "empty_command"}
 
-        start_result = self.start()
-        if not start_result.get("ok"):
-            return start_result
-        settings = self._settings()
+        try:
+            settings = self._settings()
+        except ClaudeCodeLaunchError as exc:
+            return {"ok": False, "error": "invalid_config", "message": str(exc)}
 
         with self._lock:
             if self._active_process is not None or self._spawning:
                 return {"ok": False, "error": "busy"}
+            # Resolve the session id under the same lock acquisition as the
+            # busy check: a concurrent stop() could otherwise clear it between
+            # a start() call and this critical section (never assert on it).
+            if self._session_id is None:
+                now = self._clock()
+                self._session_id = str(uuid.uuid4())
+                self._started_at = now
+                self._last_result = None
             session_id = self._session_id
-            assert session_id is not None
             self._spawning = True
             self._last_activity_at = self._clock()
 
@@ -119,17 +132,40 @@ class ClaudeCodeSessionManager:
                 self._spawning = False
             raise
 
+        waiter = threading.Thread(
+            target=self._await_result,
+            args=(process, session_id, settings),
+            name="claude-code-waiter",
+            daemon=True,
+        )
         with self._lock:
             self._spawning = False
             stopped_while_spawning = self._session_id != session_id
             if not stopped_while_spawning:
                 self._active_process = process
+                self._waiter_thread = waiter
                 self._last_activity_at = self._clock()
         if stopped_while_spawning:
             # stop() raced the spawn; don't run the command under a dead session.
             _terminate_process_group(process)
-            return {"ok": False, "error": "stopped"}
+            return {"ok": False, "error": "no_session"}
 
+        waiter.start()
+        return {
+            "ok": True,
+            "accepted": True,
+            "running": True,
+            "session_id": session_id,
+            "workdir": settings.workdir,
+        }
+
+    def _await_result(
+        self,
+        process: subprocess.Popen[str],
+        session_id: str,
+        settings: ClaudeCodeSessionSettings,
+    ) -> None:
+        """Wait for a spawned command and publish its result to status()."""
         try:
             stdout, stderr = process.communicate(timeout=settings.command_timeout_s)
             result = _result_from_process(
@@ -147,19 +183,22 @@ class ClaudeCodeSessionManager:
                 "stdout": _limit_text(stdout or "", settings.output_limit_chars),
                 "stderr": _limit_text(stderr or "", settings.output_limit_chars),
             }
-        finally:
-            with self._lock:
-                if self._active_process is process:
-                    self._active_process = None
-                self._last_activity_at = self._clock()
+        except Exception as exc:  # communicate() can fail after a kill
+            result = {"ok": False, "error": "command_failed", "message": str(exc)}
 
         with self._lock:
-            self._last_result = result
-            return {
-                **result,
-                "session_id": self._session_id,
-                "workdir": settings.workdir,
-            }
+            if self._active_process is process:
+                self._active_process = None
+            self._last_activity_at = self._clock()
+            # Generation check: stop()/restart may have replaced the session
+            # while the command ran; never resurrect its result into the new
+            # session's state (or attribute it to the wrong session id).
+            if self._session_id == session_id:
+                self._last_result = {
+                    **result,
+                    "session_id": session_id,
+                    "workdir": settings.workdir,
+                }
 
     def status(self) -> dict[str, Any]:
         """Return current managed session status (never blocks on a running command)."""
@@ -188,6 +227,15 @@ class ClaudeCodeSessionManager:
         if process is not None:
             _terminate_process_group(process)
         return {"ok": True, "stopped_session_id": session_id, "terminated_process": process is not None}
+
+    def shutdown(self, *, timeout_s: float = 5.0) -> None:
+        """Terminate any running command and reap its waiter thread at daemon exit."""
+        self.stop()
+        with self._lock:
+            waiter = self._waiter_thread
+            self._waiter_thread = None
+        if waiter is not None and waiter.is_alive():
+            waiter.join(timeout=timeout_s)
 
     def _settings(self) -> ClaudeCodeSessionSettings:
         workdir = resolve_workdir(self._config.claude_code_workdir)
@@ -254,6 +302,10 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
             if process.pid:
                 os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=3)  # reap: don't leave a zombie behind SIGKILL
+        except subprocess.TimeoutExpired:
             pass
     except ProcessLookupError:
         pass

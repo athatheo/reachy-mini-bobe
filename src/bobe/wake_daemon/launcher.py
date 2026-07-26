@@ -6,6 +6,7 @@ import time
 import shlex
 import shutil
 import tempfile
+import threading
 import subprocess
 from typing import Any, Callable
 from pathlib import Path
@@ -31,6 +32,7 @@ class ClaudeCodeLauncher:
         self._config = config
         self._clock = clock
         self._runner = runner
+        self._lock = threading.Lock()
         self._last_launch_at: float | None = None
 
     def launch(self) -> dict[str, Any]:
@@ -39,20 +41,32 @@ class ClaudeCodeLauncher:
             return {"ok": False, "error": "disabled"}
 
         cooldown = self._config.claude_code_launch_cooldown_s
-        now = self._clock()
-        if self._last_launch_at is not None and now - self._last_launch_at < cooldown:
-            retry_after = max(0.0, cooldown - (now - self._last_launch_at))
-            return {
-                "ok": False,
-                "error": "cooldown",
-                "retry_after_s": round(retry_after, 1),
-            }
+        with self._lock:
+            now = self._clock()
+            if self._last_launch_at is not None and now - self._last_launch_at < cooldown:
+                retry_after = max(0.0, cooldown - (now - self._last_launch_at))
+                return {
+                    "ok": False,
+                    "error": "cooldown",
+                    "retry_after_s": round(retry_after, 1),
+                }
+            # Arm the cooldown atomically with the check, BEFORE the slow spawn:
+            # a concurrent launch must not pass the gate while this one is in
+            # flight (double Terminal). Failures roll the arm back below.
+            previous_launch_at = self._last_launch_at
+            self._last_launch_at = now
+
+        def failed(result: dict[str, Any]) -> dict[str, Any]:
+            with self._lock:
+                if self._last_launch_at == now:
+                    self._last_launch_at = previous_launch_at
+            return result
 
         try:
             workdir = resolve_workdir(self._config.claude_code_workdir)
             binary = resolve_binary(self._config.claude_code_bin)
         except ClaudeCodeLaunchError as exc:
-            return {"ok": False, "error": "invalid_config", "message": str(exc)}
+            return failed({"ok": False, "error": "invalid_config", "message": str(exc)})
 
         workdir.mkdir(parents=True, exist_ok=True)
         script_path = create_terminal_command_script(workdir=workdir, binary=binary)
@@ -72,16 +86,15 @@ class ClaudeCodeLauncher:
             )
         except FileNotFoundError:
             _remove_script(script_path)
-            return {"ok": False, "error": "open_not_found"}
+            return failed({"ok": False, "error": "open_not_found"})
         except subprocess.CalledProcessError as exc:
             _remove_script(script_path)
             stderr = (exc.stderr or "").strip()
-            return {"ok": False, "error": "launch_failed", "message": stderr or str(exc)}
+            return failed({"ok": False, "error": "launch_failed", "message": stderr or str(exc)})
         except subprocess.TimeoutExpired:
             _remove_script(script_path)
-            return {"ok": False, "error": "launch_timeout"}
+            return failed({"ok": False, "error": "launch_timeout"})
 
-        self._last_launch_at = now
         return {
             "ok": True,
             "workdir": str(workdir),

@@ -9,7 +9,18 @@ from collections.abc import Callable
 
 import numpy as np
 
+from reachy_mini.utils import create_head_pose
+from reachy_mini.motion.move import Move
+from bobe.moves import (
+    SECONDARY_ROTATION_LIMIT_RAD,
+    SECONDARY_TRANSLATION_LIMIT_M,
+    MovementManager,
+)
 from bobe.audio.head_wobbler import HeadWobbler
+from bobe.dance_emotion_moves import GotoQueueMove
+
+
+NEUTRAL_OFFSETS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def _make_audio_chunk(duration_s: float = 0.3, frequency_hz: float = 220.0) -> str:
@@ -53,9 +64,44 @@ def test_reset_drops_pending_offsets() -> None:
         pre_reset_count = len(captured)
         wobbler.reset()
         time.sleep(0.3)
-        assert len(captured) == pre_reset_count, "offsets continued after reset without new audio"
+        new_offsets = [offsets for _, offsets in captured[pre_reset_count:]]
+        assert all(offsets == NEUTRAL_OFFSETS for offsets in new_offsets), (
+            "offsets continued after reset without new audio"
+        )
     finally:
         wobbler.stop()
+
+
+def test_reset_pushes_neutral_offsets() -> None:
+    """Reset must zero the APPLIED offsets so the head is not left mid-sway."""
+    wobbler, captured = _start_wobbler()
+    try:
+        wobbler.feed(_make_audio_chunk(duration_s=0.35))
+        assert _wait_for(lambda: len(captured) > 0), "wobbler did not emit initial offsets"
+
+        wobbler.reset()
+        offsets = [captured_offsets for _, captured_offsets in captured]
+        assert NEUTRAL_OFFSETS in offsets, "reset did not push a neutral offset snapshot"
+        assert offsets[-1] == NEUTRAL_OFFSETS, "head left with non-neutral offsets after reset"
+    finally:
+        wobbler.stop()
+
+
+def test_stop_returns_promptly_while_pacing_audio() -> None:
+    """stop() must not block while the worker paces out a long queued chunk."""
+    wobbler, captured = _start_wobbler()
+    stopped = False
+    try:
+        wobbler.feed(_make_audio_chunk(duration_s=2.0))
+        assert _wait_for(lambda: len(captured) > 0, timeout=1.5), "wobbler did not start pacing"
+
+        start = time.monotonic()
+        wobbler.stop()
+        stopped = True
+        assert time.monotonic() - start < 1.0, "stop() blocked while pacing a queued chunk"
+    finally:
+        if not stopped:
+            wobbler.stop()
 
 
 def test_reset_allows_future_offsets() -> None:
@@ -108,3 +154,142 @@ def test_reset_during_inflight_chunk_keeps_worker(monkeypatch: Any) -> None:
         assert wobbler._thread.is_alive()
     finally:
         wobbler.stop()
+
+
+# --- MovementManager: consumer of the wobbler's speech offsets ---
+
+
+class _FakeRobot:
+    """Minimal ReachyMini stand-in for MovementManager tests."""
+
+    def __init__(self) -> None:
+        self.set_target_calls = 0
+        self.last_target: Tuple[Any, Any, Any] | None = None
+        self.goto_calls = 0
+
+    def set_target(self, head: Any = None, antennas: Any = None, body_yaw: Any = None) -> None:
+        self.set_target_calls += 1
+        self.last_target = (head, antennas, body_yaw)
+
+    def goto_target(self, head: Any = None, antennas: Any = None, duration: Any = None, body_yaw: Any = None) -> None:
+        self.goto_calls += 1
+
+    def get_current_joint_positions(self) -> Tuple[Any, Any]:
+        return np.zeros(7), np.zeros(2)
+
+    def get_current_head_pose(self) -> Any:
+        return np.eye(4)
+
+
+class _ExplodingMove(Move):  # type: ignore[misc]
+    """Move whose evaluation always raises, simulating a poisoned tick."""
+
+    @property
+    def duration(self) -> float:
+        return 1.0
+
+    def evaluate(self, t: float) -> Any:
+        raise RuntimeError("boom")
+
+
+def test_movement_manager_survives_tick_errors() -> None:
+    """A raising move must not kill the 100 Hz control loop (finding #24)."""
+    robot = _FakeRobot()
+    manager = MovementManager(robot)
+    manager.start()
+    try:
+        assert _wait_for(lambda: robot.set_target_calls > 0), "control loop never issued a command"
+
+        manager.queue_move(_ExplodingMove())
+        assert _wait_for(lambda: manager.state.current_move is None and manager._command_queue.empty(), timeout=1.0)
+
+        before = robot.set_target_calls
+        assert _wait_for(lambda: robot.set_target_calls > before + 5, timeout=1.0), (
+            "control loop stopped issuing commands after a tick error"
+        )
+        assert manager._thread is not None and manager._thread.is_alive()
+
+        # A follow-up move still runs to completion.
+        goto = GotoQueueMove(
+            target_head_pose=create_head_pose(0, 0, 0, 0, 0, 0, degrees=True),
+            start_head_pose=np.eye(4),
+            target_body_yaw=0.5,
+            start_body_yaw=0.0,
+            duration=0.05,
+        )
+        manager.queue_move(goto)
+        assert _wait_for(
+            lambda: robot.last_target is not None and robot.last_target[2] > 0.4,
+            timeout=1.0,
+        ), "follow-up move did not execute after a tick error"
+    finally:
+        manager.stop()
+
+
+def test_secondary_offsets_are_clamped_and_sanitized() -> None:
+    """Fused speech+face offsets are bounded and NaN-safe before composition."""
+    manager = MovementManager(_FakeRobot())
+    manager.state.speech_offsets = (1.0, -1.0, float("nan"), 2.0, -2.0, 1.0)
+    manager.state.face_tracking_offsets = NEUTRAL_OFFSETS
+
+    head_pose, antennas, body_yaw = manager._get_secondary_pose()
+
+    expected = create_head_pose(
+        x=SECONDARY_TRANSLATION_LIMIT_M,
+        y=-SECONDARY_TRANSLATION_LIMIT_M,
+        z=0.0,
+        roll=SECONDARY_ROTATION_LIMIT_RAD,
+        pitch=-SECONDARY_ROTATION_LIMIT_RAD,
+        yaw=SECONDARY_ROTATION_LIMIT_RAD,
+        degrees=False,
+        mm=False,
+    )
+    assert np.all(np.isfinite(head_pose))
+    assert np.allclose(head_pose, expected)
+    assert antennas == (0.0, 0.0)
+    assert body_yaw == 0.0
+
+
+def test_listening_debounce_coalesces_to_latest_state() -> None:
+    """Burst toggles inside the debounce window are deferred, not dropped (finding #50)."""
+    manager = MovementManager(_FakeRobot())
+    clock = {"t": 1000.0}
+    manager._now = lambda: clock["t"]  # type: ignore[method-assign]
+    manager._last_listening_toggle_time = clock["t"]
+
+    clock["t"] += 1.0
+    manager._request_listening(True)
+    assert manager._is_listening is True
+
+    # Opposite toggle arriving within the debounce window is deferred...
+    clock["t"] += 0.05
+    manager._request_listening(False)
+    manager._flush_pending_listening()
+    assert manager._is_listening is True, "toggle applied inside the debounce window"
+
+    # ...and applied once the window expires (instead of being dropped).
+    clock["t"] += 0.2
+    manager._flush_pending_listening()
+    assert manager._is_listening is False, "deferred toggle was dropped"
+
+    # Several queued toggles coalesce to the most recent requested state.
+    clock["t"] += 0.05
+    manager._request_listening(True)
+    manager._request_listening(False)
+    manager._request_listening(True)
+    clock["t"] += 0.2
+    manager._flush_pending_listening()
+    assert manager._is_listening is True
+
+
+def test_set_listening_producer_does_not_drop_return_toggle() -> None:
+    """The producer-side dedupe must track requested (not lagging applied) state."""
+    manager = MovementManager(_FakeRobot())
+
+    manager.set_listening(True)
+    manager.set_listening(False)
+
+    commands = []
+    while not manager._command_queue.empty():
+        commands.append(manager._command_queue.get_nowait())
+    assert commands == [("set_listening", True), ("set_listening", False)]

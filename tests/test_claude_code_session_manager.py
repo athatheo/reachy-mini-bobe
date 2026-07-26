@@ -28,6 +28,34 @@ class FakeProcess:
         return self.returncode
 
 
+class KillableProcess(FakeProcess):
+    """Blocks in communicate() until the process-group terminate path runs."""
+
+    def __init__(self, stdout: str, stderr: str = "", returncode: int = 0):
+        super().__init__(stdout, stderr, returncode)
+        self.pid = 0  # keep _terminate_process_group away from os.killpg
+        self.done = threading.Event()
+
+    def communicate(self, timeout=None):
+        assert self.done.wait(timeout=5)
+        return self._stdout, self._stderr
+
+    def wait(self, timeout=None):
+        self.done.set()
+        return self.returncode
+
+
+def _wait_for_result(manager: ClaudeCodeSessionManager, timeout: float = 5.0) -> dict:
+    """Poll status() until the background command publishes last_result."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = manager.status()
+        if not status["running"] and status["last_result"] is not None:
+            return status["last_result"]
+        time.sleep(0.005)
+    raise AssertionError("command result was never published to status()")
+
+
 def test_session_manager_starts_without_running_claude(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     calls = []
@@ -44,7 +72,7 @@ def test_session_manager_starts_without_running_claude(tmp_path, monkeypatch):
     assert calls == []
 
 
-def test_session_manager_sends_command_with_session_id(tmp_path, monkeypatch):
+def test_session_manager_send_is_accepted_and_publishes_result(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
     calls = []
@@ -60,10 +88,12 @@ def test_session_manager_sends_command_with_session_id(tmp_path, monkeypatch):
     )
     manager = ClaudeCodeSessionManager(config, popen_factory=fake_popen)
 
-    result = manager.send("run the focused tests")
+    accepted = manager.send("run the focused tests")
 
-    assert result["ok"] is True
-    assert result["output"] == "Tests passed"
+    assert accepted["ok"] is True
+    assert accepted["accepted"] is True
+    assert accepted["running"] is True
+    assert accepted["session_id"]
     args, kwargs = calls[0]
     assert args[0] == "/usr/local/bin/claude"
     assert "-p" in args
@@ -75,6 +105,11 @@ def test_session_manager_sends_command_with_session_id(tmp_path, monkeypatch):
     assert args[-1] == "run the focused tests"
     assert kwargs["cwd"] == str(tmp_path / "repos" / "voice-work")
 
+    result = _wait_for_result(manager)
+    assert result["ok"] is True
+    assert result["output"] == "Tests passed"
+    assert result["session_id"] == accepted["session_id"]
+
 
 def test_session_manager_reports_failed_command(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -84,7 +119,8 @@ def test_session_manager_reports_failed_command(tmp_path, monkeypatch):
         popen_factory=lambda *args, **kwargs: FakeProcess("", "permission needed", returncode=1),
     )
 
-    result = manager.send("edit a file")
+    assert manager.send("edit a file")["ok"] is True
+    result = _wait_for_result(manager)
 
     assert result["ok"] is False
     assert result["error"] == "claude_failed"
@@ -100,7 +136,8 @@ def test_session_manager_does_not_return_unbounded_json_payload(tmp_path, monkey
         popen_factory=lambda *args, **kwargs: FakeProcess(stdout),
     )
 
-    result = manager.send("summarize")
+    assert manager.send("summarize")["ok"] is True
+    result = _wait_for_result(manager)
 
     assert result["ok"] is True
     assert result["output"] == "x" * 10
@@ -122,6 +159,24 @@ def test_session_manager_rejects_invalid_permission_mode(tmp_path, monkeypatch):
     assert "permission mode" in result["message"]
 
 
+def test_session_manager_rejects_second_command_while_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    process = KillableProcess(json.dumps({"result": "done"}))
+    manager = ClaudeCodeSessionManager(
+        WakeDaemonConfig(token="wake-token"),
+        popen_factory=lambda *args, **kwargs: process,
+    )
+
+    assert manager.send("long task")["ok"] is True
+    busy = manager.send("second task")
+    process.done.set()
+
+    assert busy["ok"] is False
+    assert busy["error"] == "busy"
+    assert _wait_for_result(manager)["output"] == "done"
+
+
 def test_session_manager_times_out_and_clears_running(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
@@ -132,12 +187,18 @@ def test_session_manager_times_out_and_clears_running(tmp_path, monkeypatch):
                 raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
             return "partial", ""
 
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = TimeoutProcess("partial")
+    process.pid = 0  # keep the timeout path away from os.killpg
     manager = ClaudeCodeSessionManager(
         WakeDaemonConfig(token="wake-token", claude_code_command_timeout_s=1.0),
-        popen_factory=lambda *args, **kwargs: TimeoutProcess("partial"),
+        popen_factory=lambda *args, **kwargs: process,
     )
 
-    result = manager.send("long task")
+    assert manager.send("long task")["ok"] is True
+    result = _wait_for_result(manager)
 
     assert result["ok"] is False
     assert result["error"] == "timeout"
@@ -197,8 +258,93 @@ def test_session_manager_send_aborts_when_stopped_during_spawn(tmp_path, monkeyp
 
     assert stop_result["ok"] is True
     assert results[0]["ok"] is False
-    assert results[0]["error"] == "stopped"
+    assert results[0]["error"] == "no_session"
     assert manager.status()["running"] is False
+
+
+def test_session_manager_send_never_asserts_when_stop_races_session_id(tmp_path, monkeypatch):
+    """A stop() landing around send() must yield a clean error/new session, not a 500."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    manager = ClaudeCodeSessionManager(
+        WakeDaemonConfig(token="wake-token"),
+        popen_factory=lambda *args, **kwargs: FakeProcess(json.dumps({"result": "done"})),
+    )
+    manager.start()
+    manager.stop()  # simulates the stop() winning the race before send()'s critical section
+
+    result = manager.send("task")
+
+    assert result["ok"] is True
+    assert result["session_id"]
+    assert _wait_for_result(manager)["ok"] is True
+
+
+def test_session_manager_drops_result_from_session_stopped_mid_command(tmp_path, monkeypatch):
+    """stop() during a running command must not have its result resurrected (#36)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    process = KillableProcess(json.dumps({"result": "stale"}), returncode=1)
+    manager = ClaudeCodeSessionManager(
+        WakeDaemonConfig(token="wake-token"),
+        popen_factory=lambda *args, **kwargs: process,
+    )
+
+    assert manager.send("long task")["ok"] is True
+    stop_result = manager.stop()  # kills the process; the waiter then reaps it
+    waiter = manager._waiter_thread
+    assert waiter is not None
+    waiter.join(timeout=5)
+
+    status = manager.status()
+    assert stop_result["ok"] is True
+    assert status["active"] is False
+    assert status["running"] is False
+    assert status["last_result"] is None
+
+
+def test_session_manager_result_keeps_spawning_session_id_after_restart(tmp_path, monkeypatch):
+    """A dead session's result must not be attributed to a brand-new session (#36)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    process = KillableProcess(json.dumps({"result": "stale"}))
+    manager = ClaudeCodeSessionManager(
+        WakeDaemonConfig(token="wake-token"),
+        popen_factory=lambda *args, **kwargs: process,
+    )
+
+    assert manager.send("long task")["ok"] is True
+    manager.stop()
+    new_session_id = manager.start()["session_id"]
+    waiter = manager._waiter_thread
+    assert waiter is not None
+    waiter.join(timeout=5)
+
+    status = manager.status()
+    assert status["session_id"] == new_session_id
+    assert status["last_result"] is None
+
+
+def test_session_manager_shutdown_terminates_active_command(tmp_path, monkeypatch):
+    """Daemon shutdown must kill the active claude process and reap its waiter (#25)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(session_module, "resolve_binary", lambda _binary: "/usr/local/bin/claude")
+    process = KillableProcess(json.dumps({"result": "done"}))
+    manager = ClaudeCodeSessionManager(
+        WakeDaemonConfig(token="wake-token", claude_code_command_timeout_s=300.0),
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    assert manager.send("long task")["ok"] is True
+
+    started = time.monotonic()
+    manager.shutdown(timeout_s=5.0)
+    elapsed = time.monotonic() - started
+
+    assert process.done.is_set()
+    assert elapsed < 5.0
+    status = manager.status()
+    assert status["running"] is False
+    assert status["active"] is False
 
 
 def test_session_manager_stop_clears_session(tmp_path, monkeypatch):

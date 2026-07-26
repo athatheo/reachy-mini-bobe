@@ -56,6 +56,10 @@ TEXT_OUTPUT_COST_PER_1M = 24.0
 IMAGE_INPUT_COST_PER_1M = 5.0
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
+# Cap for the exponential backoff between realtime session retry attempts.
+_MAX_SESSION_RETRY_DELAY_S: Final[float] = 30.0
+# How long a restart request waits for the supervisor to bring up a new session.
+_RESTART_CONNECT_TIMEOUT_S: Final[float] = 5.0
 # Ignore server VAD briefly after assistant audio so speaker echo does not freeze motors.
 _ASSISTANT_VAD_GUARD_S: Final[float] = 0.4
 # World-frame head translation applied when falling asleep (millimeters, vertical).
@@ -169,6 +173,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._latest_user_transcript: str = ""
         self._sleep_pending: bool = False
         self._realtime_session_task: asyncio.Task[None] | None = None
+        # Session lifecycle: start_up()'s supervisor loop is the ONLY creator of
+        # session tasks. Other code requests a new session by setting
+        # _restart_requested (see _restart_session) and waiting on _connected_event.
+        self._restart_requested: asyncio.Event = asyncio.Event()
+        self._restart_lock: asyncio.Lock = asyncio.Lock()
+        self._shutdown_requested: bool = False
+        # Consecutive session failures; reset whenever a session connects.
+        self._session_failures: int = 0
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         self.wake_config = load_wake_config()
@@ -259,7 +271,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return f"Failed to apply personality: {e}"
 
     async def start_up(self) -> None:
-        """Start the handler with minimal retries on unexpected websocket closure."""
+        """Supervise the realtime session: retry on failure, reconnect on request.
+
+        This supervisor loop is the single owner of ``_realtime_session_task``:
+        it is the only place session tasks are ever created and awaited. Failed
+        sessions are retried with capped exponential backoff (counting
+        consecutive failures, reset once a session connects); cleanly-ended
+        sessions park until someone requests a restart via _restart_requested.
+        """
         openai_api_key = config.OPENAI_API_KEY
         if self.gradio_mode and not openai_api_key:
             # api key was not found in .env or in the environment variables
@@ -282,41 +301,57 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         if self._wake_detector is not None:
             self._wake_detector.start()
 
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
+        while not self._shutdown_requested:
+            self._restart_requested.clear()
+            session_task = asyncio.create_task(
+                self._run_realtime_session(),
+                name="openai-realtime-session",
+            )
+            self._realtime_session_task = session_task
             try:
-                self._realtime_session_task = asyncio.create_task(
-                    self._run_realtime_session(),
-                    name="openai-realtime-session",
-                )
-                await self._realtime_session_task
-                # Normal exit from the session, stop retrying
-                return
-            except (ConnectionClosedError, RealtimeSessionError) as e:
-                # Abrupt close or session setup failure → retry
-                logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
-                if attempt < max_attempts:
-                    # exponential backoff with jitter
-                    base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
-                    jitter = random.uniform(0, 0.5)
-                    delay = base_delay + jitter
-                    logger.info("Retrying in %.1f seconds...", delay)
-                    await asyncio.sleep(delay)
-                    continue
-                logger.error(
-                    "Realtime session unavailable after %d attempts; keeping settings UI alive until stop",
-                    max_attempts,
-                )
-                try:
-                    while True:
-                        await asyncio.sleep(3600)
-                except asyncio.CancelledError:
+                await session_task
+            except asyncio.CancelledError:
+                # Either shutdown/external cancellation (propagate) or a stalled
+                # session was cancelled to force a restart (reconnect).
+                if self._shutdown_requested or not self._restart_requested.is_set():
+                    raise
+                if self._current_task_cancelling():
+                    raise
+                logger.info("Realtime session task cancelled for restart; reconnecting")
+                continue
+            except Exception as e:
+                if self._shutdown_requested:
                     return
+                # Any session failure is retried; only cancellation ends the loop.
+                self._session_failures += 1
+                base_delay = min(2.0 ** min(self._session_failures - 1, 6), _MAX_SESSION_RETRY_DELAY_S)
+                delay = base_delay + random.uniform(0, base_delay / 2)
+                logger.warning(
+                    "Realtime websocket closed unexpectedly (%d consecutive failure(s)); retrying in %.1f seconds: %s",
+                    self._session_failures,
+                    delay,
+                    e,
+                )
+                # Back off, but let a restart request (e.g. a wake) retry sooner.
+                try:
+                    await asyncio.wait_for(self._restart_requested.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            # The session ended cleanly (server close or a requested restart).
+            if self._shutdown_requested:
                 return
-            finally:
-                # never keep a stale reference
-                self.connection = None
-                self._connected_event.clear()
+            if not self._restart_requested.is_set():
+                logger.info("Realtime session ended; waiting for a restart request")
+                await self._restart_requested.wait()
+
+    @staticmethod
+    def _current_task_cancelling() -> bool:
+        """Return True when the running task itself has a pending cancellation."""
+        task = asyncio.current_task()
+        cancelling = getattr(task, "cancelling", None)  # Python >= 3.11
+        return bool(cancelling and cancelling())
 
     async def _ensure_openai_connection(self, timeout: float = 5.0) -> bool:
         """Wait for an active Realtime connection, restarting the session if needed."""
@@ -326,12 +361,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             logger.warning("OpenAI client not initialized; cannot connect")
             return False
 
-        try:
-            await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
-        if self.connection is not None:
-            return True
+        session_task = self._realtime_session_task
+        if session_task is not None and not session_task.done():
+            # A session task is alive and may already be (re)connecting.
+            try:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+            if self.connection is not None:
+                return True
 
         logger.warning("No OpenAI Realtime connection; restarting session")
         await self._restart_session()
@@ -373,37 +411,29 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self._await_or_cancel_session_task()
 
     async def _restart_session(self) -> None:
-        """Force-close the current session and start a fresh one in background.
+        """Ask the start_up supervisor to replace the session with a fresh one.
 
-        Does not block the caller while the new session is establishing.
+        Never creates session tasks itself: it signals _restart_requested,
+        force-closes the current connection so the running session task can
+        exit, and waits briefly for the supervisor to bring up the new session.
         """
         try:
-            await self._invalidate_realtime_connection()
-
             # Ensure we have a client (start_up must have run once)
             if getattr(self, "client", None) is None:
                 logger.warning("Cannot restart: OpenAI client not initialized yet.")
                 return
 
-            if self._realtime_session_task is not None and not self._realtime_session_task.done():
-                try:
-                    await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-                    logger.info("Realtime session reconnected by existing task.")
-                except asyncio.TimeoutError:
-                    logger.warning("Existing realtime session task did not reconnect in time.")
-                    await self._await_or_cancel_session_task()
-                if self.connection is not None:
-                    return
+            async with self._restart_lock:
+                # Signal first so the supervisor reconnects as soon as the
+                # current session task exits instead of parking.
+                self._restart_requested.set()
+                await self._invalidate_realtime_connection()
 
-            self._realtime_session_task = asyncio.create_task(
-                self._run_realtime_session(),
-                name="openai-realtime-restart",
-            )
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-                logger.info("Realtime session restarted and connected.")
-            except asyncio.TimeoutError:
-                logger.warning("Realtime session restart timed out; continuing in background.")
+                try:
+                    await asyncio.wait_for(self._connected_event.wait(), timeout=_RESTART_CONNECT_TIMEOUT_S)
+                    logger.info("Realtime session restarted and connected.")
+                except asyncio.TimeoutError:
+                    logger.warning("Realtime session restart timed out; continuing in background.")
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
 
@@ -576,6 +606,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
             self.connection = None
+            self._connected_event.clear()
             self._response_done_event.set()
 
     def _transcript_requests_sleep(self, transcript: str | None) -> bool:
@@ -677,14 +708,33 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return
         self.wake_session.touch()
 
+    def _reset_per_session_response_state(self) -> None:
+        """Reset response bookkeeping so nothing replays into a fresh conversation."""
+        while True:
+            try:
+                self._pending_responses.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._response_done_event.set()
+        self._last_response_rejected = False
+
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
+        try:
+            instructions = get_realtime_session_instructions()
+            voice = get_session_voice()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:  # catch SystemExit from the prompt loader without crashing
+            logger.error("Failed to resolve session instructions/voice: %s", e)
+            raise RealtimeSessionError("failed to resolve session instructions") from e
+
         async with self.client.realtime.connect(model=config.MODEL_NAME) as conn:
             try:
                 await conn.session.update(
                     session={
                         "type": "realtime",
-                        "instructions": get_realtime_session_instructions(),
+                        "instructions": instructions,
                         "audio": {
                             "input": {
                                 "format": {
@@ -702,7 +752,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                     "type": "audio/pcm",
                                     "rate": self.output_sample_rate,
                                 },
-                                "voice": get_session_voice(),
+                                "voice": voice,
                             },
                         },
                         "tools": get_tool_specs(),  # type: ignore[typeddict-item]
@@ -712,7 +762,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 logger.info(
                     "Realtime session initialized with profile=%r voice=%r",
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
-                    get_session_voice(),
+                    voice,
                 )
                 # If we reached here, the session update succeeded which implies the API key worked.
                 # Persist the key to a newly created .env (copied from .env.example) if needed.
@@ -723,9 +773,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             logger.info("Realtime session updated successfully")
 
+            # Per-session state: drop any response requests queued for a previous
+            # conversation and clear stale in-flight response bookkeeping so
+            # nothing replays into (or suppresses VAD in) this fresh session.
+            self._reset_per_session_response_state()
+
             # Manage event received from the openai server
             self.connection = conn
             self._connected_event.set()
+            # This session connected; reset the supervisor's failure streak.
+            self._session_failures = 0
 
             response_sender_task: asyncio.Task[None] | None = None
             try:
@@ -909,6 +966,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                # This session owns its registration: clear the shared connection
+                # state only if it still refers to this session's connection.
+                if self.connection is conn:
+                    self.connection = None
+                    self._connected_event.clear()
+
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()
@@ -1135,6 +1198,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
+        # Tell the start_up supervisor to stop, and wake it if it is parked
+        # waiting for a restart request.
+        self._shutdown_requested = True
+        self._restart_requested.set()
+
         # Stop the local wake-word detector thread
         if self._wake_detector is not None:
             self._wake_detector.stop()

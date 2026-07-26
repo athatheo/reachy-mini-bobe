@@ -477,6 +477,24 @@ class MovementManager:
         with self._shared_state_lock:
             self._shared_last_activity_time = self.state.last_activity_time
             self._shared_is_listening = self._is_listening
+            if self.state.last_primary_pose is not None:
+                # The stored tuple is replaced (never mutated) by the worker,
+                # so sharing the reference is safe; readers clone on access.
+                self._shared_primary_pose = self.state.last_primary_pose
+
+    def get_primary_target_pose(self) -> FullBodyPose:
+        """Return a snapshot of the current PRIMARY (offset-free) target pose.
+
+        This is the pose of the active/most recent primary move before the
+        speech-sway and face-tracking offsets are composed on top. Goto moves
+        should interpolate from this pose (instead of the measured head pose)
+        to avoid baking secondary offsets into the primary pose.
+
+        Thread-safe: may be called from any thread.
+        """
+        with self._shared_state_lock:
+            pose = self._shared_primary_pose
+        return clone_full_body_pose(pose)
 
     def _manage_move_queue(self, current_time: float) -> None:
         """Manage the primary move queue (sequential execution)."""
@@ -568,14 +586,23 @@ class MovementManager:
 
     def _get_secondary_pose(self) -> FullBodyPose:
         """Get the secondary full body pose from speech and face tracking offsets."""
-        # Combine speech sway offsets + face tracking offsets for secondary pose
+        # Combine speech sway offsets + face tracking offsets for the secondary
+        # pose, clamped to safe per-axis bounds (and NaN/Inf-sanitized) so the
+        # additive sources cannot compound past the head's mechanical range.
+        limits = (
+            SECONDARY_TRANSLATION_LIMIT_M,
+            SECONDARY_TRANSLATION_LIMIT_M,
+            SECONDARY_TRANSLATION_LIMIT_M,
+            SECONDARY_ROTATION_LIMIT_RAD,
+            SECONDARY_ROTATION_LIMIT_RAD,
+            SECONDARY_ROTATION_LIMIT_RAD,
+        )
         secondary_offsets = [
-            self.state.speech_offsets[0] + self.state.face_tracking_offsets[0],
-            self.state.speech_offsets[1] + self.state.face_tracking_offsets[1],
-            self.state.speech_offsets[2] + self.state.face_tracking_offsets[2],
-            self.state.speech_offsets[3] + self.state.face_tracking_offsets[3],
-            self.state.speech_offsets[4] + self.state.face_tracking_offsets[4],
-            self.state.speech_offsets[5] + self.state.face_tracking_offsets[5],
+            clamp_secondary_offset(
+                self.state.speech_offsets[axis] + self.state.face_tracking_offsets[axis],
+                limits[axis],
+            )
+            for axis in range(6)
         ]
 
         secondary_head_pose = create_head_pose(
@@ -741,10 +768,14 @@ class MovementManager:
         # Clear any queued moves and stop current move
         self.clear_move_queue()
 
-        # Stop the worker thread first so it doesn't interfere
+        # Stop the worker thread first so it doesn't interfere. The join is
+        # bounded so a wedged SDK call cannot hang the whole shutdown path
+        # (the worker is a daemon thread anyway).
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning("Move worker did not stop within 5s; continuing shutdown")
             self._thread = None
         logger.debug("Move worker stopped")
 
@@ -802,6 +833,45 @@ class MovementManager:
             },
         }
 
+    def _recover_from_tick_error(self) -> None:
+        """Keep the control loop alive after a tick failure.
+
+        Logs the exception (rate-limited), drops the current move (its
+        evaluate() may fail identically on every tick), and clears any
+        non-finite offsets or cached primary pose that would otherwise poison
+        every subsequent composition.
+        """
+        now = self._now()
+        if now - self._last_tick_err >= self._tick_err_interval:
+            msg = "Movement tick failed; dropping current move/bad offsets and continuing"
+            if self._tick_err_suppressed:
+                msg += f" (suppressed {self._tick_err_suppressed} repeats)"
+                self._tick_err_suppressed = 0
+            logger.exception(msg)
+            self._last_tick_err = now
+        else:
+            self._tick_err_suppressed += 1
+
+        # Skip the offending move so the queue keeps draining.
+        self.state.current_move = None
+        self.state.move_start_time = None
+        self._breathing_active = False
+
+        # Sanitize state that would keep failing on every tick.
+        if not all(np.isfinite(v) for v in self.state.speech_offsets):
+            self.state.speech_offsets = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        if not all(np.isfinite(v) for v in self.state.face_tracking_offsets):
+            self.state.face_tracking_offsets = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        last = self.state.last_primary_pose
+        if last is not None and not (
+            bool(np.all(np.isfinite(last[0])))
+            and np.isfinite(last[1][0])
+            and np.isfinite(last[1][1])
+            and np.isfinite(last[2])
+        ):
+            neutral_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
+            self.state.last_primary_pose = (neutral_pose, (0.0, 0.0), 0.0)
+
     def working_loop(self) -> None:
         """Control loop main movements - reproduces main_works.py control architecture.
 
@@ -822,23 +892,29 @@ class MovementManager:
                 freq_stats = self._update_frequency_stats(loop_start, prev_loop_start, freq_stats)
             prev_loop_start = loop_start
 
-            # 1) Poll external commands and apply pending offsets (atomic snapshot)
-            self._poll_signals(loop_start)
+            try:
+                # 1) Poll external commands and apply pending offsets (atomic snapshot)
+                self._poll_signals(loop_start)
 
-            # 2) Manage the primary move queue (start new move, end finished move, breathing)
-            self._update_primary_motion(loop_start)
+                # 2) Manage the primary move queue (start new move, end finished move, breathing)
+                self._update_primary_motion(loop_start)
 
-            # 3) Update vision-based secondary offsets
-            self._update_face_tracking(loop_start)
+                # 3) Update vision-based secondary offsets
+                self._update_face_tracking(loop_start)
 
-            # 4) Build primary and secondary full-body poses, then fuse them
-            head, antennas, body_yaw = self._compose_full_body_pose(loop_start)
+                # 4) Build primary and secondary full-body poses, then fuse them
+                head, antennas, body_yaw = self._compose_full_body_pose(loop_start)
 
-            # 5) Apply listening antenna freeze or blend-back
-            antennas_cmd = self._calculate_blended_antennas(antennas)
+                # 5) Apply listening antenna freeze or blend-back
+                antennas_cmd = self._calculate_blended_antennas(antennas)
 
-            # 6) Single set_target call - the only control point
-            self._issue_control_command(head, antennas_cmd, body_yaw)
+                # 6) Single set_target call - the only control point
+                self._issue_control_command(head, antennas_cmd, body_yaw)
+            except Exception:
+                # A single bad tick (e.g. NaN offsets -> LinAlgError during pose
+                # composition) must never kill the control loop: log it, drop
+                # the poisoned state, and keep ticking.
+                self._recover_from_tick_error()
 
             # 7) Adaptive sleep to align to next tick, then publish shared state
             sleep_time, freq_stats = self._schedule_next_tick(loop_start, freq_stats)

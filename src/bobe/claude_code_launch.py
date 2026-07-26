@@ -16,6 +16,7 @@ from bobe.claude_code_client import (
     request_daemon_json,
     derive_daemon_http_url,
     transcript_matches_phrase,
+    transcript_attempts_confirmation,
 )
 
 
@@ -111,6 +112,16 @@ class ClaudeCodeLaunchController:
     async def maybe_confirm_from_transcript(self, transcript: str | None) -> dict[str, Any] | None:
         """Launch only when a completed transcript is the exact confirmation phrase."""
         if not confirmation_phrase_matches(transcript):
+            if self.has_pending() and transcript_attempts_confirmation(transcript):
+                # Don't fail silently while a launch is pending: keep the pending
+                # request alive and tell the user the exact phrase to repeat.
+                return {
+                    "status": "confirmation_mismatch",
+                    "message": (
+                        "That wasn't the exact confirmation phrase. "
+                        f"To launch Claude Code, say exactly: {CONFIRMATION_PHRASE}."
+                    ),
+                }
             return None
 
         pending = self._pending

@@ -7,13 +7,16 @@ JSON-over-HTTP error mapping.
 """
 
 from __future__ import annotations
-import re
 import json
 import logging
+import functools
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
+
+from bobe.wake.phrases import normalize_transcript
 
 
 logger = logging.getLogger(__name__)
@@ -22,17 +25,53 @@ DEFAULT_CONFIRM_TTL_S = 45.0
 DEFAULT_REQUEST_TIMEOUT_S = 10.0
 AUTH_HEADER = "X-BoBe-Launch-Token"
 
-_SPACE_RE = re.compile(r"\s+")
-_TRAILING_PUNCTUATION_RE = re.compile(r"^[\s\"'`.,!?;:]+|[\s\"'`.,!?;:]+$")
+# Common Whisper/gpt-4o-transcribe mishears (keep tight, mirroring
+# WAKE_PHRASE_ASR_VARIANTS in bobe.wake.phrases).
+_CLAUDE_ASR_VARIANTS: tuple[str, ...] = ("cloud", "clod", "clawed", "claud")
+_CONFIRM_ASR_VARIANTS: tuple[str, ...] = ("confirmed",)
+
+
+@functools.lru_cache(maxsize=8)
+def _phrase_variants(phrase: str) -> frozenset[str]:
+    """Return the accepted normalized spellings of a confirmation phrase."""
+    base = normalize_transcript(phrase)
+    if not base:
+        return frozenset()
+    variants = {base}
+    for mishear in _CLAUDE_ASR_VARIANTS:
+        variants.add(base.replace("claude", mishear))
+    for confirmed in _CONFIRM_ASR_VARIANTS:
+        variants.update(
+            f"{confirmed} {variant.removeprefix('confirm ')}"
+            for variant in tuple(variants)
+            if variant.startswith("confirm ")
+        )
+    return frozenset(variants)
 
 
 def transcript_matches_phrase(transcript: str | None, phrase: str) -> bool:
-    """Return True only when the transcript is exactly ``phrase``, modulo ASR punctuation."""
+    """Return True only when the transcript is exactly ``phrase``, modulo ASR noise.
+
+    Both sides are normalized like the wake path (internal punctuation becomes
+    spaces), and a small variant list absorbs the well-known ``claude`` ->
+    ``cloud``/``clod`` and ``confirm`` -> ``confirmed`` mishears.
+    """
     if transcript is None:
         return False
-    normalized = _TRAILING_PUNCTUATION_RE.sub("", transcript.casefold())
-    normalized = _SPACE_RE.sub(" ", normalized).strip()
-    return normalized == phrase
+    normalized = normalize_transcript(transcript)
+    if not normalized:
+        return False
+    return normalized in _phrase_variants(phrase)
+
+
+def transcript_attempts_confirmation(transcript: str | None) -> bool:
+    """Return True when a transcript looks like a (possibly garbled) confirmation attempt."""
+    if transcript is None:
+        return False
+    normalized = normalize_transcript(transcript)
+    if not normalized:
+        return False
+    return normalized.split(" ", 1)[0] in {"confirm", *_CONFIRM_ASR_VARIANTS}
 
 
 def derive_daemon_http_url(wake_url: str | None, path: str) -> str | None:
@@ -83,6 +122,12 @@ def request_daemon_json(
         return {"ok": False, "error": "endpoint_unreachable"}
     except TimeoutError:
         return {"ok": False, "error": "endpoint_timeout"}
+    except (OSError, http.client.HTTPException) as exc:
+        # Body-read failures (ConnectionResetError, IncompleteRead, ...) are not
+        # wrapped in URLError by urllib; they must not escape into the realtime
+        # event loop, so map them like the other transport errors.
+        logger.warning("%s endpoint request failed: %s", log_label, exc)
+        return {"ok": False, "error": "endpoint_error"}
     return json_or_error(raw, fallback={"ok": False, "error": "bad_response"})
 
 

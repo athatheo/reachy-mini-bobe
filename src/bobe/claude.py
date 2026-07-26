@@ -13,6 +13,9 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_TOKENS = 1024  # search tool-use blocks count toward output tokens
 WEB_SEARCH_TOOL_TYPE = "web_search_20260209"
 DEFAULT_WEB_SEARCH_MAX_USES = 3
+# Explicit per-request timeout: the SDK default (10 minutes) would pin the
+# background tool on a stuck request for the rest of the conversation.
+DEFAULT_REQUEST_TIMEOUT_S = 60.0
 
 
 class ClaudeNotConfiguredError(RuntimeError):
@@ -66,6 +69,44 @@ class _ClaudeClient(Protocol):
     messages: _MessagesClient
 
 
+# One process-wide AsyncAnthropic client (it owns an httpx connection pool):
+# creating one per ask_claude call leaks pooled sockets until GC.
+_shared_client: Any = None
+_shared_client_api_key: str | None = None
+
+
+async def _get_shared_client(api_key: str) -> _ClaudeClient:
+    """Return the shared Anthropic client, rebuilding it when the API key changes."""
+    global _shared_client, _shared_client_api_key
+    if _shared_client is not None and _shared_client_api_key == api_key:
+        return cast(_ClaudeClient, _shared_client)
+
+    from anthropic import AsyncAnthropic
+
+    stale = _shared_client
+    _shared_client = AsyncAnthropic(api_key=api_key, timeout=DEFAULT_REQUEST_TIMEOUT_S)
+    _shared_client_api_key = api_key
+    if stale is not None:
+        await _close_client(stale)
+    return cast(_ClaudeClient, _shared_client)
+
+
+async def aclose_shared_claude_client() -> None:
+    """Close the shared Anthropic client (app shutdown / tests)."""
+    global _shared_client, _shared_client_api_key
+    stale = _shared_client
+    _shared_client = None
+    _shared_client_api_key = None
+    if stale is not None:
+        await _close_client(stale)
+
+
+async def _close_client(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        await close()
+
+
 async def ask_claude(
     question: str,
     *,
@@ -79,9 +120,7 @@ async def ask_claude(
 
     active_client = client
     if active_client is None:
-        from anthropic import AsyncAnthropic
-
-        active_client = cast(_ClaudeClient, AsyncAnthropic(api_key=cast(str, active_settings.api_key)))
+        active_client = await _get_shared_client(cast(str, active_settings.api_key))
 
     request: dict[str, Any] = {
         "model": active_settings.model,

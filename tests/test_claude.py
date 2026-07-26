@@ -1,14 +1,18 @@
 # ruff: noqa: D101,D102,D103,D107
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 
+from bobe import claude as claude_module
 from bobe.claude import (
     ClaudeSettings,
     ClaudeNotConfiguredError,
     ask_claude,
     extract_message_text,
     load_claude_settings,
+    aclose_shared_claude_client,
 )
 from bobe.prompts import REALTIME_LOCKED_ROUTING_SUFFIX, get_claude_system_prompt, get_realtime_session_instructions
 
@@ -119,3 +123,38 @@ async def test_ask_claude_omits_tools_when_web_search_disabled():
     await ask_claude("hi", settings=ClaudeSettings(api_key="key", web_search=False), client=client)
 
     assert "tools" not in client.messages.kwargs
+
+
+@pytest.mark.asyncio
+async def test_ask_claude_reuses_one_shared_client_with_explicit_timeout(monkeypatch):
+    instances = []
+
+    class FakeAsyncAnthropic:
+        def __init__(self, *, api_key, timeout=None, **kwargs):
+            self.api_key = api_key
+            self.timeout = timeout
+            self.closed = False
+            self.messages = FakeMessages()
+            instances.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(AsyncAnthropic=FakeAsyncAnthropic))
+    await aclose_shared_claude_client()
+    try:
+        await ask_claude("one", settings=ClaudeSettings(api_key="key-a"))
+        await ask_claude("two", settings=ClaudeSettings(api_key="key-a"))
+
+        assert len(instances) == 1
+        assert instances[0].timeout == claude_module.DEFAULT_REQUEST_TIMEOUT_S
+
+        # A changed API key rebuilds the client and closes the stale one.
+        await ask_claude("three", settings=ClaudeSettings(api_key="key-b"))
+        assert len(instances) == 2
+        assert instances[0].closed is True
+
+        await aclose_shared_claude_client()
+        assert instances[1].closed is True
+    finally:
+        await aclose_shared_claude_client()

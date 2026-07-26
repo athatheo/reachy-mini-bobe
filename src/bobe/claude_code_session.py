@@ -16,11 +16,17 @@ from bobe.claude_code_client import (
     request_daemon_json,
     derive_daemon_http_url,
     transcript_matches_phrase,
+    transcript_attempts_confirmation,
 )
 
 
 COMMAND_CONFIRMATION_PHRASE = "confirm claude command"
 CONTROL_PATH = "/v1/claude-code"
+
+# After the daemon accepts a command (202-style), poll briefly for a fast
+# result before reporting the command as still running.
+SEND_POLL_INTERVAL_S = 1.0
+SEND_POLL_WINDOW_S = 8.0
 
 
 @dataclass(frozen=True)
@@ -56,11 +62,13 @@ class ClaudeCodeSessionController:
         settings_loader: Callable[[], ClaudeCodeSessionSettings] | None = None,
         clock: Callable[[], float] = time.monotonic,
         opener: Callable[..., Any] = urllib.request.urlopen,
+        sleeper: Callable[[float], Any] | None = None,
     ) -> None:
-        """Initialize the controller with injectable clock and HTTP opener."""
+        """Initialize the controller with injectable clock, HTTP opener, and sleeper."""
         self._settings_loader = settings_loader or load_claude_code_session_settings
         self._clock = clock
         self._opener = opener
+        self._sleep = sleeper or asyncio.sleep
         self._pending: PendingClaudeCodeCommand | None = None
 
     async def start(self) -> dict[str, Any]:
@@ -99,6 +107,16 @@ class ClaudeCodeSessionController:
     async def maybe_confirm_from_transcript(self, transcript: str | None) -> dict[str, Any] | None:
         """Send a pending command only after the exact confirmation phrase."""
         if not command_confirmation_phrase_matches(transcript):
+            if self.has_pending() and transcript_attempts_confirmation(transcript):
+                # Don't fail silently while a command is pending: keep the pending
+                # command alive and tell the user the exact phrase to repeat.
+                return {
+                    "status": "confirmation_mismatch",
+                    "message": (
+                        "That wasn't the exact confirmation phrase. "
+                        f"To send the command, say exactly: {COMMAND_CONFIRMATION_PHRASE}."
+                    ),
+                }
             return None
 
         pending = self._pending
@@ -119,6 +137,10 @@ class ClaudeCodeSessionController:
 
         result = await asyncio.to_thread(self._post, settings, "/session/send", {"command": pending.command})
         if result.get("ok"):
+            if result.get("accepted"):
+                # New daemons accept the command and run it in the background;
+                # poll briefly so fast commands still get their result spoken.
+                return await self._report_accepted_command(settings, result)
             return {
                 "status": "sent",
                 "message": "I sent that command to Claude Code.",
@@ -129,6 +151,50 @@ class ClaudeCodeSessionController:
             "status": "error",
             "message": f"Claude Code command failed: {error}.",
             "result": result,
+        }
+
+    async def _report_accepted_command(
+        self,
+        settings: ClaudeCodeSessionSettings,
+        accepted: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Poll session status briefly; long commands report as running, not failed."""
+        deadline = self._clock() + SEND_POLL_WINDOW_S
+        while self._clock() < deadline:
+            await self._sleep(SEND_POLL_INTERVAL_S)
+            status = await asyncio.to_thread(self._request, settings, "GET", "/session/status", None)
+            if not status.get("ok"):
+                break  # transient status hiccup: fall through to the running report
+            if status.get("session_id") != accepted.get("session_id") or not status.get("active", True):
+                return {
+                    "status": "stopped",
+                    "message": "The Claude Code session was stopped before that command finished.",
+                    "result": status,
+                }
+            if status.get("running"):
+                continue
+            last_result = status.get("last_result")
+            if isinstance(last_result, dict):
+                if last_result.get("ok"):
+                    return {
+                        "status": "sent",
+                        "message": "Claude Code finished that command.",
+                        "result": last_result,
+                    }
+                error = str(last_result.get("error") or "send_failed")
+                return {
+                    "status": "error",
+                    "message": f"Claude Code command failed: {error}.",
+                    "result": last_result,
+                }
+            break
+        return {
+            "status": "running",
+            "message": (
+                "Claude Code is working on that command. "
+                "Ask me for the Claude Code status in a little while."
+            ),
+            "result": accepted,
         }
 
     async def status(self) -> dict[str, Any]:
