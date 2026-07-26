@@ -310,8 +310,10 @@ async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDe
     try:
         return await tool(deps, **args)
     except asyncio.CancelledError:
+        # Task cancellation must propagate: converting it into a normal result
+        # would let a cancelled tool task keep running as if it had completed.
         logger.info("Tool cancelled: %s", tool_name)
-        return {"error": "Tool cancelled"}
+        raise
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
         logger.exception("Tool error in %s: %s", tool_name, msg)

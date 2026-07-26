@@ -2,6 +2,7 @@ import time
 import random
 import asyncio
 import logging
+import threading
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -22,6 +23,7 @@ from bobe.claude_code_session import (
     ClaudeCodeSessionController,
     reset_claude_code_session_controller,
 )
+from bobe.tools.tool_constants import ToolState
 from bobe.tools.background_tool_manager import ToolCallRoutine
 
 
@@ -627,6 +629,19 @@ def _mic_frame(samples: int = 2400) -> tuple[int, Any]:
     return (24000, np.ones(samples, dtype=np.int16))
 
 
+async def _finish_wake_transition(handler: rt_mod.OpenaiRealtimeHandler) -> None:
+    """Wait for the background wake transition spawned by receive()."""
+    task = handler._wake_transition_task
+    assert task is not None
+    await task
+
+
+async def _drain_claude_code_tasks(handler: rt_mod.OpenaiRealtimeHandler) -> None:
+    """Wait for the background Claude Code confirmation tasks to finish."""
+    while handler._claude_code_tasks:
+        await asyncio.gather(*list(handler._claude_code_tasks), return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_receive_bypasses_wake_gating_when_detector_missing(caplog: Any) -> None:
     """Misconfigured wake must not silently drop mic audio."""
@@ -692,7 +707,9 @@ async def test_receive_flushes_buffer_and_streams_after_wake() -> None:
 
     await handler.receive(_mic_frame())  # buffered locally
     handler.wake_session.request_wake()
-    await handler.receive(_mic_frame())  # wake transition + live frame
+    await handler.receive(_mic_frame())  # consumes the wake; transition runs off the mic loop
+    await _finish_wake_transition(handler)
+    await handler.receive(_mic_frame())  # live frame streams upstream
 
     appended = handler.connection.input_audio_buffer.appended
     assert len(appended) == 2  # buffer tail flush + live frame
@@ -712,8 +729,82 @@ async def test_wake_ignored_when_openai_unavailable(monkeypatch: Any) -> None:
 
     handler.wake_session.request_wake()
     await handler.receive(_mic_frame())
+    await _finish_wake_transition(handler)
 
     assert not handler.wake_session.awake
+
+
+@pytest.mark.asyncio
+async def test_receive_is_not_blocked_by_slow_wake_transition(monkeypatch: Any) -> None:
+    """A stalled OpenAI connection wait must never freeze the mic loop."""
+    handler = _build_wake_enabled_handler()
+    handler.connection = None
+    release = asyncio.Event()
+
+    async def _slow_connect(_self: Any, timeout: float = 5.0) -> bool:
+        await release.wait()
+        return False
+
+    monkeypatch.setattr(rt_mod.OpenaiRealtimeHandler, "_ensure_openai_connection", _slow_connect)
+
+    handler.wake_session.request_wake()
+    started_at = time.monotonic()
+    await handler.receive(_mic_frame())
+    assert time.monotonic() - started_at < 0.5
+    assert handler._wake_transition_active()
+
+    # Mic frames keep flowing (buffered locally) while the transition hangs.
+    for _ in range(3):
+        await handler.receive(_mic_frame())
+    assert not handler.wake_session.awake
+    assert handler._wake_buffer.drain_tail(seconds=10.0).size > 0
+
+    release.set()
+    await _finish_wake_transition(handler)
+
+
+@pytest.mark.asyncio
+async def test_failed_wake_transition_backs_off_instead_of_retrying_every_frame(monkeypatch: Any) -> None:
+    """A failed transition re-queues the wake with backoff and an audible cue."""
+    handler = _build_wake_enabled_handler()
+    handler.connection = None
+    attempts = {"n": 0}
+
+    async def _unavailable(_self: Any, timeout: float = 5.0) -> bool:
+        attempts["n"] += 1
+        return False
+
+    monkeypatch.setattr(rt_mod.OpenaiRealtimeHandler, "_ensure_openai_connection", _unavailable)
+
+    handler.wake_session.request_wake()
+    await handler.receive(_mic_frame())
+    await _finish_wake_transition(handler)
+
+    assert attempts["n"] == 1
+    assert not handler.wake_session.awake
+    assert handler._next_wake_retry_at > time.monotonic()
+    # The failure is audible: a chime landed on the output queue.
+    assert isinstance(await handler.output_queue.get(), tuple)
+
+    # During the backoff window further frames must not start new attempts,
+    # and the wake request stays queued for a later retry.
+    for _ in range(3):
+        await handler.receive(_mic_frame())
+    assert attempts["n"] == 1
+    assert handler.wake_session.consume_wake_request()
+    first_delay = handler._wake_retry_delay_s
+
+    # Once the backoff window elapses the next frame retries the transition.
+    handler.wake_session.request_wake()
+    handler._next_wake_retry_at = time.monotonic() - 0.01
+    await handler.receive(_mic_frame())
+    await _finish_wake_transition(handler)
+
+    assert attempts["n"] == 2
+    # Exponential backoff: the retry delay keeps growing between failures.
+    assert handler._wake_retry_delay_s > first_delay
+    # The cue plays once per failure streak, not on every retry.
+    assert handler.output_queue.empty()
 
 
 @pytest.mark.asyncio
@@ -770,6 +861,7 @@ async def test_completed_user_transcript_awake_defers_to_server_response() -> No
     handler.wake_session.wake()
 
     await handler._handle_completed_user_transcript("what time is it")
+    await _drain_claude_code_tasks(handler)
 
     output = await handler.output_queue.get()
     assert output.args[0] == {"role": "user", "content": "what time is it"}
@@ -822,6 +914,7 @@ async def test_completed_confirmation_phrase_launches_claude_code() -> None:
         handler.wake_session.wake()
 
         await handler._handle_completed_user_transcript("confirm launch Claude Code")
+        await _drain_claude_code_tasks(handler)
 
         user_output = await handler.output_queue.get()
         assistant_output = await handler.output_queue.get()
@@ -851,6 +944,7 @@ async def test_near_miss_confirmation_transcript_does_not_launch_claude_code() -
         handler.wake_session.wake()
 
         await handler._handle_completed_user_transcript("please confirm launch Claude Code")
+        await _drain_claude_code_tasks(handler)
 
         assert calls == []
         assert controller.has_pending() is True
@@ -918,6 +1012,7 @@ async def test_completed_command_confirmation_sends_claude_code_command() -> Non
         handler.wake_session.wake()
 
         await handler._handle_completed_user_transcript("confirm Claude command")
+        await _drain_claude_code_tasks(handler)
 
         user_output = await handler.output_queue.get()
         assistant_output = await handler.output_queue.get()
@@ -947,12 +1042,74 @@ async def test_near_miss_command_confirmation_does_not_send_claude_code_command(
         handler.wake_session.wake()
 
         await handler._handle_completed_user_transcript("please confirm Claude command")
+        await _drain_claude_code_tasks(handler)
 
         assert calls == []
         assert controller.has_pending() is True
         user_output = await handler.output_queue.get()
         assert user_output.args[0] == {"role": "user", "content": "please confirm Claude command"}
         assert handler.output_queue.empty()
+    finally:
+        reset_claude_code_session_controller()
+
+
+@pytest.mark.asyncio
+async def test_command_confirmation_http_runs_off_the_event_dispatcher() -> None:
+    """The confirmation HTTP round-trip must not stall transcript handling.
+
+    _handle_completed_user_transcript runs inline in the realtime event
+    dispatcher; the Mac HTTP call (up to 10s) has to happen in a background
+    task that posts its result when done.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b'{"ok": true, "output": "done"}'
+
+    def slow_opener(request: Any, *, timeout: float) -> FakeResponse:
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return FakeResponse()
+
+    controller = ClaudeCodeSessionController(
+        settings_loader=lambda: ClaudeCodeSessionSettings(
+            base_url="http://mac.local:8765/v1/claude-code",
+            token="control-token",
+        ),
+        opener=slow_opener,
+    )
+    reset_claude_code_session_controller(controller)
+    try:
+        controller.request_send("run the tests")
+        handler = _build_wake_enabled_handler()
+        handler.wake_session.wake()
+
+        started_at = time.monotonic()
+        await handler._handle_completed_user_transcript("confirm Claude command")
+        assert time.monotonic() - started_at < 0.5
+
+        # The HTTP call is still in flight in a background task.
+        tasks = list(handler._claude_code_tasks)
+        assert len(tasks) == 1
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 2.0), timeout=3.0)
+        assert not tasks[0].done()
+
+        # Once the daemon answers, the result is surfaced via the output queue.
+        release.set()
+        await asyncio.wait_for(tasks[0], timeout=3.0)
+
+        user_output = await handler.output_queue.get()
+        assistant_output = await handler.output_queue.get()
+        assert user_output.args[0] == {"role": "user", "content": "confirm Claude command"}
+        assert "sent" in assistant_output.args[0]["content"]
     finally:
         reset_claude_code_session_controller()
 
@@ -1113,6 +1270,87 @@ async def test_preempt_sleep_response_cancels_active_response() -> None:
     assert handler._sleep_pending
     assert cancel_count == 1
     assert handler.connection.input_audio_buffer.cleared == 1
+
+
+# ---- Tool-result handling ----
+
+
+class RecordingItemConnection:
+    """Connection stub recording conversation.item.create payloads."""
+
+    def __init__(self) -> None:
+        """Initialize with an empty item log."""
+        self.items: list[dict[str, Any]] = []
+        outer = self
+
+        class _Item:
+            async def create(self, *, item: dict[str, Any]) -> None:
+                outer.items.append(item)
+
+        class _Conversation:
+            item = _Item()
+
+        self.conversation = _Conversation()
+
+
+@pytest.mark.asyncio
+async def test_camera_tool_result_never_inlines_base64_as_text() -> None:
+    """The camera JPEG travels only as an input_image item, never as raw text.
+
+    Inlining the base64 as function_call_output text (or in the chat payload)
+    injects hundreds of KB of raw tokens and breaks every camera invocation.
+    """
+    handler = _build_wake_enabled_handler()
+    connection = RecordingItemConnection()
+    handler.connection = connection
+
+    b64_im = "QUJD" * 50_000  # ~200 KB of base64, like a real camera frame
+    notification = btm_mod.ToolNotification(
+        id="call_cam_1",
+        tool_name="camera",
+        status=ToolState.COMPLETED,
+        result={"b64_im": b64_im},
+    )
+
+    await handler._handle_tool_result(notification)
+
+    function_outputs = [i for i in connection.items if i.get("type") == "function_call_output"]
+    assert len(function_outputs) == 1
+    assert b64_im not in function_outputs[0]["output"]
+    assert "image captured and attached" in function_outputs[0]["output"]
+
+    image_items = [i for i in connection.items if i.get("type") == "message"]
+    assert len(image_items) == 1
+    image_content = image_items[0]["content"][0]
+    assert image_content["type"] == "input_image"
+    assert image_content["image_url"] == f"data:image/jpeg;base64,{b64_im}"
+
+    # The chat payload must not carry the base64 either.
+    chat_payload = await handler.output_queue.get()
+    assert b64_im not in chat_payload.args[0]["content"]
+    assert "image captured and attached" in chat_payload.args[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_non_camera_tool_result_output_is_unchanged() -> None:
+    """Regular tool results still serialize verbatim into the function output."""
+    handler = _build_wake_enabled_handler()
+    connection = RecordingItemConnection()
+    handler.connection = connection
+
+    notification = btm_mod.ToolNotification(
+        id="call_1",
+        tool_name="move_head",
+        status=ToolState.COMPLETED,
+        result={"ok": True, "direction": "left"},
+    )
+
+    await handler._handle_tool_result(notification)
+
+    function_outputs = [i for i in connection.items if i.get("type") == "function_call_output"]
+    assert len(function_outputs) == 1
+    assert '"direction": "left"' in function_outputs[0]["output"]
+    assert [i for i in connection.items if i.get("type") == "message"] == []
 
 
 # ---- Stress test: response.create rejection + retry ----

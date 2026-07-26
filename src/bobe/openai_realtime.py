@@ -16,7 +16,7 @@ from openai import AsyncOpenAI
 from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item, audio_to_int16
 from numpy.typing import NDArray
 from scipy.signal import resample
-from websockets.exceptions import ConnectionClosedError
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
 from bobe.config import config, set_custom_profile
 from bobe.prompts import get_session_voice, get_realtime_session_instructions
@@ -64,6 +64,10 @@ _RESTART_CONNECT_TIMEOUT_S: Final[float] = 5.0
 _ASSISTANT_VAD_GUARD_S: Final[float] = 0.4
 # World-frame head translation applied when falling asleep (millimeters, vertical).
 _SLEEP_HEAD_Z_OFFSET_MM: Final[float] = 30.0
+# Exponential backoff bounds for retrying a failed wake transition; retries
+# must never run once per mic frame, and the mic loop must never stall on them.
+_WAKE_RETRY_INITIAL_DELAY_S: Final[float] = 2.0
+_WAKE_RETRY_MAX_DELAY_S: Final[float] = 30.0
 
 
 class RealtimeSessionError(Exception):
@@ -181,6 +185,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._shutdown_requested: bool = False
         # Consecutive session failures; reset whenever a session connects.
         self._session_failures: int = 0
+        # Wake transitions run off the mic loop: receive() must never await the
+        # (possibly multi-second) OpenAI connection wait. A failed transition
+        # re-queues the wake and backs off exponentially instead of retrying
+        # once per mic frame.
+        self._wake_transition_task: asyncio.Task[None] | None = None
+        self._wake_retry_delay_s: float = _WAKE_RETRY_INITIAL_DELAY_S
+        self._next_wake_retry_at: float = 0.0
+        # Claude Code confirmations do HTTP round-trips to the Mac; they run as
+        # background tasks so the realtime event dispatcher never blocks on them.
+        self._claude_code_tasks: set[asyncio.Task[None]] = set()
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         self.wake_config = load_wake_config()
@@ -527,6 +541,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             )
             return
 
+        # The camera tool's base64 JPEG travels only as the input_image item
+        # below; inlining it in the function output or chat payload would
+        # inject hundreds of kilobytes of base64 as raw text tokens.
+        b64_im: str | None = None
+        summary_result = tool_result
+        if bg_tool.tool_name == "camera" and isinstance(tool_result, dict) and "b64_im" in tool_result:
+            # use raw base64, don't json.dumps (which adds quotes)
+            raw_b64 = tool_result["b64_im"]
+            if not isinstance(raw_b64, str):
+                logger.warning("Unexpected type for b64_im: %s", type(raw_b64))
+                raw_b64 = str(raw_b64)
+            b64_im = raw_b64
+            summary_result = {k: v for k, v in tool_result.items() if k != "b64_im"}
+            summary_result["status"] = "image captured and attached"
+
         try:
             # Send the tool result back
             if isinstance(bg_tool.id, str):
@@ -534,7 +563,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     item={
                         "type": "function_call_output",
                         "call_id": bg_tool.id,
-                        "output": json.dumps(tool_result),
+                        "output": json.dumps(summary_result),
                     },
                 )
 
@@ -542,7 +571,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 AdditionalOutputs(
                     {
                         "role": "assistant",
-                        "content": json.dumps(tool_result),
+                        "content": json.dumps(summary_result),
                         # Gradio UI metadata.status accept only "pending" and "done". Do not accept bg.tool.status values.
                         "metadata": {
                             "title": f"🛠️ Used tool {bg_tool.tool_name}",
@@ -552,12 +581,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 ),
             )
 
-            if bg_tool.tool_name == "camera" and "b64_im" in tool_result:
-                # use raw base64, don't json.dumps (which adds quotes)
-                b64_im = tool_result["b64_im"]
-                if not isinstance(b64_im, str):
-                    logger.warning("Unexpected type for b64_im: %s", type(b64_im))
-                    b64_im = str(b64_im)
+            if b64_im is not None:
                 await self.connection.conversation.item.create(
                     item={
                         "type": "message",
@@ -603,11 +627,20 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             if self.deps.head_wobbler is not None:
                 self.deps.head_wobbler.reset()
 
-        except ConnectionClosedError:
+        except ConnectionClosed:
+            # Base class: covers ConnectionClosedError AND ConnectionClosedOK
+            # (a cleanly-closed socket, e.g. after a session restart).
             logger.warning("Connection closed while sending tool result")
             self.connection = None
             self._connected_event.clear()
             self._response_done_event.set()
+        except Exception:
+            # Never let a single tool result kill the notification listener.
+            logger.exception(
+                "Failed to deliver result of tool '%s' (id=%s)",
+                bg_tool.tool_name,
+                bg_tool.id,
+            )
 
     def _transcript_requests_sleep(self, transcript: str | None) -> bool:
         """Return True when a transcript contains a configured sleep phrase."""
@@ -659,6 +692,33 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             fallback_message="Claude Code command request handled.",
         )
 
+    def _start_claude_code_confirmation(self, transcript: str) -> None:
+        """Run the Claude Code confirmation flow as a background task.
+
+        Confirming a launch/command does an HTTP round-trip to the Mac (and may
+        poll the daemon for several seconds). Awaiting that inline in the
+        realtime event dispatcher would stall all event processing (audio
+        deltas, VAD, tool calls), so the flow runs off the dispatcher and posts
+        its result via output_queue/_safe_response_create when done.
+        """
+        task = asyncio.create_task(
+            self._run_claude_code_confirmation(transcript),
+            name="claude-code-confirmation",
+        )
+        self._claude_code_tasks.add(task)
+        task.add_done_callback(self._claude_code_tasks.discard)
+
+    async def _run_claude_code_confirmation(self, transcript: str) -> None:
+        """Handle launch then command confirmations, surfacing results when done."""
+        try:
+            if await self._maybe_launch_claude_code_from_transcript(transcript):
+                return
+            await self._maybe_send_claude_code_command_from_transcript(transcript)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Claude Code confirmation handling failed")
+
     async def _handle_claude_code_confirmation_result(
         self,
         result: dict[str, Any] | None,
@@ -702,10 +762,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
         if await self._maybe_sleep_from_transcript(transcript):
             return
-        if await self._maybe_launch_claude_code_from_transcript(transcript):
-            return
-        if await self._maybe_send_claude_code_command_from_transcript(transcript):
-            return
+        # Claude Code confirmations can block on HTTP for many seconds; never
+        # await them here, inside the realtime event dispatcher.
+        self._start_claude_code_confirmation(transcript)
         self.wake_session.touch()
 
     def _reset_per_session_response_state(self) -> None:
@@ -785,9 +844,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self._session_failures = 0
 
             response_sender_task: asyncio.Task[None] | None = None
+            tool_manager_generation: int | None = None
             try:
-                # Start the background tool manager
-                self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
+                # Start the background tool manager; keep the generation token
+                # so this session can only ever shut down its own listener.
+                tool_manager_generation = self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
@@ -980,8 +1041,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     except asyncio.CancelledError:
                         pass
 
-                # Stop background tool manager tasks (listener + cleanup) in all paths.
-                await self.tool_manager.shutdown()
+                # Stop background tool manager tasks (listener + cleanup) in all
+                # paths. The shutdown is generation-scoped: if a newer session
+                # already ran start_up, this stale teardown is a no-op instead
+                # of cancelling the new session's listener and tools.
+                if tool_manager_generation is not None:
+                    await self.tool_manager.shutdown(generation=tool_manager_generation)
 
     def _to_wake_rate(self, audio_frame: NDArray[Any], input_sample_rate: int) -> NDArray[np.int16]:
         """Convert a mono frame to the 16 kHz int16 format the wake backends expect."""
@@ -1050,6 +1115,55 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self.deps.movement_manager.queue_move(move)
         except Exception:
             logger.debug("Antenna cue skipped", exc_info=True)
+
+    def _wake_transition_active(self) -> bool:
+        """Return whether an awake transition task is currently running."""
+        task = self._wake_transition_task
+        return task is not None and not task.done()
+
+    def _start_wake_transition(self) -> None:
+        """Kick off the awake transition without stalling the mic loop.
+
+        _transition_to_awake can spend many seconds waiting for an OpenAI
+        connection; awaiting it inline in receive() would freeze mic capture
+        and sleep/expiry processing. At most one transition runs at a time;
+        while a failed attempt is backing off, the wake request stays queued so
+        a later frame retries it once the window elapses.
+        """
+        if self._wake_transition_active():
+            # The running transition already opens the streaming window.
+            return
+        if time.monotonic() < self._next_wake_retry_at:
+            self.wake_session.request_wake()
+            return
+        self._wake_transition_task = asyncio.create_task(
+            self._run_wake_transition(),
+            name="wake-transition",
+        )
+
+    async def _run_wake_transition(self) -> None:
+        """Attempt the awake transition; on failure cue the user and back off."""
+        try:
+            success = await self._transition_to_awake()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Wake transition failed")
+            success = False
+
+        if success:
+            self._wake_retry_delay_s = _WAKE_RETRY_INITIAL_DELAY_S
+            self._next_wake_retry_at = 0.0
+            return
+
+        delay = self._wake_retry_delay_s
+        self._wake_retry_delay_s = min(delay * 2.0, _WAKE_RETRY_MAX_DELAY_S)
+        self._next_wake_retry_at = time.monotonic() + delay
+        logger.error("Wake transition failed; retrying in %.1f seconds", delay)
+        if delay == _WAKE_RETRY_INITIAL_DELAY_S:
+            # Audible cue once per failure streak so the wake is not silently dropped.
+            await self._play_chime(ascending=False)
+        self.wake_session.request_wake()
 
     async def _transition_to_awake(self) -> bool:
         """Open the streaming window after a local wake-word detection."""
@@ -1147,8 +1261,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         if self.wake_gating_enabled:
             if self.wake_session.consume_wake_request():
-                if not await self._transition_to_awake():
-                    self.wake_session.request_wake()
+                # Never await the (possibly slow) transition here: receive() is
+                # called serially per mic frame by the record loop.
+                self._start_wake_transition()
             elif self.wake_session.consume_sleep_request():
                 await self._transition_to_sleep("local sleep phrase")
             elif self.wake_session.expired():
@@ -1206,6 +1321,19 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Stop the local wake-word detector thread
         if self._wake_detector is not None:
             self._wake_detector.stop()
+
+        # Stop any in-flight wake transition and Claude Code confirmation tasks.
+        background_tasks = [self._wake_transition_task, *self._claude_code_tasks]
+        self._wake_transition_task = None
+        self._claude_code_tasks.clear()
+        for background_task in background_tasks:
+            if background_task is None or background_task.done():
+                continue
+            background_task.cancel()
+            try:
+                await background_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         session_task = self._realtime_session_task
         if session_task is not None and not session_task.done():

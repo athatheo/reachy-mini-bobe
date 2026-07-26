@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM_TOOL_NAMES: set[str] = {t.value for t in SystemTool}
 
+# How long shutdown() waits for cancelled tool tasks to actually finish.
+_TOOL_SHUTDOWN_TIMEOUT_S: float = 5.0
+
+
+def _consume_task_result(task: "asyncio.Task[Any]") -> None:
+    """Retrieve a finished task's exception so it is never reported as unretrieved."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Discarded exception from task %r: %r", task.get_name(), exc)
+
 
 class ToolProgress(BaseModel):
     """Progress of a background tool."""
@@ -101,6 +113,10 @@ class BackgroundToolManager(BaseModel):
     _loop: Optional[asyncio.AbstractEventLoop] = PrivateAttr(default=None)
     # Internal lifecycle tasks (notification listener, periodic cleanup).
     _lifecycle_tasks: list[asyncio.Task[None]] = PrivateAttr(default_factory=list)
+    # Monotonic token identifying the start_up() that owns _lifecycle_tasks.
+    # A stale session's shutdown(generation=...) must never touch tasks that
+    # a newer start_up() created.
+    _lifecycle_generation: int = PrivateAttr(default=0)
     # Tools running longer than this are auto-cancelled (1 day).
     _max_tool_duration_seconds: float = PrivateAttr(default=86400)
     # Completed/failed/cancelled tools older than this are purged (1 hour).
@@ -169,7 +185,18 @@ class BackgroundToolManager(BaseModel):
         tool_call_routine: ToolCallRoutine,
     ) -> None:
         """Execute the tool and handle completion."""
-        result: dict[str, Any] = await tool_call_routine(self)
+        try:
+            result: dict[str, Any] = await tool_call_routine(self)
+        except asyncio.CancelledError:
+            # Cancellation propagates from the tool (core_tools re-raises it).
+            # Record the outcome, queue the notification synchronously (the
+            # queue is unbounded), and let the cancellation finish the task.
+            bg_tool.completed_at = time.monotonic()
+            bg_tool.status = ToolState.CANCELLED
+            bg_tool.error = "Tool cancelled"
+            self._notification_queue.put_nowait(bg_tool.get_notification())
+            logger.debug(f"Background tool cancelled: {bg_tool.tool_name} (id={bg_tool.id})")
+            raise
         bg_tool.completed_at = time.monotonic()
         error = result.get("error")
 
@@ -249,7 +276,7 @@ class BackgroundToolManager(BaseModel):
 
         return False
 
-    def start_up(self, tool_callbacks: list[Callable[[ToolNotification], Coroutine[Any, Any, None]]]) -> None:
+    def start_up(self, tool_callbacks: list[Callable[[ToolNotification], Coroutine[Any, Any, None]]]) -> int:
         """Start the background tool manager.
 
         This method starts two concurrent tasks:
@@ -259,14 +286,44 @@ class BackgroundToolManager(BaseModel):
         Args:
             tool_callbacks: A list of async or sync callables that receive the completed BackgroundTool notifications.
 
+        Returns:
+            A generation token identifying this start_up. Pass it to
+            ``shutdown(generation=...)`` so a stale caller can never tear down
+            lifecycle tasks created by a newer ``start_up``.
+
         """
         self.set_loop()
+
+        # Idempotent takeover: a previous session's lifecycle tasks must never
+        # survive a new start_up (and its later shutdown must not touch ours).
+        for stale_task in self._lifecycle_tasks:
+            if not stale_task.done():
+                stale_task.cancel()
+            stale_task.add_done_callback(_consume_task_result)
+        self._lifecycle_tasks = []
+        self._lifecycle_generation += 1
+        generation = self._lifecycle_generation
+
+        # Notifications queued for a dead session's conversation must never
+        # replay into this fresh session.
+        self._drain_notifications()
 
         async def _listener() -> None:
             while True:
                 bg_tool = await self._notification_queue.get()
                 for callback in tool_callbacks:
-                    await callback(bg_tool)
+                    try:
+                        await callback(bg_tool)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # One bad notification/callback must not kill delivery
+                        # for the rest of the session.
+                        logger.exception(
+                            "Tool notification callback failed for %s (id=%s)",
+                            bg_tool.tool_name,
+                            bg_tool.id,
+                        )
 
         async def _cleanup(interval_seconds: float = 5 * 60) -> None:
             while True:
@@ -285,20 +342,81 @@ class BackgroundToolManager(BaseModel):
             "Max tool memory retention: %s seconds (completed/failed/cancelled tools older than this are purged).",
             self._max_tool_duration_seconds, self._max_tool_memory_seconds,
         )
+        return generation
 
-    async def shutdown(self) -> None:
-        """Cancel all background tasks (listener, cleanup) and running tools."""
-        for task in self._lifecycle_tasks:
+    def _drain_notifications(self) -> int:
+        """Discard queued notifications; they belong to an ended session."""
+        drained = 0
+        while True:
+            try:
+                self._notification_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            drained += 1
+        if drained:
+            logger.debug("Discarded %d stale tool notification(s)", drained)
+        return drained
+
+    async def shutdown(self, generation: int | None = None) -> None:
+        """Cancel running tools, then the background tasks (listener, cleanup).
+
+        Ordering matters: tools are cancelled and awaited *before* the listener
+        so their cancellation notifications are consumed (or drained below)
+        instead of surviving in the persistent queue and replaying into the
+        next session's fresh listener.
+
+        Args:
+            generation: When provided, only shut down if it still matches the
+                generation returned by the owning ``start_up``. A stale caller
+                (e.g. an old session's teardown racing a new session) becomes a
+                no-op instead of killing the new session's listener and tools.
+
+        """
+        if generation is not None and generation != self._lifecycle_generation:
+            logger.debug(
+                "Skipping shutdown for stale generation %d (current %d)",
+                generation,
+                self._lifecycle_generation,
+            )
+            return
+
+        # Cancel and await running tools first so every cancellation
+        # notification is enqueued before the queue is drained.
+        tool_tasks = [
+            tool._task
+            for tool in self._tools.values()
+            if tool.status == ToolState.RUNNING and tool._task is not None and not tool._task.done()
+        ]
+        for tool_id in list(self._tools):
+            await self.cancel_tool(tool_id, log=False)
+        if tool_tasks:
+            done, pending = await asyncio.wait(tool_tasks, timeout=_TOOL_SHUTDOWN_TIMEOUT_S)
+            for task in done:
+                _consume_task_result(task)
+            for task in pending:
+                logger.warning(
+                    "Background tool task %r did not stop within %.1fs",
+                    task.get_name(),
+                    _TOOL_SHUTDOWN_TIMEOUT_S,
+                )
+
+        lifecycle_tasks = self._lifecycle_tasks
+        self._lifecycle_tasks = []
+        for task in lifecycle_tasks:
             task.cancel()
-        for task in self._lifecycle_tasks:
+        for task in lifecycle_tasks:
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-        self._lifecycle_tasks.clear()
+            except Exception:
+                # A listener that died with a stored exception (e.g. a closed
+                # websocket) must not let that exception escape shutdown.
+                logger.exception("Lifecycle task %r failed during shutdown", task.get_name())
 
-        for tool_id in list(self._tools):
-            await self.cancel_tool(tool_id, log=False)
+        # Anything still queued belongs to this ended session; never let it
+        # replay into the next one.
+        self._drain_notifications()
 
         logger.info("BackgroundToolManager shut down")
 
