@@ -342,13 +342,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             try:
                 await session_task
             except asyncio.CancelledError:
-                # Either shutdown/external cancellation (propagate) or a stalled
-                # session was cancelled to force a restart (reconnect).
-                if self._shutdown_requested or not self._restart_requested.is_set():
+                # Propagate only shutdown or cancellation of the supervisor
+                # itself. Any other cancel of the session task (a requested
+                # restart, or a restart racing mid-connect that already cleared
+                # _restart_requested) must reconnect, never kill the supervisor.
+                if self._shutdown_requested or self._current_task_cancelling():
                     raise
-                if self._current_task_cancelling():
-                    raise
-                logger.info("Realtime session task cancelled for restart; reconnecting")
+                logger.info("Realtime session task cancelled; reconnecting")
                 continue
             except Exception as e:
                 if self._shutdown_requested:
@@ -414,9 +414,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return False
         return self.connection is not None
 
-    async def _await_or_cancel_session_task(self, *, timeout: float = 2.0) -> None:
-        """Wait for the current session task to finish, or cancel it if it stalls."""
-        task = self._realtime_session_task
+    async def _await_or_cancel_session_task(
+        self,
+        task: "asyncio.Task[None] | None" = None,
+        *,
+        timeout: float = 2.0,
+    ) -> None:
+        """Wait for a session task to finish, or cancel it if it stalls.
+
+        Operates on the caller's task snapshot: while we wait, the supervisor
+        may already have installed a replacement session task, and cancelling
+        whatever _realtime_session_task points to NOW could kill that healthy
+        replacement instead of the stale session we meant to reap.
+        """
+        if task is None:
+            task = self._realtime_session_task
         if task is None or task.done():
             return
         try:
@@ -432,6 +444,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     async def _invalidate_realtime_connection(self) -> None:
         """Drop the active connection so the session task can exit and restart."""
         conn = self.connection
+        # Snapshot before the first await: this is still the OLD session task
+        # (the supervisor cannot have swapped in a replacement yet).
+        session_task = self._realtime_session_task
         self.connection = None
         self._connected_event.clear()
         if conn is not None:
@@ -439,7 +454,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 await conn.close()
             except Exception:
                 pass
-        await self._await_or_cancel_session_task()
+        await self._await_or_cancel_session_task(session_task)
 
     async def _restart_session(self) -> None:
         """Ask the start_up supervisor to replace the session with a fresh one.
@@ -1100,7 +1115,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     try:
                         await response_sender_task
                     except asyncio.CancelledError:
-                        pass
+                        # Distinguish the sender finishing its cancel from THIS
+                        # task being cancelled (e.g. by shutdown()) while it
+                        # awaited: swallowing the latter would consume
+                        # shutdown's only cancellation and block it on the
+                        # tool-manager teardown below. shutdown() runs a full
+                        # tool_manager.shutdown() itself afterwards.
+                        if self._current_task_cancelling():
+                            raise
 
                 # Stop background tool manager tasks (listener + cleanup) in all
                 # paths. The shutdown is generation-scoped: if a newer session
