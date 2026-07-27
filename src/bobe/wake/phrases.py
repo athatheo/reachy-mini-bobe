@@ -10,10 +10,16 @@ DEFAULT_SLEEP_PHRASES: tuple[str, ...] = ("go to sleep", "κοιμήσου")
 SLEEP_PHRASE_ASR_VARIANTS: tuple[str, ...] = ("got to sleep",)
 
 # Common Whisper near-misses for the wake name (keep tight — avoid everyday phrases).
+# "hey bob"/"hey bove" added after benchmarking: every Whisper size (including
+# medium.en) predominantly transcribes "hey bobe" as "Hey Bob"; without these
+# variants most genuine wakes are dropped. Trade-off: saying "hey Bob" to a
+# person named Bob within earshot now wakes the robot.
 WAKE_PHRASE_ASR_VARIANTS: tuple[str, ...] = (
     "hey bobby",
     "hey boby",
     "hey bobbie",
+    "hey bob",
+    "hey bove",
 )
 
 # Substrings that must not trigger wake (common Whisper false positives / homophones).

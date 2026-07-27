@@ -42,6 +42,13 @@ def test_rejects_bare_name_prompt_echo():
 def test_matches_wake_phrase_asr_variants():
     assert matches_wake_phrase("hey bobby")
     assert matches_wake_phrase("hey boby what's up")
+    # Whisper (all sizes) predominantly hears "hey bobe" as "Hey Bob"/"Hey Bove".
+    assert matches_wake_phrase("Hey, Bob.")
+    assert matches_wake_phrase("Hey Bob, what's the weather today?")
+    assert matches_wake_phrase("Hey Bove, what's the weather today?")
+    # Bare name must still not wake, even as the variant form.
+    assert not matches_wake_phrase("Bob.")
+    assert not matches_wake_phrase("bove")
 
 
 def test_rejects_unrelated_speech():
