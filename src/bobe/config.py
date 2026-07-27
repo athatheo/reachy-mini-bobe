@@ -5,6 +5,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from bobe.env_utils import parse_bool
+
 
 # Locked profile: set to a profile name (e.g., "astronomer") to lock the app
 # to that profile and disable all profile switching. Leave as None for normal behavior.
@@ -21,17 +23,12 @@ def _env_flag(name: str, default: bool = False) -> bool:
     Accepted falsy values: 0, false, no, off
     """
     raw = os.getenv(name)
-    if raw is None:
+    value = parse_bool(raw)
+    if value is None:
+        if raw is not None:
+            logger.warning("Invalid boolean value for %s=%r, using default=%s", name, raw, default)
         return default
-
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-
-    logger.warning("Invalid boolean value for %s=%r, using default=%s", name, raw, default)
-    return default
+    return value
 
 
 def _collect_profile_names(profiles_root: Path) -> set[str]:

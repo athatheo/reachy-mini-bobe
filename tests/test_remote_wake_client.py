@@ -191,6 +191,19 @@ def _make_client(**kwargs) -> RemoteWakeClient:
     return RemoteWakeClient(lambda: None, url="ws://127.0.0.1:8765/v1/stream", token="secret", **kwargs)
 
 
+def _listen_payloads(ws: FakeWebSocket) -> list[dict]:
+    payloads = [json.loads(m) for m in ws.sent if isinstance(m, str)]
+    return [p for p in payloads if p.get("type") == "listen"]
+
+
+async def _wait_for_listen(ws: FakeWebSocket, *, mode: str | None = None, timeout: float = 2.0) -> None:
+    """Poll until the send loop has flushed a listen payload (optionally for a given mode)."""
+    deadline = time.monotonic() + timeout
+    while not any(mode is None or p["mode"] == mode for p in _listen_payloads(ws)):
+        assert time.monotonic() < deadline, f"no listen payload (mode={mode!r}) sent within {timeout}s"
+        await asyncio.sleep(0.01)
+
+
 def test_run_connection_replays_current_listen_mode_and_stops_on_sentinel():
     client = _make_client()
     client._listen_mode = "sleep"
@@ -198,7 +211,7 @@ def test_run_connection_replays_current_listen_mode_and_stops_on_sentinel():
 
     async def run() -> None:
         task = asyncio.create_task(client._run_connection(ws))
-        await asyncio.sleep(0.3)
+        await _wait_for_listen(ws)
         # Stop sentinel, as stop() would enqueue after the handshake.
         client._audio_queue.put_nowait(None)
         await asyncio.wait_for(task, timeout=5.0)
@@ -223,7 +236,10 @@ def test_run_connection_drops_stale_queued_audio():
 
     async def run() -> None:
         task = asyncio.create_task(client._run_connection(ws))
-        await asyncio.sleep(0.3)
+        # The listen replay is sent after _drain_audio_queue(), so once it
+        # shows up any stale frames were either dropped or already in ws.sent
+        # (the queue is FIFO); the negative assertion below is deterministic.
+        await _wait_for_listen(ws)
         client._audio_queue.put_nowait(None)
         await asyncio.wait_for(task, timeout=5.0)
 
@@ -231,14 +247,9 @@ def test_run_connection_drops_stale_queued_audio():
     assert not any(isinstance(m, (bytes, bytearray)) for m in ws.sent)
 
 
-def _listen_payloads(ws: FakeWebSocket) -> list[dict]:
-    payloads = [json.loads(m) for m in ws.sent if isinstance(m, str)]
-    return [p for p in payloads if p.get("type") == "listen"]
-
-
-async def _drive_send_loop(client: RemoteWakeClient, ws: object) -> None:
+async def _drive_send_loop(client: RemoteWakeClient, ws: FakeWebSocket) -> None:
     task = asyncio.create_task(client._send_loop(ws))
-    await asyncio.sleep(0.2)
+    await _wait_for_listen(ws)
     client._audio_queue.put_nowait(None)  # stop sentinel
     await asyncio.wait_for(task, timeout=5.0)
 
@@ -304,7 +315,7 @@ def test_reconnect_replay_cannot_clobber_concurrent_mode_change():
 
     async def run() -> None:
         task = asyncio.create_task(client._run_connection(ws))
-        await asyncio.sleep(0.3)
+        await _wait_for_listen(ws, mode="sleep")
         client._audio_queue.put_nowait(None)
         await asyncio.wait_for(task, timeout=5.0)
 

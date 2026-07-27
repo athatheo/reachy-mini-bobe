@@ -8,7 +8,6 @@ from pathlib import Path
 
 from bobe.claude import DEFAULT_CLAUDE_MODEL
 from bobe.config import config
-from bobe.instance import load_instance_env
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +49,25 @@ def read_env_lines(env_path: Path) -> list[str]:
         return _read_lines_if_exists(env_path) or []
     except Exception:
         return []
+
+
+def parse_env_lines(lines: list[str]) -> dict[str, str]:
+    """Parse KEY=value assignments from env file lines.
+
+    Skips blank lines, ``#`` comments, and lines without ``=``; strips
+    whitespace and surrounding quotes from values. The first occurrence of a
+    key wins, matching ``upsert_env_keys``'s first-line-update semantics.
+    """
+    values: dict[str, str] = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key in values:
+            continue
+        values[key] = value.strip().strip('"').strip("'")
+    return values
 
 
 def write_env_lines(env_path: Path, lines: list[str]) -> None:
@@ -110,6 +128,5 @@ def persist_api_settings(
             lines = upsert_env_keys(read_env_lines(env_path), values)
             write_env_lines(env_path, lines)
         logger.info("Persisted explicit API settings to %s", env_path)
-        load_instance_env(instance_path)
     except Exception as exc:
         logger.warning("Failed to persist explicit API settings: %s", exc)

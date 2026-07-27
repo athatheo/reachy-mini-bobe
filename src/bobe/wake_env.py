@@ -3,11 +3,13 @@
 from __future__ import annotations
 import os
 from pathlib import Path
+from functools import lru_cache
 from urllib.parse import urlparse
 
 from bobe.env_file import (
     ENV_FILE_LOCK,
     read_env_lines,
+    parse_env_lines,
     upsert_env_keys,
     write_env_lines,
     _read_lines_if_exists,
@@ -44,26 +46,24 @@ def _hostname_from_ws_url(url: str) -> str | None:
     return hostname.casefold() if hostname else None
 
 
+@lru_cache(maxsize=1)
 def default_wake_allowed_hosts() -> frozenset[str]:
-    """Hostnames from the packaged .env.example, always part of the effective allowlist."""
+    """Hostnames from the packaged .env.example, always part of the effective allowlist.
+
+    Parsed once per process (the packaged example is immutable at runtime), so
+    per-request host checks never re-read the file.
+    """
     if not _PACKAGED_ENV_EXAMPLE.exists():
         return frozenset()
-    hosts: set[str] = set()
-    for line in _PACKAGED_ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, _, value = stripped.partition("=")
-        value = value.strip().strip('"').strip("'")
-        if key == "BOBE_WAKE_REMOTE_URL":
-            host = _hostname_from_ws_url(value)
-            if host:
-                hosts.add(host)
-        elif key == "BOBE_WAKE_ALLOWED_HOSTS":
-            for part in value.split(","):
-                normalized = part.strip().casefold()
-                if normalized:
-                    hosts.add(normalized)
+    values = parse_env_lines(_PACKAGED_ENV_EXAMPLE.read_text(encoding="utf-8").splitlines())
+    hosts = {
+        normalized
+        for part in values.get("BOBE_WAKE_ALLOWED_HOSTS", "").split(",")
+        if (normalized := part.strip().casefold())
+    }
+    host = _hostname_from_ws_url(values.get("BOBE_WAKE_REMOTE_URL", ""))
+    if host:
+        hosts.add(host)
     return frozenset(hosts)
 
 
@@ -96,13 +96,8 @@ def is_wake_remote_host_allowed(hostname: str) -> bool:
 
 def _allowed_hosts_from_lines(lines: list[str]) -> set[str]:
     """Parse the BOBE_WAKE_ALLOWED_HOSTS assignment from env file lines."""
-    for line in lines:
-        stripped = line.strip()
-        if not stripped.startswith("BOBE_WAKE_ALLOWED_HOSTS="):
-            continue
-        value = stripped.partition("=")[2].strip().strip('"').strip("'")
-        return {part.strip().casefold() for part in value.split(",") if part.strip()}
-    return set()
+    value = parse_env_lines(lines).get("BOBE_WAKE_ALLOWED_HOSTS", "")
+    return {part.strip().casefold() for part in value.split(",") if part.strip()}
 
 
 def upsert_wake_env_lines(
@@ -184,18 +179,15 @@ def merge_packaged_wake_defaults(instance_path: str | Path) -> bool:
 
     BOBE_WAKE_ALLOWED_HOSTS is never seeded; see ``_SEEDABLE_WAKE_KEYS``.
     """
-    example = Path(__file__).parent / ".env.example"
-    if not example.exists():
+    if not _PACKAGED_ENV_EXAMPLE.exists():
         return False
 
-    example_values: dict[str, str] = {}
-    for line in example.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, _, value = stripped.partition("=")
-        if key in _SEEDABLE_WAKE_KEYS and value.strip():
-            example_values[key] = value.strip().strip('"').strip("'")
+    example_lines = _PACKAGED_ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+    example_values = {
+        key: value
+        for key, value in parse_env_lines(example_lines).items()
+        if key in _SEEDABLE_WAKE_KEYS and value
+    }
 
     if example_values.get("BOBE_WAKE_BACKEND") != "remote":
         return False
@@ -205,13 +197,7 @@ def merge_packaged_wake_defaults(instance_path: str | Path) -> bool:
     env_path = Path(instance_path) / ".env"
     with ENV_FILE_LOCK:
         lines = _read_lines_if_exists(env_path) or []
-        current: dict[str, str] = {}
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#") or "=" not in stripped:
-                continue
-            key, _, value = stripped.partition("=")
-            current[key] = value.strip().strip('"').strip("'")
+        current = parse_env_lines(lines)
 
         # Only seed keys with no configured value anywhere: an already-tuned
         # value (instance .env or live environment) must never be reset to

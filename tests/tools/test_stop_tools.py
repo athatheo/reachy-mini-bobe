@@ -8,7 +8,6 @@ import pytest
 
 from bobe.tools import play_emotion
 from bobe.tools.move_head import MoveHead
-from bobe.tools.stop_dance import StopDance
 from bobe.tools.stop_emotion import StopEmotion
 from bobe.profiles._bobe_locked_profile.sweep_look import SweepLook
 
@@ -53,21 +52,19 @@ def _pose_yaw(pose):
     return math.atan2(pose[1, 0], pose[0, 0])
 
 
-@pytest.mark.parametrize("tool_cls", [StopDance, StopEmotion])
-def test_stop_tools_do_not_require_dummy_arguments(tool_cls):
-    schema = tool_cls.parameters_schema
+def test_stop_emotion_does_not_require_dummy_arguments():
+    schema = StopEmotion.parameters_schema
 
     assert schema["properties"] == {}
     assert schema["required"] == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_cls", [StopDance, StopEmotion])
-async def test_stop_tools_clear_move_queue_without_arguments(tool_cls):
+async def test_stop_emotion_clears_move_queue_without_arguments():
     movement_manager = FakeMovementManager()
     deps = SimpleNamespace(movement_manager=movement_manager)
 
-    result = await tool_cls()(deps)
+    result = await StopEmotion()(deps)
 
     assert movement_manager.clear_count == 1
     assert result["status"]

@@ -11,6 +11,7 @@ from bobe.config import config
 from bobe.console import LocalStream
 from bobe.env_file import (
     read_env_lines,
+    parse_env_lines,
     upsert_env_keys,
     persist_api_settings,
     is_plausible_openai_key,
@@ -77,6 +78,29 @@ def test_persist_api_settings_does_not_bake_template_lines(tmp_path, monkeypatch
 def test_read_env_lines_missing_file_ignores_templates(tmp_path):
     (tmp_path / ".env.example").write_text("OPENAI_API_KEY=\nBOBE_WAKE_GAIN=1.75\n", encoding="utf-8")
     assert read_env_lines(tmp_path / ".env") == []
+
+
+def test_parse_env_lines_strips_quotes_and_skips_comments():
+    lines = [
+        "# comment",
+        "",
+        "PLAIN=value",
+        'QUOTED="ws://mac.local:8765/v1/stream"',
+        "SINGLE='1.75'",
+        "NOEQUALS",
+        "EMPTY=",
+    ]
+    assert parse_env_lines(lines) == {
+        "PLAIN": "value",
+        "QUOTED": "ws://mac.local:8765/v1/stream",
+        "SINGLE": "1.75",
+        "EMPTY": "",
+    }
+
+
+def test_parse_env_lines_first_occurrence_wins():
+    """Duplicate keys keep the first value, matching upsert_env_keys' first-line update."""
+    assert parse_env_lines(["KEY=first", "KEY=second"]) == {"KEY": "first"}
 
 
 def test_upsert_env_keys_skips_empty_values():

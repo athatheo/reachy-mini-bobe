@@ -109,18 +109,53 @@ def test_merge_packaged_wake_defaults(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
 
-    real_path = Path
-
-    def fake_path(*parts: str) -> Path:
-        if parts and parts[-1] == ".env.example":
-            return example
-        return real_path(*parts)
-
-    monkeypatch.setattr("bobe.wake_env.Path", fake_path)
+    monkeypatch.setattr("bobe.wake_env._PACKAGED_ENV_EXAMPLE", example)
     changed = merge_packaged_wake_defaults(tmp_path)
     assert changed is True
     env = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "BOBE_WAKE_BACKEND=remote" in env
+
+
+def test_merge_packaged_wake_defaults_strips_quoted_values(tmp_path: Path, monkeypatch):
+    """Quoted example values are seeded without their surrounding quotes."""
+    _clear_wake_env(monkeypatch)
+    example = tmp_path / "example.env"
+    example.write_text(
+        "\n".join(
+            [
+                'BOBE_WAKE_BACKEND="remote"',
+                "BOBE_WAKE_REMOTE_URL='ws://192.168.1.114:8765/v1/stream'",
+                'BOBE_WAKE_GAIN="1.75"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("bobe.wake_env._PACKAGED_ENV_EXAMPLE", example)
+    changed = merge_packaged_wake_defaults(tmp_path)
+    assert changed is True
+    env = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "BOBE_WAKE_BACKEND=remote" in env
+    assert "BOBE_WAKE_REMOTE_URL=ws://192.168.1.114:8765/v1/stream" in env
+    assert os.environ["BOBE_WAKE_GAIN"] == "1.75"
+
+
+def test_persist_wake_env_merges_quoted_stored_allowlist(tmp_path: Path, monkeypatch):
+    """A quoted stored allowlist is merged without quotes when a new host is accepted."""
+    _clear_wake_env(monkeypatch)
+    env_path = tmp_path / ".env"
+    env_path.write_text('BOBE_WAKE_ALLOWED_HOSTS="192.168.1.50"\n', encoding="utf-8")
+
+    persist_wake_env(tmp_path, remote_url="ws://192.168.1.114:8765/v1/stream", token="secret")
+
+    text = env_path.read_text(encoding="utf-8")
+    hosts_line = next(
+        line for line in text.splitlines() if line.startswith("BOBE_WAKE_ALLOWED_HOSTS=")
+    )
+    assert "192.168.1.50" in hosts_line
+    assert "192.168.1.114" in hosts_line
+    assert '"' not in hosts_line
 
 
 def test_merge_packaged_wake_defaults_does_not_seed_allowed_hosts(tmp_path: Path, monkeypatch):

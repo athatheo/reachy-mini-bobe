@@ -28,6 +28,38 @@ def _claude_code_launch_config():
     )
 
 
+class _ScriptedStub:
+    """Launcher/manager double: each scripted method records its args and returns a canned dict."""
+
+    def __init__(self, **responses):
+        self._responses = responses
+        self.calls: dict[str, list[tuple]] = {name: [] for name in responses}
+
+    def __getattr__(self, name):
+        try:
+            response = self.__dict__["_responses"][name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+        def method(*args):
+            self.calls[name].append(args)
+            return response
+
+        return method
+
+
+def _client_with(*, manager=None, launcher=None, config=None):
+    """Build a daemon TestClient, optionally swapping in scripted state stubs."""
+    from bobe.wake_daemon.server import create_app
+
+    app = create_app(config or _claude_code_launch_config())
+    if manager is not None:
+        app.state.claude_code_session_manager = manager
+    if launcher is not None:
+        app.state.claude_code_launcher = launcher
+    return TestClient(app)
+
+
 def test_load_wake_daemon_config_requires_token():
     with pytest.raises(ValueError, match="BOBE_WAKE_TOKEN"):
         load_wake_daemon_config({})
@@ -305,12 +337,12 @@ def test_whisper_engine_loads_model_once(monkeypatch):
     assert load_calls["count"] == 1
 
 
-def test_wake_daemon_app_starts_with_empty_engine_pool():
+def test_wake_daemon_app_starts_without_engine():
     from bobe.wake_daemon.server import create_app
 
     config = load_wake_daemon_config(_TEST_ENV)
     app = create_app(config)
-    assert app.state.wake_engines == {}
+    assert app.state.wake_engine is None
 
 
 def test_create_app_preloads_whisper_model_on_startup(monkeypatch):
@@ -324,7 +356,7 @@ def test_create_app_preloads_whisper_model_on_startup(monkeypatch):
         app.state.whisper_preload_thread.join(timeout=5)
 
     assert len(preloaded) == 1
-    assert list(app.state.wake_engines.values()) == preloaded
+    assert [app.state.wake_engine] == preloaded
 
 
 def test_create_app_warns_when_english_only_model_meets_non_ascii_phrase(caplog):
@@ -380,10 +412,7 @@ def test_stream_accepts_valid_hello_token():
 
 
 def test_claude_code_launch_endpoint_disabled_by_default():
-    from bobe.wake_daemon.server import create_app
-
-    config = load_wake_daemon_config(_TEST_ENV)
-    client = TestClient(create_app(config))
+    client = _client_with(config=load_wake_daemon_config(_TEST_ENV))
 
     response = client.post("/v1/launch/claude-code")
 
@@ -392,10 +421,7 @@ def test_claude_code_launch_endpoint_disabled_by_default():
 
 
 def test_claude_code_launch_endpoint_rejects_bad_token():
-    from bobe.wake_daemon.server import create_app
-
-    config = _claude_code_launch_config()
-    client = TestClient(create_app(config))
+    client = _client_with()
 
     response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "bad-token"})
 
@@ -404,15 +430,13 @@ def test_claude_code_launch_endpoint_rejects_bad_token():
 
 
 def test_claude_code_launch_endpoint_requires_launch_token_when_enabled():
-    from bobe.wake_daemon.server import create_app
-
     config = load_wake_daemon_config(
         {
             **_TEST_ENV,
             "BOBE_CLAUDE_CODE_LAUNCH_ENABLED": "1",
         }
     )
-    client = TestClient(create_app(config))
+    client = _client_with(config=config)
 
     response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
 
@@ -421,16 +445,8 @@ def test_claude_code_launch_endpoint_requires_launch_token_when_enabled():
 
 
 def test_claude_code_launch_endpoint_calls_launcher_when_enabled():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeLauncher:
-        def launch(self):
-            return {"ok": True, "workdir": "/tmp/repos/bobe", "binary": "claude"}
-
-    config = _claude_code_launch_config()
-    app = create_app(config)
-    app.state.claude_code_launcher = FakeLauncher()
-    client = TestClient(app)
+    launcher = _ScriptedStub(launch={"ok": True, "workdir": "/tmp/repos/bobe", "binary": "claude"})
+    client = _client_with(launcher=launcher)
 
     response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
 
@@ -439,16 +455,8 @@ def test_claude_code_launch_endpoint_calls_launcher_when_enabled():
 
 
 def test_claude_code_launch_endpoint_returns_cooldown_status():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeLauncher:
-        def launch(self):
-            return {"ok": False, "error": "cooldown", "retry_after_s": 12.0}
-
-    config = _claude_code_launch_config()
-    app = create_app(config)
-    app.state.claude_code_launcher = FakeLauncher()
-    client = TestClient(app)
+    launcher = _ScriptedStub(launch={"ok": False, "error": "cooldown", "retry_after_s": 12.0})
+    client = _client_with(launcher=launcher)
 
     response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
 
@@ -457,16 +465,8 @@ def test_claude_code_launch_endpoint_returns_cooldown_status():
 
 
 def test_claude_code_launch_endpoint_maps_invalid_config():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeLauncher:
-        def launch(self):
-            return {"ok": False, "error": "invalid_config", "message": "bad workdir"}
-
-    config = _claude_code_launch_config()
-    app = create_app(config)
-    app.state.claude_code_launcher = FakeLauncher()
-    client = TestClient(app)
+    launcher = _ScriptedStub(launch={"ok": False, "error": "invalid_config", "message": "bad workdir"})
+    client = _client_with(launcher=launcher)
 
     response = client.post("/v1/launch/claude-code", headers={"X-BoBe-Launch-Token": "launch-token"})
 
@@ -475,15 +475,8 @@ def test_claude_code_launch_endpoint_maps_invalid_config():
 
 
 def test_claude_code_session_start_endpoint_calls_manager():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeManager:
-        def start(self):
-            return {"ok": True, "session_id": "session-1"}
-
-    app = create_app(_claude_code_launch_config())
-    app.state.claude_code_session_manager = FakeManager()
-    client = TestClient(app)
+    manager = _ScriptedStub(start={"ok": True, "session_id": "session-1"})
+    client = _client_with(manager=manager)
 
     response = client.post("/v1/claude-code/session/start", headers={"X-BoBe-Launch-Token": "launch-token"})
 
@@ -492,20 +485,8 @@ def test_claude_code_session_start_endpoint_calls_manager():
 
 
 def test_claude_code_session_send_endpoint_passes_command():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeManager:
-        def __init__(self):
-            self.commands = []
-
-        def send(self, command):
-            self.commands.append(command)
-            return {"ok": True, "output": "done"}
-
-    manager = FakeManager()
-    app = create_app(_claude_code_launch_config())
-    app.state.claude_code_session_manager = manager
-    client = TestClient(app)
+    manager = _ScriptedStub(send={"ok": True, "output": "done"})
+    client = _client_with(manager=manager)
 
     response = client.post(
         "/v1/claude-code/session/send",
@@ -515,19 +496,12 @@ def test_claude_code_session_send_endpoint_passes_command():
 
     assert response.status_code == 200
     assert response.json()["output"] == "done"
-    assert manager.commands == ["run tests"]
+    assert manager.calls["send"] == [("run tests",)]
 
 
 def test_claude_code_session_send_endpoint_returns_202_for_accepted_command():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeManager:
-        def send(self, command):
-            return {"ok": True, "accepted": True, "running": True, "session_id": "session-1"}
-
-    app = create_app(_claude_code_launch_config())
-    app.state.claude_code_session_manager = FakeManager()
-    client = TestClient(app)
+    manager = _ScriptedStub(send={"ok": True, "accepted": True, "running": True, "session_id": "session-1"})
+    client = _client_with(manager=manager)
 
     response = client.post(
         "/v1/claude-code/session/send",
@@ -541,37 +515,20 @@ def test_claude_code_session_send_endpoint_returns_202_for_accepted_command():
 
 def test_wake_daemon_lifespan_shuts_down_claude_session_manager(monkeypatch):
     """Daemon shutdown must terminate any active claude command (finding #25)."""
-    from bobe.wake_daemon.server import create_app
-
     monkeypatch.setattr(WhisperWakeEngine, "preload", lambda self: None)
 
-    class FakeManager:
-        def __init__(self):
-            self.shutdowns = 0
+    manager = _ScriptedStub(shutdown={"ok": True})
+    client = _client_with(manager=manager, config=load_wake_daemon_config(_TEST_ENV))
 
-        def shutdown(self):
-            self.shutdowns += 1
-
-    app = create_app(load_wake_daemon_config(_TEST_ENV))
-    manager = FakeManager()
-    app.state.claude_code_session_manager = manager
-
-    with TestClient(app):
+    with client:
         pass
 
-    assert manager.shutdowns == 1
+    assert len(manager.calls["shutdown"]) == 1
 
 
 def test_claude_code_session_send_endpoint_rejects_empty_command():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeManager:
-        def send(self, command):
-            return {"ok": False, "error": "empty_command"}
-
-    app = create_app(_claude_code_launch_config())
-    app.state.claude_code_session_manager = FakeManager()
-    client = TestClient(app)
+    manager = _ScriptedStub(send={"ok": False, "error": "empty_command"})
+    client = _client_with(manager=manager)
 
     response = client.post(
         "/v1/claude-code/session/send",
@@ -584,18 +541,11 @@ def test_claude_code_session_send_endpoint_rejects_empty_command():
 
 
 def test_claude_code_session_status_and_stop_endpoints():
-    from bobe.wake_daemon.server import create_app
-
-    class FakeManager:
-        def status(self):
-            return {"ok": True, "active": True}
-
-        def stop(self):
-            return {"ok": True, "stopped_session_id": "session-1"}
-
-    app = create_app(_claude_code_launch_config())
-    app.state.claude_code_session_manager = FakeManager()
-    client = TestClient(app)
+    manager = _ScriptedStub(
+        status={"ok": True, "active": True},
+        stop={"ok": True, "stopped_session_id": "session-1"},
+    )
+    client = _client_with(manager=manager)
 
     status_response = client.get("/v1/claude-code/session/status", headers={"X-BoBe-Launch-Token": "launch-token"})
     stop_response = client.post("/v1/claude-code/session/stop", headers={"X-BoBe-Launch-Token": "launch-token"})
@@ -607,9 +557,7 @@ def test_claude_code_session_status_and_stop_endpoints():
 
 
 def test_claude_code_session_endpoints_require_token():
-    from bobe.wake_daemon.server import create_app
-
-    client = TestClient(create_app(_claude_code_launch_config()))
+    client = _client_with()
 
     response = client.post("/v1/claude-code/session/start", headers={"X-BoBe-Launch-Token": "bad-token"})
 

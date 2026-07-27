@@ -11,8 +11,9 @@ play_emotion
 stop_emotion
 move_head
 sweep_look
+# Deliberate opt-in shelf: these modules stay in src/bobe/tools/ so
+# re-enabling any of them is a one-line uncomment here.
 #do_nothing
 #camera
 #head_tracking
 #dance
-#stop_dance

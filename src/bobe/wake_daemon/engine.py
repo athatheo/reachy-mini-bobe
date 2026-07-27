@@ -23,17 +23,6 @@ TRANSCRIPT_HISTORY_MAX = 30
 ListenMode = Literal["wake", "sleep"]
 
 
-def whisper_engine_key(config: WakeDaemonConfig) -> tuple[str, str, str, str | None, str | None]:
-    """Hashable key for sharing one loaded Whisper model across connections."""
-    return (
-        config.whisper_model,
-        config.whisper_device,
-        config.whisper_compute_type,
-        config.whisper_initial_prompt,
-        config.whisper_hotwords,
-    )
-
-
 def warn_if_phrases_unsupported(
     config: WakeDaemonConfig,
     sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,

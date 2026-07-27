@@ -18,6 +18,8 @@ def _reload_core_tools() -> ModuleType:
 
     sys.modules.pop("bobe.tools.core_tools", None)
     core_tools_mod = importlib.import_module("bobe.tools.core_tools")
+    # Registry initialization is explicit (no import side effect).
+    core_tools_mod.ensure_tools_loaded()
     return core_tools_mod
 
 
@@ -68,7 +70,7 @@ def test_external_tools_can_be_loaded_without_external_profile(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", "default")
+    monkeypatch.setattr(config_mod.config, "REACHY_MINI_CUSTOM_PROFILE", "_bobe_locked_profile")
     monkeypatch.setattr(config_mod.config, "PROFILES_DIRECTORY", config_mod.DEFAULT_PROFILES_DIRECTORY)
     monkeypatch.setattr(config_mod.config, "TOOLS_DIRECTORY", external_tools_root)
     monkeypatch.setattr(config_mod.config, "AUTOLOAD_EXTERNAL_TOOLS", True)

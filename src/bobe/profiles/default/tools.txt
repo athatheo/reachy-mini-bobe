@@ -1,2 +1,0 @@
-# Minimal fallback profile used when tests or external loading select default.
-do_nothing

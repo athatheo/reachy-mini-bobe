@@ -43,6 +43,15 @@ ALL_TOOL_SPECS: List[Dict[str, Any]] = []
 _TOOLS_INITIALIZED = False
 
 
+class ToolLoadError(RuntimeError):
+    """Raised when the tool registry cannot be built (e.g. missing tools.txt).
+
+    Deliberately a plain Exception (not SystemExit) so a failure surfacing
+    inside the realtime session task is caught by its ``except Exception``
+    handlers instead of killing the session supervisor. Startup code should
+    translate it to a clean process exit.
+    """
+
 
 def get_concrete_subclasses(base: type[Tool]) -> List[type[Tool]]:
     """Recursively find all concrete (non-abstract) subclasses of a base class."""
@@ -149,7 +158,6 @@ def _load_profile_tools() -> None:
     # Get the profile directory path
     profile_module_path = config.PROFILES_DIRECTORY / profile
     tools_txt_path = profile_module_path / "tools.txt"
-    default_tools_txt_path = Path(__file__).parent.parent / "profiles" / "default" / "tools.txt"
 
     if config.PROFILES_DIRECTORY != DEFAULT_PROFILES_PATH:
         logger.info(
@@ -159,17 +167,8 @@ def _load_profile_tools() -> None:
         )
 
     if not tools_txt_path.exists():
-        if profile != "default" and default_tools_txt_path.exists():
-            logger.warning(
-                "tools.txt not found for profile '%s' at %s. Falling back to default profile tools at %s",
-                profile,
-                tools_txt_path,
-                default_tools_txt_path,
-            )
-            tools_txt_path = default_tools_txt_path
-        else:
-            logger.error(f"✗ tools.txt not found at {tools_txt_path}")
-            sys.exit(1)
+        logger.error(f"✗ tools.txt not found at {tools_txt_path}")
+        raise ToolLoadError(f"tools.txt not found at {tools_txt_path}")
 
     # Read and parse tools.txt
     try:
@@ -177,7 +176,7 @@ def _load_profile_tools() -> None:
             lines = f.readlines()
     except Exception as e:
         logger.error(f"✗ Failed to read tools.txt: {e}")
-        sys.exit(1)
+        raise ToolLoadError(f"Failed to read tools.txt: {e}") from e
 
     # Parse tool names (skip comments and blank lines)
     tool_names = []
@@ -266,9 +265,18 @@ def _load_profile_tools() -> None:
 
 
 
-def _initialize_tools() -> None:
-    """Populate registry once, even if module is imported repeatedly."""
-    global ALL_TOOLS, ALL_TOOL_SPECS, _TOOLS_INITIALIZED
+def ensure_tools_loaded() -> None:
+    """Populate the tool registry once; safe to call repeatedly.
+
+    Initialization is explicit (no import side effect): call this at startup
+    for fail-fast behavior. The registry consumers (``get_tool_specs`` and the
+    dispatchers) also call it as an idempotent guard.
+
+    Raises:
+        ToolLoadError: If the profile's tools.txt is missing or unreadable.
+
+    """
+    global _TOOLS_INITIALIZED
 
     if _TOOLS_INITIALIZED:
         logger.debug("Tools already initialized; skipping reinitialization.")
@@ -276,8 +284,11 @@ def _initialize_tools() -> None:
 
     _load_profile_tools()
 
-    ALL_TOOLS = {cls.name: cls() for cls in get_concrete_subclasses(Tool)}  # type: ignore[type-abstract]
-    ALL_TOOL_SPECS = [tool.spec() for tool in ALL_TOOLS.values()]
+    # Mutate in place so references to ALL_TOOLS/ALL_TOOL_SPECS stay valid.
+    ALL_TOOLS.clear()
+    ALL_TOOLS.update({cls.name: cls() for cls in get_concrete_subclasses(Tool)})  # type: ignore[type-abstract]
+    ALL_TOOL_SPECS.clear()
+    ALL_TOOL_SPECS.extend(tool.spec() for tool in ALL_TOOLS.values())
 
     for tool_name, tool in ALL_TOOLS.items():
         logger.info(f"tool registered: {tool_name} - {tool.description}")
@@ -285,11 +296,9 @@ def _initialize_tools() -> None:
     _TOOLS_INITIALIZED = True
 
 
-_initialize_tools()
-
-
 def get_tool_specs(exclusion_list: list[str] = []) -> list[Dict[str, Any]]:
     """Get tool specs, optionally excluding some tools."""
+    ensure_tools_loaded()
     return [spec for spec in ALL_TOOL_SPECS if spec.get("name") not in exclusion_list]
 
 
@@ -304,6 +313,11 @@ def _safe_load_obj(args_json: str) -> Dict[str, Any]:
 
 
 async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDependencies) -> Dict[str, Any]:
+    try:
+        ensure_tools_loaded()
+    except ToolLoadError as e:
+        # Dispatch never raises (except cancellation); report as a tool error.
+        return {"error": str(e)}
     tool = ALL_TOOLS.get(tool_name)
     if not tool:
         return {"error": f"unknown tool: {tool_name}"}

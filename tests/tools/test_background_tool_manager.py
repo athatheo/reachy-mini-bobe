@@ -9,7 +9,6 @@ import pytest
 
 from bobe.tools.tool_constants import ToolState
 from bobe.tools.background_tool_manager import (
-    ToolProgress,
     BackgroundTool,
     ToolCallRoutine,
     ToolNotification,
@@ -61,28 +60,6 @@ def _make_routine(
 # ---------------------------------------------------------------------------
 # Model / data-class sanity checks
 # ---------------------------------------------------------------------------
-
-
-class TestToolProgress:
-    """Validate ToolProgress construction and bounds."""
-
-    def test_valid_progress(self) -> None:
-        """Accept valid progress values and messages."""
-        p = ToolProgress(progress=0.5, message="halfway")
-        assert p.progress == 0.5
-        assert p.message == "halfway"
-
-    def test_bounds(self) -> None:
-        """Allow 0.0 and 1.0 as boundary values."""
-        assert ToolProgress(progress=0.0).progress == 0.0
-        assert ToolProgress(progress=1.0).progress == 1.0
-
-    def test_out_of_bounds_raises(self) -> None:
-        """Reject progress values outside [0, 1]."""
-        with pytest.raises(Exception):
-            ToolProgress(progress=-0.1)
-        with pytest.raises(Exception):
-            ToolProgress(progress=1.1)
 
 
 class TestToolNotification:
@@ -142,30 +119,6 @@ def manager() -> BackgroundToolManager:
     return BackgroundToolManager()
 
 
-class TestSetLoop:
-    """Verify event-loop assignment via set_loop."""
-
-    @pytest.mark.asyncio
-    async def test_set_loop_uses_running_loop(self, manager: BackgroundToolManager) -> None:
-        """Default to the current running loop."""
-        manager.set_loop()
-        assert manager._loop is asyncio.get_running_loop()
-
-    def test_set_loop_explicit(self, manager: BackgroundToolManager) -> None:
-        """Accept an explicitly provided loop."""
-        loop = asyncio.new_event_loop()
-        try:
-            manager.set_loop(loop)
-            assert manager._loop is loop
-        finally:
-            loop.close()
-
-    def test_set_loop_creates_new_when_no_running(self, manager: BackgroundToolManager) -> None:
-        """When called outside an async context it falls back to a new loop."""
-        manager.set_loop()
-        assert manager._loop is not None
-
-
 class TestStartTool:
     """Verify tool registration via start_tool."""
 
@@ -184,19 +137,6 @@ class TestStartTool:
 
         # Let the task finish
         await asyncio.sleep(0.05)
-
-    @pytest.mark.asyncio
-    async def test_start_with_progress(self, manager: BackgroundToolManager) -> None:
-        """Initialize progress tracking when requested."""
-        routine = _make_routine("slow", delay=0.1)
-        bg = await manager.start_tool(
-            call_id="c2",
-            tool_call_routine=routine,
-            with_progress=True,
-        )
-        assert bg.progress is not None
-        assert bg.progress.progress == 0.0
-        await asyncio.sleep(0.15)
 
 
 class TestRunToolLifecycle:
@@ -252,60 +192,6 @@ class TestRunToolLifecycle:
         assert bg.status == ToolState.CANCELLED
         assert bg.error == "Tool cancelled"
         assert bg.completed_at is not None
-
-
-class TestUpdateProgress:
-    """Verify progress updates on running tools."""
-
-    @pytest.mark.asyncio
-    async def test_update_progress_success(self, manager: BackgroundToolManager) -> None:
-        """Update progress value and message on a tracked tool."""
-        routine = _make_routine("prog", delay=0.5)
-        bg = await manager.start_tool("c1", routine, with_progress=True)
-
-        ok = await manager.update_progress(bg.tool_id, 0.5, "half done")
-        assert ok is True
-        assert bg.progress is not None
-        assert bg.progress.progress == 0.5
-        assert bg.progress.message == "half done"
-
-        # Cancel to clean up
-        await manager.cancel_tool(bg.tool_id)
-        await asyncio.sleep(0.05)
-
-    @pytest.mark.asyncio
-    async def test_update_progress_clamps(self, manager: BackgroundToolManager) -> None:
-        """Clamp out-of-range progress values to [0, 1]."""
-        routine = _make_routine("prog", delay=0.5)
-        bg = await manager.start_tool("c1", routine, with_progress=True)
-
-        await manager.update_progress(bg.tool_id, 1.5)
-        assert bg.progress is not None
-        assert bg.progress.progress == 1.0
-
-        await manager.update_progress(bg.tool_id, -0.5)
-        assert bg.progress.progress == 0.0
-
-        await manager.cancel_tool(bg.tool_id)
-        await asyncio.sleep(0.05)
-
-    @pytest.mark.asyncio
-    async def test_update_progress_unknown_tool(self, manager: BackgroundToolManager) -> None:
-        """Return False for an unknown tool_id."""
-        ok = await manager.update_progress("nonexistent", 0.5)
-        assert ok is False
-
-    @pytest.mark.asyncio
-    async def test_update_progress_no_tracking(self, manager: BackgroundToolManager) -> None:
-        """Return False when progress tracking is disabled."""
-        routine = _make_routine("fast", delay=0.5)
-        bg = await manager.start_tool("c1", routine, with_progress=False)
-
-        ok = await manager.update_progress(bg.tool_id, 0.5)
-        assert ok is False
-
-        await manager.cancel_tool(bg.tool_id)
-        await asyncio.sleep(0.05)
 
 
 class TestCancelTool:
@@ -447,35 +333,6 @@ class TestGetters:
         await manager.cancel_tool(bg1.tool_id)
         await manager.cancel_tool(bg2.tool_id)
         await asyncio.sleep(0.05)
-
-    @pytest.mark.asyncio
-    async def test_get_all_tools_sorted(self, manager: BackgroundToolManager) -> None:
-        """Tools are returned most-recent-first."""
-        r1 = _make_routine("first")
-        r2 = _make_routine("second")
-
-        await manager.start_tool("1", r1)
-        await asyncio.sleep(0.02)  # ensure different started_at
-        await manager.start_tool("2", r2)
-
-        await asyncio.sleep(0.05)
-
-        all_tools = manager.get_all_tools()
-        assert len(all_tools) == 2
-        assert all_tools[0].tool_name == "second"
-        assert all_tools[1].tool_name == "first"
-
-    @pytest.mark.asyncio
-    async def test_get_all_tools_limit(self, manager: BackgroundToolManager) -> None:
-        """Respect the limit parameter on get_all_tools."""
-        for i in range(5):
-            r = _make_routine(f"t{i}")
-            await manager.start_tool(str(i), r)
-
-        await asyncio.sleep(0.05)
-
-        limited = manager.get_all_tools(limit=3)
-        assert len(limited) == 3
 
 
 class TestStartUp:
@@ -709,6 +566,10 @@ class TestDispatchCancellationContract:
     async def test_dispatch_tool_call_reraises_cancellation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Cancelling a dispatched tool cancels the task instead of completing it."""
         from bobe.tools import core_tools
+
+        # Initialization is explicit now; load the registry before patching it
+        # so the lazy guard inside dispatch cannot rebuild (and wipe) it.
+        core_tools.ensure_tools_loaded()
 
         started = asyncio.Event()
 

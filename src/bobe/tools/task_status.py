@@ -58,11 +58,6 @@ class TaskStatus(Tool):
             if tool.completed_at:
                 result["completed_at"] = tool.completed_at
 
-            if tool.progress is not None:
-                result["progress_percent"] = f"{tool.progress.progress:.0%}"
-                if tool.progress.message:
-                    result["progress_message"] = tool.progress.message
-
             if tool.result:
                 result["result"] = tool.result
             if tool.error:
@@ -87,13 +82,6 @@ class TaskStatus(Tool):
                 "status": tool.status.value,
                 "elapsed_seconds": round(elapsed, 1),
             }
-
-            # Add progress if tracking
-            if tool.progress is not None:
-                tool_info["progress_percent"] = f"{tool.progress.progress:.0%}"
-                if tool.progress.message:
-                    tool_info["progress_message"] = tool.progress.message
-
             tools_info.append(tool_info)
 
         return {

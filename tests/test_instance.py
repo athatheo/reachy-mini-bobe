@@ -1,5 +1,6 @@
 import os
 
+import bobe.config as config_mod
 from bobe.config import config
 from bobe.instance import load_instance_env, _migrate_legacy_env, resolve_instance_path
 
@@ -44,3 +45,27 @@ def test_load_instance_env_never_erases_live_values_with_empty_lines(tmp_path, m
     # Non-empty persisted values still override the process environment.
     assert os.environ["MODEL_NAME"] == "test-model"
     assert config.MODEL_NAME == "test-model"
+
+
+def test_env_layering_repo_env_fills_gaps_then_instance_env_overrides(tmp_path, monkeypatch):
+    """Effective end-to-end precedence: repo .env fills gaps < process env < instance .env."""
+    repo_env = tmp_path / "repo.env"
+    repo_env.write_text(
+        "BOBE_TEST_REPO_ONLY=repo\nBOBE_TEST_PROCESS_SET=repo\nBOBE_TEST_INSTANCE_SET=repo\n",
+        encoding="utf-8",
+    )
+    instance_dir = tmp_path / "instance"
+    instance_dir.mkdir()
+    (instance_dir / ".env").write_text("BOBE_TEST_INSTANCE_SET=instance\n", encoding="utf-8")
+
+    monkeypatch.setenv("BOBE_TEST_REPO_ONLY", "placeholder")
+    monkeypatch.delenv("BOBE_TEST_REPO_ONLY")
+    monkeypatch.setenv("BOBE_TEST_PROCESS_SET", "process")
+    monkeypatch.setenv("BOBE_TEST_INSTANCE_SET", "process")
+
+    config_mod._apply_dotenv_values(repo_env)  # config.py import-time load
+    load_instance_env(instance_dir)  # canonical instance load in main.run()
+
+    assert os.environ["BOBE_TEST_REPO_ONLY"] == "repo"
+    assert os.environ["BOBE_TEST_PROCESS_SET"] == "process"
+    assert os.environ["BOBE_TEST_INSTANCE_SET"] == "instance"

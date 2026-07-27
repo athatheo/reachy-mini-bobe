@@ -44,15 +44,28 @@ def run(
     handler_box: Optional[list[Any]] = None,
 ) -> None:
     """Run the Reachy Mini conversation app."""
+    logger = setup_logger(args.debug)
+    logger.info("Starting Reachy Mini Conversation App")
+
+    # Canonical env loading: seed packaged wake defaults, then apply the
+    # instance .env, once per startup and before any lazy imports read env.
+    if instance_path:
+        try:
+            from bobe.wake_env import merge_packaged_wake_defaults
+
+            merge_packaged_wake_defaults(instance_path)
+            env_path = load_instance_env(instance_path)
+            if env_path is not None:
+                logger.info("Loaded instance configuration from %s", env_path)
+        except Exception as exc:
+            logger.warning("Could not load instance .env from %s: %s", instance_path, exc)
+
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from bobe.moves import MovementManager
     from bobe.console import LocalStream
     from bobe.openai_realtime import OpenaiRealtimeHandler
     from bobe.tools.core_tools import ToolDependencies
     from bobe.audio.head_wobbler import HeadWobbler
-
-    logger = setup_logger(args.debug)
-    logger.info("Starting Reachy Mini Conversation App")
 
     if args.no_camera and args.head_tracker is not None:
         logger.warning(
@@ -130,17 +143,6 @@ def run(
         resizable=True,
     )
 
-    if instance_path:
-        try:
-            from bobe.wake_env import merge_packaged_wake_defaults
-
-            merge_packaged_wake_defaults(instance_path)
-            env_path = load_instance_env(instance_path)
-            if env_path is not None:
-                logger.info("Loaded instance configuration from %s", env_path)
-        except Exception as exc:
-            logger.warning("Could not load instance .env from %s: %s", instance_path, exc)
-
     handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
     if handler_box is not None:
         handler_box[0] = handler
@@ -182,14 +184,10 @@ def run(
 
         app = gr.mount_gradio_app(app, stream.ui, path="/")
     else:
-        # In headless mode, wire settings_app + instance_path to console LocalStream
-        stream_manager = LocalStream(
-            handler,
-            robot,
-            settings_app=settings_app,
-            instance_path=instance_path,
-            app_stop_event=app_stop_event,
-        )
+        # Headless mode. Stop requests reach LocalStream via the stop-event
+        # poller below, which calls stream_manager.close(); settings routes
+        # (if any) were already mounted by bootstrap_settings_ui.
+        stream_manager = LocalStream(handler, robot)
 
     # Each async service → its own thread/loop
     movement_manager.start()
@@ -243,8 +241,9 @@ class Bobe(ReachyMiniApp):  # type: ignore[misc]
         """Run the Reachy Mini conversation app."""
         args, _ = parse_args()
         instance_path = resolve_instance_path()
-        load_instance_env(instance_path)
         handler_box: list[Any] = [None]
+        # Single settings-UI bootstrap: routes are mounted here, before run()
+        # starts the voice handler. Nothing else re-bootstraps them.
         bootstrap_settings_ui(self.settings_app, str(instance_path), lambda: handler_box[0])
 
         run(

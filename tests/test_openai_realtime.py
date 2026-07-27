@@ -2181,13 +2181,12 @@ class _ParkedHandler:
 
 
 def test_localstream_close_signals_loop_thread_safely() -> None:
-    """close() with a live loop marshals Event.set/Task.cancel via call_soon_threadsafe.
+    """close() with a live loop marshals Task.cancel via call_soon_threadsafe.
 
-    close() runs on the dashboard stop-poller thread (main.py); neither
-    asyncio.Event.set() nor Task.cancel() is thread-safe, so close() must not
-    invoke them directly. A recording fake loop proves the marshalling: the
-    old close() set the event and cancelled tasks straight from the caller
-    thread, which this test rejects.
+    close() runs on the dashboard stop-poller thread (main.py); Task.cancel()
+    is not thread-safe, so close() must not invoke it directly. A recording
+    fake loop proves the marshalling: the old close() cancelled tasks
+    straight from the caller thread, which this test rejects.
     """
     from bobe.console import LocalStream
 
@@ -2203,19 +2202,16 @@ def test_localstream_close_signals_loop_thread_safely() -> None:
 
     stream.close()
 
-    # Nothing may run directly on the caller thread...
-    assert not stream._stop_event.is_set(), "Event.set() ran on the caller thread (not thread-safe)"
+    # Cancellation may not run directly on the caller thread...
     pending.cancel.assert_not_called()
 
-    # ...both operations must be handed to the loop instead.
+    # ...it must be handed to the loop instead.
     callbacks = [cb for cb, _args in fake_loop.calls]
-    assert stream._stop_event.set in callbacks
     assert pending.cancel in callbacks
     assert finished.cancel not in callbacks  # done tasks are not re-cancelled
 
     for cb, args in fake_loop.calls:  # what the loop thread would then do
         cb(*args)
-    assert stream._stop_event.is_set()
     pending.cancel.assert_called_once()
 
 
@@ -2246,8 +2242,9 @@ def test_localstream_close_before_launch_prevents_start(monkeypatch: pytest.Monk
 def test_localstream_close_during_key_wait_terminates_launch(monkeypatch: pytest.MonkeyPatch) -> None:
     """close() while launch() is polling for API keys ends the wait.
 
-    The key-wait loop must honor close() itself, not only the app stop event
-    (which may be absent, or fire before close() is observable).
+    close() is the only stop signal into the key-wait loop (main.py's stop
+    poller translates the app stop event into a close() call), so the loop
+    must honor it directly.
     """
     from bobe.console import LocalStream
 
@@ -2302,7 +2299,6 @@ def test_localstream_close_without_running_loop() -> None:
 
     stream.close()
 
-    assert stream._stop_event.is_set()
     assert stream._close_requested.is_set()
 
 
@@ -2315,7 +2311,6 @@ def test_localstream_double_close_before_loop_is_harmless() -> None:
     stream.close()
     stream.close()  # e.g. stop poller and a finally-block both closing
 
-    assert stream._stop_event.is_set()
     assert stream._close_requested.is_set()
 
 

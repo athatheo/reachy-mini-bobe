@@ -198,8 +198,8 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         try:
             hello_raw = await websocket.receive_text()
             hello = parse_json(hello_raw)
-            if hello is None or hello.get("type") != "hello":
-                await websocket.close(code=1003)
+            if hello is None or hello.get("type") != MSG_HELLO:
+                await websocket.close(code=CLOSE_UNSUPPORTED_DATA)
                 return
             if hello.get("sample_rate") != WAKE_SAMPLE_RATE:
                 logger.warning(
@@ -207,17 +207,18 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     hello.get("sample_rate"),
                     WAKE_SAMPLE_RATE,
                 )
-                await websocket.close(code=1003)
+                await websocket.close(code=CLOSE_UNSUPPORTED_DATA)
                 return
             hello_token = str(hello.get("token") or "").strip()
             if not hello_token or not hmac.compare_digest(hello_token, runtime.token or ""):
                 logger.warning("Rejected wake stream with missing or invalid token")
-                await websocket.close(code=1008)
+                await websocket.close(code=CLOSE_POLICY_VIOLATION)
                 return
             client_phrase = str(hello.get("phrase") or runtime.phrase).casefold()
             # Match against the daemon env phrase so Mac-side config wins when the
-            # robot app still has a stale BOBE_WAKE_PHRASE.
-            match_phrase = runtime.phrase.casefold() or client_phrase
+            # robot app still has a stale BOBE_WAKE_PHRASE (load_wake_daemon_config
+            # guarantees a non-empty phrase).
+            match_phrase = runtime.phrase.casefold()
             session = shared_engine().session(replace(runtime, phrase=match_phrase))
             await websocket.send_json(ready_message(engine="faster-whisper", phrase=match_phrase))
 
@@ -231,7 +232,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     if payload is None:
                         continue
                     msg_type = payload.get("type")
-                    if msg_type == "listen":
+                    if msg_type == MSG_LISTEN:
                         apply_listen(payload)
                     continue
 

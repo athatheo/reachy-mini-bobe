@@ -10,9 +10,11 @@ def test_config_raises_on_external_profile_name_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Config should fail fast when external/built-in profile names collide."""
+    builtin_profiles = config_mod._collect_profile_names(config_mod.DEFAULT_PROFILES_DIRECTORY) - {"__pycache__"}
+    assert builtin_profiles, "expected at least one built-in profile"
     external_profiles = tmp_path / "external_profiles"
     external_profiles.mkdir(parents=True)
-    (external_profiles / "default").mkdir()
+    (external_profiles / sorted(builtin_profiles)[0]).mkdir()
 
     monkeypatch.setattr(config_mod.Config, "PROFILES_DIRECTORY", external_profiles)
     monkeypatch.setattr(config_mod.Config, "TOOLS_DIRECTORY", None)
