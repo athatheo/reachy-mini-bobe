@@ -12,12 +12,14 @@ import os
 import time
 import logging
 import threading
-from typing import Mapping, Callable
+from typing import Any, Literal, Mapping, Callable
 from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
+from fastrtc import audio_to_int16
 from numpy.typing import NDArray
+from scipy.signal import resample
 
 from bobe.env_utils import parse_float
 from bobe.wake.phrases import WAKE_PHRASE, DEFAULT_SLEEP_PHRASES
@@ -241,3 +243,131 @@ def create_wake_detector(
         on_sleep=on_sleep,
         sleep_phrases=config.sleep_phrases,
     )
+
+
+def _to_wake_rate(audio_frame: NDArray[Any], input_sample_rate: int) -> NDArray[np.int16]:
+    """Convert a mono frame to the 16 kHz int16 format the wake backends expect."""
+    mono = audio_frame.reshape(-1)
+    if input_sample_rate != WAKE_SAMPLE_RATE:
+        mono = resample(mono, int(len(mono) * WAKE_SAMPLE_RATE / input_sample_rate))
+    if np.issubdtype(mono.dtype, np.integer):
+        return mono.astype(np.int16, copy=False)
+    converted: NDArray[np.int16] = audio_to_int16(np.asarray(mono, dtype=np.float32))
+    return converted
+
+
+class WakeGate:
+    """Own the local wake-gating building blocks: config, session, buffer, detector.
+
+    Pure wake-word plumbing with no OpenAI knowledge: the realtime handler
+    drives this gate from its mic loop and keeps the transition orchestration
+    (connection management, chimes, antenna cues) to itself. ``sleep()`` and
+    ``listen_for_wake()`` are deliberately separate methods: the handler flips
+    the session asleep BEFORE its response-cancel/buffer-clear awaits and
+    switches the detector back to wake-listening AFTER them, so that audio is
+    gated throughout the transition.
+    """
+
+    def __init__(
+        self,
+        input_sample_rate: int,
+        config: WakeConfig | None = None,
+        detector_factory: Callable[..., RemoteWakeClient | None] = create_wake_detector,
+    ) -> None:
+        """Assemble the gating subsystem from environment-driven configuration."""
+        self.config = load_wake_config() if config is None else config
+        self.session = WakeSession(timeout_s=self.config.timeout_s)
+        self.buffer = AudioRingBuffer(sample_rate=input_sample_rate)
+        self.detector = detector_factory(
+            on_wake=self.session.request_wake,
+            config=self.config,
+            on_sleep=self.session.request_sleep,
+        )
+        self.enabled = self.detector is not None
+        self.error: str | None
+        if self.enabled:
+            self.error = None
+        else:
+            self.error = wake_detector_error(self.config) or "Wake-word detector unavailable"
+            logger.error("Wake-word gating disabled: %s", self.error)
+            # Fallback: without a detector, stay in an always-on session so mic + replies work.
+            self.session.wake()
+            logger.warning("Wake-word detection unavailable; running in always-on mode until wake is configured")
+
+    @property
+    def awake(self) -> bool:
+        """Return whether audio is currently allowed to stream upstream."""
+        return self.session.awake
+
+    def poll(self) -> Literal["wake", "sleep", "expired"] | None:
+        """Consume at most one pending gating event, in mic-loop priority order."""
+        if self.session.consume_wake_request():
+            return "wake"
+        elif self.session.consume_sleep_request():
+            return "sleep"
+        elif self.session.expired():
+            return "expired"
+        return None
+
+    def feed(self, audio_frame: NDArray[Any], input_sample_rate: int) -> None:
+        """Forward mic audio to the local wake detector, restarting it if needed."""
+        if self.detector is None:
+            return
+        if not self.detector.is_running():
+            logger.warning("Wake detector thread not running; restarting")
+            self.detector.start()
+        self.detector.feed(_to_wake_rate(audio_frame, input_sample_rate))
+
+    def buffer_frame(self, frame: NDArray[np.int16]) -> None:
+        """Keep a mono mic frame local in the pre-wake ring buffer."""
+        self.buffer.append(frame)
+
+    def drain_tail(self, seconds: float) -> NDArray[np.int16]:
+        """Return up to the last ``seconds`` of buffered audio and clear the buffer."""
+        return self.buffer.drain_tail(seconds)
+
+    def restore(self, samples: NDArray[np.int16]) -> None:
+        """Put drained audio back at the front of the buffer after a failed flush."""
+        self.buffer.restore(samples)
+
+    def enter_awake(self) -> None:
+        """Open the gate: detector listens for the sleep phrase, session wakes."""
+        if self.detector is not None:
+            self.detector.listen_for_sleep()
+        self.session.wake()
+
+    def sleep(self) -> None:
+        """Flip the session asleep (call ``listen_for_wake`` separately, after any awaits)."""
+        self.session.sleep()
+
+    def listen_for_wake(self) -> None:
+        """Switch the detector back to wake-phrase listening, restarting it if needed."""
+        detector = self.detector
+        if detector is None:
+            return
+        detector.listen_for_wake()
+        if not detector.is_running():
+            logger.warning("Wake detector thread not running; restarting")
+            detector.start()
+
+    def requeue_wake(self) -> None:
+        """Re-queue a wake request (used when a wake transition fails and backs off)."""
+        self.session.request_wake()
+
+    def touch(self) -> None:
+        """Record session activity, resetting the inactivity timer."""
+        self.session.touch()
+
+    def start(self) -> None:
+        """Start the detector thread, if a detector is configured."""
+        if self.detector is not None:
+            self.detector.start()
+
+    def stop(self) -> None:
+        """Stop the detector thread, if a detector is configured."""
+        if self.detector is not None:
+            self.detector.stop()
+
+    def debug_state(self) -> Any:
+        """Return the detector's debug state (None when no detector exists)."""
+        return self.detector.debug_state() if self.detector is not None else None

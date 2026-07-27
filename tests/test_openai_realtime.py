@@ -1472,6 +1472,38 @@ async def test_camera_tool_result_never_inlines_base64_as_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_any_tool_result_with_b64_im_uses_image_attachment_path() -> None:
+    """The 'b64_im' result key is a reserved convention, not camera-specific.
+
+    An external/profile tool returning an image must get the same
+    input_image treatment instead of inlining base64 as raw text tokens.
+    """
+    handler = _build_wake_enabled_handler()
+    connection = RecordingItemConnection()
+    handler.connection = connection
+
+    b64_im = "QUJD" * 1_000
+    notification = btm_mod.ToolNotification(
+        id="call_ext_1",
+        tool_name="external_snapshot",
+        status=ToolState.COMPLETED,
+        result={"b64_im": b64_im, "note": "profile tool image"},
+    )
+
+    await handler._handle_tool_result(notification)
+
+    function_outputs = [i for i in connection.items if i.get("type") == "function_call_output"]
+    assert len(function_outputs) == 1
+    assert b64_im not in function_outputs[0]["output"]
+    assert "image captured and attached" in function_outputs[0]["output"]
+    assert '"note": "profile tool image"' in function_outputs[0]["output"]
+
+    image_items = [i for i in connection.items if i.get("type") == "message"]
+    assert len(image_items) == 1
+    assert image_items[0]["content"][0]["image_url"] == f"data:image/jpeg;base64,{b64_im}"
+
+
+@pytest.mark.asyncio
 async def test_non_camera_tool_result_output_is_unchanged() -> None:
     """Regular tool results still serialize verbatim into the function output."""
     handler = _build_wake_enabled_handler()
@@ -2107,9 +2139,9 @@ async def test_session_teardown_releases_listening_freeze(monkeypatch: Any) -> N
 async def test_partial_transcripts_survive_queue_flush() -> None:
     """After a barge-in flush, debounced partials still reach the live queue.
 
-    clear_audio_queue must drain the queue in place (not swap the object) and
-    the debouncer must resolve the handler's CURRENT queue at emit time —
-    otherwise the first interruption orphans every later partial transcript.
+    clear_audio_queue must drain the queue in place (not swap the object):
+    the debouncer holds a direct reference to the handler's queue, so a swap
+    would orphan every later partial transcript.
     """
     from bobe.console import LocalStream
 
@@ -2128,21 +2160,6 @@ async def test_partial_transcripts_survive_queue_flush() -> None:
     await handler._partial_debouncer.schedule("hello there")
     output = await asyncio.wait_for(handler.output_queue.get(), timeout=2.0)
     assert output.args[0] == {"role": "user_partial", "content": "hello there"}
-
-
-@pytest.mark.asyncio
-async def test_debouncer_resolves_current_output_queue() -> None:
-    """Even if the queue object is replaced, partials land on the current one."""
-    handler = _build_wake_enabled_handler()
-    handler._partial_debouncer._delay = 0.01
-
-    replacement: "asyncio.Queue[Any]" = asyncio.Queue()
-    handler.output_queue = replacement
-
-    await handler._partial_debouncer.schedule("still visible")
-
-    output = await asyncio.wait_for(replacement.get(), timeout=2.0)
-    assert output.args[0] == {"role": "user_partial", "content": "still visible"}
 
 
 # ---- LocalStream.close() thread-safety / startup-window handling ----

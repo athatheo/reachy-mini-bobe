@@ -130,3 +130,29 @@ def persist_api_settings(
         logger.info("Persisted explicit API settings to %s", env_path)
     except Exception as exc:
         logger.warning("Failed to persist explicit API settings: %s", exc)
+
+
+def persist_openai_key_first_run(instance_path: str, key: str) -> None:
+    """Persist a first-run OPENAI_API_KEY to the environment and instance ``.env``.
+
+    - Always refreshes ``os.environ`` first: downstream consumers rely on the
+      process-env update even when the file write is skipped.
+    - Writes ``.env`` to ``instance_path/.env`` only when the file does not
+      exist yet (an existing file is user configuration and is never touched).
+    - Persists ONLY the OPENAI_API_KEY line: seeding the rest of the file
+      from a ``.env.example`` template would bake template values (example
+      wake URL/gain) that later override live tuned env values.
+    """
+    # Update the current process environment for downstream consumers
+    os.environ["OPENAI_API_KEY"] = key
+
+    env_path = Path(instance_path) / ".env"
+    if env_path.exists():
+        # Respect existing user configuration
+        logger.info(".env already exists at %s; not overwriting.", env_path)
+        return
+
+    with ENV_FILE_LOCK:
+        lines = upsert_env_keys(read_env_lines(env_path), {"OPENAI_API_KEY": key})
+        write_env_lines(env_path, lines)
+    logger.info("Created %s and stored OPENAI_API_KEY for future runs.", env_path)

@@ -1,4 +1,3 @@
-import os
 import json
 import time
 import uuid
@@ -6,8 +5,7 @@ import base64
 import random
 import asyncio
 import logging
-from typing import Any, Final, Tuple, Literal, Callable, Optional
-from pathlib import Path
+from typing import Any, Final, Tuple, Literal, Optional
 
 import cv2
 import numpy as np
@@ -18,24 +16,19 @@ from numpy.typing import NDArray
 from scipy.signal import resample
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
+from bobe.cues import play_chime, queue_antenna_cue
 from bobe.config import config, set_custom_profile
 from bobe.prompts import get_session_voice, get_realtime_session_instructions
-from bobe.env_file import (
-    ENV_FILE_LOCK,
-    read_env_lines,
-    upsert_env_keys,
-    write_env_lines,
-)
+from bobe.env_file import persist_openai_key_first_run
 from bobe.wake_word import (
     DEFAULT_FLUSH_SECONDS,
+    WakeGate,
+    WakeConfig,
     WakeSession,
     AudioRingBuffer,
-    load_wake_config,
-    wake_detector_error,
     create_wake_detector,
 )
 from bobe.wake.phrases import matches_sleep_command
-from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
@@ -75,8 +68,6 @@ _MAX_SESSION_RETRY_DELAY_S: Final[float] = 30.0
 _RESTART_CONNECT_TIMEOUT_S: Final[float] = 5.0
 # Ignore server VAD briefly after assistant audio so speaker echo does not freeze motors.
 _ASSISTANT_VAD_GUARD_S: Final[float] = 0.4
-# World-frame head translation applied when falling asleep (millimeters, vertical).
-_SLEEP_HEAD_Z_OFFSET_MM: Final[float] = 30.0
 # Exponential backoff bounds for retrying a failed wake transition; retries
 # must never run once per mic frame, and the mic loop must never stall on them.
 _WAKE_RETRY_INITIAL_DELAY_S: Final[float] = 2.0
@@ -88,22 +79,22 @@ class RealtimeSessionError(Exception):
 
 
 class PartialTranscriptDebouncer:
-    """Debounce partial ASR transcripts before emitting them to the UI."""
+    """Debounce partial ASR transcripts before emitting them to the UI.
+
+    schedule() awaits the cancellation of the previous emit task before
+    starting the next one, so only the latest partial ever reaches the queue.
+    """
 
     # ruff: noqa: D102, D107
 
     def __init__(
         self,
-        queue_provider: "Callable[[], asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]]",
+        queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]",
         delay: float = 0.5,
     ) -> None:
-        # A provider, not a queue: the handler's output queue may be swapped
-        # over the debouncer's lifetime, and a cached reference would keep
-        # feeding an orphaned queue nobody reads anymore.
-        self._queue_provider = queue_provider
+        self._queue = queue
         self._delay = delay
         self._task: asyncio.Task[None] | None = None
-        self._sequence = 0
 
     async def cancel(self) -> None:
         if self._task and not self._task.done():
@@ -115,20 +106,31 @@ class PartialTranscriptDebouncer:
 
     async def schedule(self, transcript: str) -> None:
         await self.cancel()
-        self._sequence += 1
-        sequence = self._sequence
-        self._task = asyncio.create_task(self._emit(transcript, sequence))
+        self._task = asyncio.create_task(self._emit(transcript))
 
-    async def _emit(self, transcript: str, sequence: int) -> None:
+    async def _emit(self, transcript: str) -> None:
         try:
             await asyncio.sleep(self._delay)
-            if self._sequence == sequence:
-                # Resolve the CURRENT queue at emit time (see __init__).
-                await self._queue_provider().put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
-                logger.debug(f"Debounced partial emitted: {transcript}")
+            await self._queue.put(AdditionalOutputs({"role": "user_partial", "content": transcript}))
+            logger.debug(f"Debounced partial emitted: {transcript}")
         except asyncio.CancelledError:
             logger.debug("Debounced partial cancelled")
             raise
+
+
+def _decode_b64_jpeg_to_rgb(b64_im: str) -> "NDArray[np.uint8] | None":
+    """Decode a base64 JPEG to an RGB array; malformed data degrades to None."""
+    try:
+        buffer = np.frombuffer(base64.b64decode(b64_im), dtype=np.uint8)
+        bgr = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return None
+        # JPEGs decode as BGR; convert so Gradio displays correct colors.
+        rgb: NDArray[np.uint8] = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        return rgb
+    except Exception:
+        logger.debug("Could not decode attached tool image for UI echo", exc_info=True)
+        return None
 
 
 def _compute_response_cost(usage: Any) -> float:
@@ -164,6 +166,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.deps = deps
 
         self.connection: Any = None
+        # Never reassign this queue: console.clear_audio_queue drains it in
+        # place, and the partial-transcript debouncer holds a direct reference.
         self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
 
         self.gradio_mode = gradio_mode
@@ -172,7 +176,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._key_source: Literal["env", "textbox"] = "env"
         self._provided_api_key: str | None = None
 
-        self._partial_debouncer = PartialTranscriptDebouncer(lambda: self.output_queue)
+        self._partial_debouncer = PartialTranscriptDebouncer(self.output_queue)
 
         self._connected_event: asyncio.Event = asyncio.Event()
 
@@ -214,23 +218,70 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._claude_code_tasks: set[asyncio.Task[None]] = set()
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
-        self.wake_config = load_wake_config()
-        self.wake_session = WakeSession(timeout_s=self.wake_config.timeout_s)
-        self._wake_buffer = AudioRingBuffer(sample_rate=self.input_sample_rate)
-        self._wake_detector = create_wake_detector(
-            on_wake=self.wake_session.request_wake,
-            config=self.wake_config,
-            on_sleep=self.wake_session.request_sleep,
+        # The factory is looked up in this module's namespace at call time so
+        # tests can stub bobe.openai_realtime.create_wake_detector.
+        self.wake_gate = WakeGate(
+            input_sample_rate=self.input_sample_rate,
+            detector_factory=create_wake_detector,
         )
-        self.wake_gating_enabled = self._wake_detector is not None
-        if self.wake_gating_enabled:
-            self.wake_error = None
-        else:
-            self.wake_error = wake_detector_error(self.wake_config) or "Wake-word detector unavailable"
-            logger.error("Wake-word gating disabled: %s", self.wake_error)
-            # Fallback: without a detector, stay in an always-on session so mic + replies work.
-            self.wake_session.wake()
-            logger.warning("Wake-word detection unavailable; running in always-on mode until wake is configured")
+
+    # --- Wake-gate aliases: settings_server and tests reach these directly ---
+
+    @property
+    def wake_config(self) -> WakeConfig:
+        """Alias for the wake gate's config."""
+        return self.wake_gate.config
+
+    @wake_config.setter
+    def wake_config(self, value: WakeConfig) -> None:
+        """Replace the wake gate's config."""
+        self.wake_gate.config = value
+
+    @property
+    def wake_session(self) -> WakeSession:
+        """Alias for the wake gate's session."""
+        return self.wake_gate.session
+
+    @wake_session.setter
+    def wake_session(self, value: WakeSession) -> None:
+        """Replace the wake gate's session."""
+        self.wake_gate.session = value
+
+    @property
+    def wake_gating_enabled(self) -> bool:
+        """Alias for whether the wake gate is enabled."""
+        return self.wake_gate.enabled
+
+    @wake_gating_enabled.setter
+    def wake_gating_enabled(self, value: bool) -> None:
+        """Override whether the wake gate is enabled."""
+        self.wake_gate.enabled = value
+
+    @property
+    def wake_error(self) -> str | None:
+        """Alias for the wake gate's user-visible error."""
+        return self.wake_gate.error
+
+    @wake_error.setter
+    def wake_error(self, value: str | None) -> None:
+        """Replace the wake gate's user-visible error."""
+        self.wake_gate.error = value
+
+    @property
+    def _wake_buffer(self) -> AudioRingBuffer:
+        return self.wake_gate.buffer
+
+    @_wake_buffer.setter
+    def _wake_buffer(self, value: AudioRingBuffer) -> None:
+        self.wake_gate.buffer = value
+
+    @property
+    def _wake_detector(self) -> Any:
+        return self.wake_gate.detector
+
+    @_wake_detector.setter
+    def _wake_detector(self, value: Any) -> None:
+        self.wake_gate.detector = value
 
     def _session_accepts_responses(self) -> bool:
         """Return whether assistant responses should play (wake gating or always-on fallback)."""
@@ -329,8 +380,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
 
-        if self._wake_detector is not None:
-            self._wake_detector.start()
+        self.wake_gate.start()
 
         while not self._shutdown_requested:
             self._restart_requested.clear()
@@ -573,12 +623,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             )
             return
 
-        # The camera tool's base64 JPEG travels only as the input_image item
-        # below; inlining it in the function output or chat payload would
-        # inject hundreds of kilobytes of base64 as raw text tokens.
+        # Reserved result key: any tool result dict carrying 'b64_im' (a base64
+        # JPEG string) travels only as the input_image item below — camera,
+        # external, and profile tools alike. Inlining it in the function output
+        # or chat payload would inject hundreds of kilobytes of base64 as raw
+        # text tokens.
         b64_im: str | None = None
         summary_result = tool_result
-        if bg_tool.tool_name == "camera" and isinstance(tool_result, dict) and "b64_im" in tool_result:
+        if isinstance(tool_result, dict) and "b64_im" in tool_result:
             # use raw base64, don't json.dumps (which adds quotes)
             raw_b64 = tool_result["b64_im"]
             if not isinstance(raw_b64, str):
@@ -626,25 +678,22 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         ],
                     },
                 )
-                logger.info("Added camera image to conversation")
+                logger.info("Attached tool image to conversation")
 
-                if self.deps.camera_worker is not None:
-                    np_img = self.deps.camera_worker.get_latest_frame()
-                    if np_img is not None:
-                        # Camera frames are BGR from OpenCV; convert so Gradio displays correct colors.
-                        rgb_frame = await asyncio.to_thread(cv2.cvtColor, np_img, cv2.COLOR_BGR2RGB)
-                    else:
-                        rgb_frame = None
-                    img = gr.Image(value=rgb_frame)
+                # Echo the exact frame the model saw into the UI: decode the
+                # base64 already in hand instead of re-capturing a (possibly
+                # different, possibly stale) frame from the camera worker.
+                rgb_frame = await asyncio.to_thread(_decode_b64_jpeg_to_rgb, b64_im)
+                img = gr.Image(value=rgb_frame)
 
-                    await self.output_queue.put(
-                        AdditionalOutputs(
-                            {
-                                "role": "assistant",
-                                "content": img,
-                            },
-                        ),
-                    )
+                await self.output_queue.put(
+                    AdditionalOutputs(
+                        {
+                            "role": "assistant",
+                            "content": img,
+                        },
+                    ),
+                )
 
             await self._safe_response_create(
                 response={
@@ -892,7 +941,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     voice,
                 )
                 # If we reached here, the session update succeeded which implies the API key worked.
-                # Persist the key to a newly created .env (copied from .env.example) if needed.
+                # Persist the key to a newly created .env if needed.
                 self._persist_api_key_if_needed()
             except Exception:
                 logger.exception("Realtime session.update failed; retrying session")
@@ -929,7 +978,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         else:
                             self._latest_user_transcript = ""
                             self._sleep_pending = False
-                            if hasattr(self, "_clear_queue") and callable(self._clear_queue):
+                            # fastrtc's StreamHandlerBase declares _clear_queue as an
+                            # Optional callback; console.LocalStream installs it.
+                            if self._clear_queue is not None:
                                 self._clear_queue()
                             if self.deps.head_wobbler is not None:
                                 self.deps.head_wobbler.reset()
@@ -1131,75 +1182,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 if tool_manager_generation is not None:
                     await self.tool_manager.shutdown(generation=tool_manager_generation)
 
-    def _to_wake_rate(self, audio_frame: NDArray[Any], input_sample_rate: int) -> NDArray[np.int16]:
-        """Convert a mono frame to the 16 kHz int16 format the wake backends expect."""
-        mono = audio_frame.reshape(-1)
-        if input_sample_rate != WAKE_SAMPLE_RATE:
-            mono = resample(mono, int(len(mono) * WAKE_SAMPLE_RATE / input_sample_rate))
-        if np.issubdtype(mono.dtype, np.integer):
-            return mono.astype(np.int16, copy=False)
-        converted: NDArray[np.int16] = audio_to_int16(np.asarray(mono, dtype=np.float32))
-        return converted
-
-    def _feed_wake_detector(self, audio_frame: NDArray[Any], input_sample_rate: int) -> None:
-        """Forward mic audio to the local wake detector, restarting it if needed."""
-        if self._wake_detector is None:
-            return
-        if not self._wake_detector.is_running():
-            logger.warning("Wake detector thread not running; restarting")
-            self._wake_detector.start()
-        self._wake_detector.feed(self._to_wake_rate(audio_frame, input_sample_rate))
-
-    def _make_chime(self, *, ascending: bool) -> NDArray[np.int16]:
-        """Generate a short two-tone chime marking a wake/sleep transition."""
-        sample_rate = self.output_sample_rate
-        freqs = (660.0, 880.0) if ascending else (880.0, 660.0)
-        fade = max(1, int(sample_rate * 0.01))
-        tones = []
-        for freq in freqs:
-            t = np.arange(int(sample_rate * 0.12)) / sample_rate
-            tone = 0.25 * np.sin(2 * np.pi * freq * t)
-            tone[:fade] *= np.linspace(0.0, 1.0, fade)
-            tone[-fade:] *= np.linspace(1.0, 0.0, fade)
-            tones.append(tone)
-        return (np.concatenate(tones) * 32767).astype(np.int16)
-
     async def _play_chime(self, *, ascending: bool) -> None:
-        try:
-            chime = self._make_chime(ascending=ascending)
-            await self.output_queue.put((self.output_sample_rate, chime.reshape(1, -1)))
-        except Exception:
-            logger.debug("Chime skipped", exc_info=True)
+        await play_chime(self.output_queue, self.output_sample_rate, ascending=ascending)
 
     def _queue_antenna_cue(self, *, awake: bool) -> None:
-        """Raise antennas while streaming; relax them and nod head down when asleep."""
-        try:
-            from reachy_mini.utils import create_head_pose
-            from reachy_mini.utils.interpolation import compose_world_offset
-            from bobe.dance_emotion_moves import GotoQueueMove
-
-            # Snapshot the PRIMARY (offset-free) target pose, not the measured
-            # pose: the measured pose already contains speech-sway and
-            # face-tracking offsets, and using it as the goto target would bake
-            # those offsets into the primary pose permanently (finding #33).
-            head_pose, antennas, body_yaw = self.deps.movement_manager.get_primary_target_pose()
-            # Mirrored joints: (-, +) perks both antennas outward; (+, -) crosses them.
-            target = (-0.5, 0.5) if awake else (0.0, 0.0)
-            z_offset_mm = _SLEEP_HEAD_Z_OFFSET_MM if awake else -_SLEEP_HEAD_Z_OFFSET_MM
-            head_offset = create_head_pose(0, 0, z_offset_mm, 0, 0, 0, degrees=True, mm=True)
-            target_head_pose = compose_world_offset(head_pose, head_offset, reorthonormalize=True)
-            move = GotoQueueMove(
-                target_head_pose=target_head_pose,
-                start_head_pose=head_pose,
-                target_antennas=target,
-                start_antennas=antennas,
-                target_body_yaw=body_yaw,
-                start_body_yaw=body_yaw,
-                duration=0.6,
-            )
-            self.deps.movement_manager.queue_move(move)
-        except Exception:
-            logger.debug("Antenna cue skipped", exc_info=True)
+        """Queue the wake/sleep antenna-and-head posture cue (see bobe.cues)."""
+        queue_antenna_cue(self.deps.movement_manager, awake=awake)
 
     def _wake_transition_active(self) -> bool:
         """Return whether an awake transition task is currently running."""
@@ -1223,7 +1211,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             # The running transition already opens the streaming window.
             return
         if time.monotonic() < self._next_wake_retry_at:
-            self.wake_session.request_wake()
+            self.wake_gate.requeue_wake()
             return
         self._wake_transition_task = asyncio.create_task(
             self._run_wake_transition(),
@@ -1252,7 +1240,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         if delay == _WAKE_RETRY_INITIAL_DELAY_S:
             # Audible cue once per failure streak so the wake is not silently dropped.
             await self._play_chime(ascending=False)
-        self.wake_session.request_wake()
+        self.wake_gate.requeue_wake()
 
     async def _transition_to_awake(self) -> bool:
         """Open the streaming window after a local wake-word detection."""
@@ -1268,7 +1256,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # destroying the buffered utterance is the worst possible outcome. On
         # failure the tail goes back into the ring buffer, a fresh session is
         # requested, and the retry/backoff machinery re-runs the transition.
-        tail = self._wake_buffer.drain_tail(DEFAULT_FLUSH_SECONDS)
+        tail = self.wake_gate.drain_tail(DEFAULT_FLUSH_SECONDS)
         if tail.size:
             conn = self.connection
             flush_error: Exception | None = None
@@ -1281,7 +1269,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     flush_error = e
             if flush_error is not None:
                 logger.warning("Could not flush pre-wake audio; retrying wake: %s", flush_error)
-                self._wake_buffer.restore(tail)
+                self.wake_gate.restore(tail)
                 await self._restart_session()
                 return False
 
@@ -1290,8 +1278,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._last_assistant_audio_at = 0.0
 
         self._sleep_pending = False
-        self._listen_for_sleep_detector()
-        self.wake_session.wake()
+        self.wake_gate.enter_awake()
         logger.info("Wake word heard: streaming audio to OpenAI until timeout or sleep phrase")
         await self._play_chime(ascending=True)
         self._queue_antenna_cue(awake=True)
@@ -1299,7 +1286,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def _transition_to_sleep(self, reason: str) -> None:
         """Close the streaming window; audio stays on the robot again."""
-        self.wake_session.sleep()
+        self.wake_gate.sleep()
         self._sleep_pending = False
         logger.info("Going to sleep (%s): audio stays local until the wake word", reason)
 
@@ -1318,26 +1305,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 await self.connection.input_audio_buffer.clear()
             except Exception as e:
                 logger.debug("Could not clear input buffer on sleep: %s", e)
-        if hasattr(self, "_clear_queue") and callable(self._clear_queue):
+        # fastrtc's StreamHandlerBase declares _clear_queue as an Optional
+        # callback; console.LocalStream installs it.
+        if self._clear_queue is not None:
             self._clear_queue()
 
         await self._play_chime(ascending=False)
         self._queue_antenna_cue(awake=False)
-        self._listen_for_wake_detector()
-
-    def _listen_for_sleep_detector(self) -> None:
-        detector = self._wake_detector
-        if detector is not None:
-            detector.listen_for_sleep()
-
-    def _listen_for_wake_detector(self) -> None:
-        detector = self._wake_detector
-        if detector is None:
-            return
-        detector.listen_for_wake()
-        if not detector.is_running():
-            logger.warning("Wake detector thread not running; restarting")
-            detector.start()
+        self.wake_gate.listen_for_wake()
 
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive a mic frame; keep it local while asleep, otherwise send upstream.
@@ -1369,22 +1344,23 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Cast if needed
         upstream_frame = audio_to_int16(upstream_frame)
 
-        if self.wake_gating_enabled:
-            if self.wake_session.consume_wake_request():
+        if self.wake_gate.enabled:
+            event = self.wake_gate.poll()
+            if event == "wake":
                 # Never await the (possibly slow) transition here: receive() is
                 # called serially per mic frame by the record loop.
                 self._start_wake_transition()
-            elif self.wake_session.consume_sleep_request():
+            elif event == "sleep":
                 await self._transition_to_sleep("local sleep phrase")
-            elif self.wake_session.expired():
+            elif event == "expired":
                 await self._transition_to_sleep("inactivity timeout")
 
-            if not self.wake_session.awake:
-                self._wake_buffer.append(upstream_frame.reshape(-1))
-                self._feed_wake_detector(audio_frame, input_sample_rate)
+            if not self.wake_gate.awake:
+                self.wake_gate.buffer_frame(upstream_frame.reshape(-1))
+                self.wake_gate.feed(audio_frame, input_sample_rate)
                 return
 
-            self._feed_wake_detector(audio_frame, input_sample_rate)
+            self.wake_gate.feed(audio_frame, input_sample_rate)
 
         if not self.connection:
             now = time.monotonic()
@@ -1429,8 +1405,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._restart_requested.set()
 
         # Stop the local wake-word detector thread
-        if self._wake_detector is not None:
-            self._wake_detector.stop()
+        self.wake_gate.stop()
 
         # Stop any in-flight wake transition and Claude Code confirmation tasks.
         background_tasks = [self._wake_transition_task, *self._claude_code_tasks]
@@ -1492,14 +1467,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         ]
 
     def _persist_api_key_if_needed(self) -> None:
-        """Persist the API key into `.env` inside `instance_path/` when appropriate.
+        """Persist a textbox-provided API key into ``instance_path/.env`` when appropriate.
 
-        - Only runs in Gradio mode when key came from the textbox and is non-empty.
-        - Only saves if `self.instance_path` is not None.
-        - Writes `.env` to `instance_path/.env` (does not overwrite if it already exists).
-        - Persists ONLY the OPENAI_API_KEY line: seeding the rest of the file
-          from a `.env.example` template would bake template values (example
-          wake URL/gain) that later override live tuned env values.
+        Only runs in Gradio mode when the key came from the textbox, is
+        non-empty, and ``self.instance_path`` is set. The env-file policy
+        itself (process-env refresh, never overwriting an existing ``.env``,
+        key-only writes) lives in ``bobe.env_file.persist_openai_key_first_run``.
         """
         try:
             if not self.gradio_mode:
@@ -1518,19 +1491,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 logger.warning("Instance path is None; cannot persist API key.")
                 return
 
-            # Update the current process environment for downstream consumers
-            os.environ["OPENAI_API_KEY"] = key
-
-            env_path = Path(self.instance_path) / ".env"
-            if env_path.exists():
-                # Respect existing user configuration
-                logger.info(".env already exists at %s; not overwriting.", env_path)
-                return
-
-            with ENV_FILE_LOCK:
-                lines = upsert_env_keys(read_env_lines(env_path), {"OPENAI_API_KEY": key})
-                write_env_lines(env_path, lines)
-            logger.info("Created %s and stored OPENAI_API_KEY for future runs.", env_path)
+            persist_openai_key_first_run(self.instance_path, key)
         except Exception as e:
             # Never crash the app for QoL persistence; just log.
             logger.warning("Could not persist OPENAI_API_KEY to .env: %s", e)

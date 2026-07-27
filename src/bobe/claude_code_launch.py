@@ -13,10 +13,10 @@ from bobe.env_utils import parse_float, clean_optional
 from bobe.claude_code_client import (
     DEFAULT_CONFIRM_TTL_S,
     DEFAULT_REQUEST_TIMEOUT_S,
+    ConfirmationGate,
     request_daemon_json,
     derive_daemon_http_url,
     transcript_matches_phrase,
-    transcript_attempts_confirmation,
 )
 
 

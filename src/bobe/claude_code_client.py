@@ -2,8 +2,8 @@
 
 Used by :mod:`bobe.claude_code_launch` (one-shot Terminal launch) and
 :mod:`bobe.claude_code_session` (managed ``claude -p`` sessions), which share
-the same auth header, URL derivation, confirmation-phrase matching, and
-JSON-over-HTTP error mapping.
+the same auth header, URL derivation, confirmation-phrase matching,
+pending-confirmation gate, and JSON-over-HTTP error mapping.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
+from dataclasses import dataclass
 
 from bobe.wake.phrases import normalize_transcript
 
@@ -72,6 +73,111 @@ def transcript_attempts_confirmation(transcript: str | None) -> bool:
     if not normalized:
         return False
     return normalized.split(" ", 1)[0] in {"confirm", *_CONFIRM_ASR_VARIANTS}
+
+
+@dataclass
+class _PendingConfirmation:
+    """A staged, not-yet-confirmed payload awaiting the exact phrase."""
+
+    payload: Any
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class ConfirmationOutcome:
+    """Tagged outcome of consuming a transcript against a pending confirmation.
+
+    ``confirmed`` distinguishes a confirmed gate whose staged ``payload`` is
+    ``None`` (the launch gate stages nothing) from the finished ``reply``
+    outcomes (mismatch, no-pending, expired).
+    """
+
+    confirmed: bool = False
+    payload: Any = None
+    reply: dict[str, Any] | None = None
+
+
+class ConfirmationGate:
+    """Exact-phrase confirmation state shared by the launch and session controllers.
+
+    Owns the stage/expire/consume lifecycle around an opaque payload; callers
+    keep their HTTP actions and pass every user-facing status and message in.
+    """
+
+    def __init__(
+        self,
+        *,
+        phrase: str,
+        instruction: str,
+        no_pending_reply: dict[str, Any],
+        expired_reply: dict[str, Any],
+        clock: Callable[[], float],
+    ) -> None:
+        """Initialize the gate with its exact phrase, pinned replies, and clock."""
+        self._phrase = phrase
+        self._instruction = instruction
+        self._no_pending_reply = no_pending_reply
+        self._expired_reply = expired_reply
+        self._clock = clock
+        self._pending: _PendingConfirmation | None = None
+
+    def stage(self, payload: Any, *, ttl_s: float) -> float:
+        """Stage ``payload`` for confirmation and return the clamped TTL applied."""
+        ttl = max(1.0, ttl_s)
+        self._pending = _PendingConfirmation(payload=payload, expires_at=self._clock() + ttl)
+        return ttl
+
+    def clear(self) -> bool:
+        """Drop any staged confirmation, reporting whether one existed (even expired)."""
+        had_pending = self._pending is not None
+        self._pending = None
+        return had_pending
+
+    def has_pending(self) -> bool:
+        """Return whether a non-expired confirmation is pending."""
+        pending = self._pending
+        if pending is None:
+            return False
+        if self._clock() > pending.expires_at:
+            self._pending = None
+            return False
+        return True
+
+    def consume(self, transcript: str | None, *, correct_mismatch: bool) -> ConfirmationOutcome | None:
+        """Match ``transcript`` against the gate, consuming the staged payload.
+
+        Returns ``None`` when the transcript is not the exact phrase and no
+        correction is owed. With ``correct_mismatch``, a garbled confirmation
+        attempt while something is pending returns a corrective
+        ``confirmation_mismatch`` reply instead of failing silently.
+        Orchestrators coordinating several pending confirmations pass
+        ``False`` so a corrective reply here can never shadow another
+        controller's exactly-spoken phrase; they build the correction
+        themselves once every exact match has failed.
+        """
+        if not transcript_matches_phrase(transcript, self._phrase):
+            if correct_mismatch and self.has_pending() and transcript_attempts_confirmation(transcript):
+                # Don't fail silently while a confirmation is pending: keep it
+                # alive and tell the user the exact phrase to repeat.
+                return ConfirmationOutcome(
+                    reply={
+                        "status": "confirmation_mismatch",
+                        "message": f"That wasn't the exact confirmation phrase. {self._instruction}",
+                    }
+                )
+            return None
+
+        pending = self._pending
+        if pending is None:
+            return ConfirmationOutcome(reply=dict(self._no_pending_reply))
+
+        # Single consume before the expiry check: pending clears exactly once,
+        # before the caller's settings check and POST.
+        now = self._clock()
+        self._pending = None
+        if now > pending.expires_at:
+            return ConfirmationOutcome(reply=dict(self._expired_reply))
+        return ConfirmationOutcome(confirmed=True, payload=pending.payload)
 
 
 def derive_daemon_http_url(wake_url: str | None, path: str) -> str | None:
