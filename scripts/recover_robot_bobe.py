@@ -3,23 +3,10 @@
 
 from __future__ import annotations
 import sys
-import json
 import argparse
 import urllib.error
-import urllib.request
 
-
-def _request(method: str, url: str, payload: dict | None = None, timeout: float = 10.0) -> dict:
-    data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json"} if payload is not None else {},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-        return json.loads(body) if body else {}
+from _common import _request
 
 
 def main() -> None:

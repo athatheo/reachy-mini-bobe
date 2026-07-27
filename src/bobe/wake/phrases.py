@@ -105,25 +105,6 @@ def matches_wake_phrase(text: str, *, phrase: str = WAKE_PHRASE) -> bool:
     return False
 
 
-def matches_sleep_phrase(
-    text: str,
-    phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
-) -> bool:
-    """Return whether a transcript contains a sleep phrase anywhere.
-
-    Loose substring containment — prefer :func:`matches_sleep_command` for
-    deciding whether to actually put BoBe to sleep, since sleep phrases are
-    ordinary English n-grams that occur naturally inside sentences.
-    """
-    normalized = normalize_transcript(text)
-    if not normalized:
-        return False
-    # Normalize the phrase side too so punctuated/decomposed custom phrases
-    # can match the normalized transcript.
-    candidates = (normalize_transcript(phrase) for phrase in (*phrases, *SLEEP_PHRASE_ASR_VARIANTS))
-    return any(candidate in normalized for candidate in candidates if candidate)
-
-
 def matches_sleep_command(
     text: str,
     phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,

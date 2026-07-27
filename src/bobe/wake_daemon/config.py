@@ -26,14 +26,6 @@ DEFAULT_CLAUDE_CODE_OUTPUT_LIMIT_CHARS = 6000
 DEFAULT_CLAUDE_CODE_PERMISSION_MODE = "default"
 
 
-def whisper_initial_prompt_from_phrase(phrase: str) -> str:
-    """Build a mild Whisper initial prompt (wake name only — less bias than full phrase)."""
-    words = phrase.strip().casefold().split()
-    if not words:
-        return ""
-    return f"{words[-1].capitalize()}."
-
-
 @dataclass(frozen=True)
 class WakeDaemonConfig:
     """Runtime settings for bobe-wake-daemon."""

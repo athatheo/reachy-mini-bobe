@@ -7,11 +7,30 @@ from typing import Any
 from bobe.wake.phrases import WAKE_PHRASE
 
 
+# Declared in both handshake messages so either side can key compat behavior
+# off the peer's version instead of guessing. Peers ignore unknown JSON
+# fields, so adding it is wire-compatible with older builds (which simply
+# never send it).
+PROTOCOL_VERSION = 1
+
+MSG_HELLO = "hello"
+MSG_READY = "ready"
+MSG_WAKE = "wake"
+MSG_SLEEP = "sleep"
+MSG_STATS = "stats"
+MSG_LISTEN = "listen"
+
+# WebSocket close codes used by the daemon handshake (RFC 6455).
+CLOSE_UNSUPPORTED_DATA = 1003
+CLOSE_POLICY_VIOLATION = 1008
+
+
 def hello_message(*, sample_rate: int, token: str | None, phrase: str = WAKE_PHRASE) -> dict[str, Any]:
     """Build the robot handshake payload."""
     payload: dict[str, Any] = {
-        "type": "hello",
+        "type": MSG_HELLO,
         "client": "bobe",
+        "version": PROTOCOL_VERSION,
         "sample_rate": sample_rate,
         "phrase": phrase,
     }
@@ -23,7 +42,8 @@ def hello_message(*, sample_rate: int, token: str | None, phrase: str = WAKE_PHR
 def ready_message(*, engine: str, phrase: str = WAKE_PHRASE) -> dict[str, Any]:
     """Build the daemon ready acknowledgement."""
     return {
-        "type": "ready",
+        "type": MSG_READY,
+        "version": PROTOCOL_VERSION,
         "engine": engine,
         "phrase": phrase,
     }
@@ -32,7 +52,7 @@ def ready_message(*, engine: str, phrase: str = WAKE_PHRASE) -> dict[str, Any]:
 def wake_message(*, transcript: str, latency_ms: float, phrase: str = WAKE_PHRASE) -> dict[str, Any]:
     """Build a wake detection event."""
     return {
-        "type": "wake",
+        "type": MSG_WAKE,
         "phrase": phrase,
         "transcript": transcript,
         "latency_ms": round(latency_ms, 1),
@@ -41,13 +61,13 @@ def wake_message(*, transcript: str, latency_ms: float, phrase: str = WAKE_PHRAS
 
 def stats_message(**fields: Any) -> dict[str, Any]:
     """Build a periodic debug stats payload."""
-    return {"type": "stats", **fields}
+    return {"type": MSG_STATS, **fields}
 
 
 def sleep_message(*, transcript: str, latency_ms: float) -> dict[str, Any]:
     """Build a sleep detection event."""
     return {
-        "type": "sleep",
+        "type": MSG_SLEEP,
         "transcript": transcript,
         "latency_ms": round(latency_ms, 1),
     }
@@ -59,7 +79,7 @@ def listen_message(
     sleep_phrases: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Tell the daemon which phrase class to listen for."""
-    payload: dict[str, Any] = {"type": "listen", "mode": mode}
+    payload: dict[str, Any] = {"type": MSG_LISTEN, "mode": mode}
     if mode == "sleep" and sleep_phrases:
         payload["sleep_phrases"] = list(sleep_phrases)
     return payload

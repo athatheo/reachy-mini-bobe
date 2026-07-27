@@ -16,7 +16,16 @@ import numpy as np
 from numpy.typing import NDArray
 
 from bobe.wake.phrases import WAKE_PHRASE, DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_command
-from bobe.wake.protocol import hello_message, listen_message
+from bobe.wake.protocol import (
+    MSG_WAKE,
+    MSG_READY,
+    MSG_SLEEP,
+    MSG_STATS,
+    CLOSE_POLICY_VIOLATION,
+    parse_json,
+    hello_message,
+    listen_message,
+)
 from bobe.wake.constants import WAKE_SAMPLE_RATE, DEBUG_WINDOW_SECONDS
 
 
@@ -266,9 +275,10 @@ class RemoteWakeClient:
                 self._connected = False
                 if self._stop_event.is_set():
                     break
-                if _close_code(exc) == 1008:
+                if _close_code(exc) == CLOSE_POLICY_VIOLATION:
                     self._auth_error = (
-                        "Wake daemon rejected the handshake (close code 1008); check BOBE_WAKE_TOKEN"
+                        f"Wake daemon rejected the handshake (close code {CLOSE_POLICY_VIOLATION}); "
+                        "check BOBE_WAKE_TOKEN"
                     )
                     self._log_event("error", self._auth_error)
                     logger.error("%s. Retrying in %.0fs.", self._auth_error, AUTH_RETRY_S)
@@ -432,14 +442,11 @@ class RemoteWakeClient:
                 break
             if isinstance(message, bytes):
                 continue
-            try:
-                payload = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(payload, dict):
+            payload = parse_json(message)
+            if payload is None:
                 continue
             msg_type = payload.get("type")
-            if msg_type == "ready":
+            if msg_type == MSG_READY:
                 engine = str(payload.get("engine") or "")
                 phrase = str(payload.get("phrase") or self._phrase)
                 self._auth_error = None
@@ -451,9 +458,9 @@ class RemoteWakeClient:
                     payload.get("engine"),
                     payload.get("phrase"),
                 )
-            elif msg_type == "stats":
+            elif msg_type == MSG_STATS:
                 self._apply_remote_stats(payload)
-            elif msg_type == "wake":
+            elif msg_type == MSG_WAKE:
                 self._handle_wake_payload(payload)
-            elif msg_type == "sleep":
+            elif msg_type == MSG_SLEEP:
                 self._handle_sleep_payload(payload)

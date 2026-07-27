@@ -14,15 +14,20 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from bobe.wake.phrases import matches_wake_phrase
-from bobe.wake.protocol import parse_json, wake_message, ready_message, sleep_message, stats_message
+from bobe.wake.protocol import (
+    MSG_HELLO,
+    MSG_LISTEN,
+    CLOSE_POLICY_VIOLATION,
+    CLOSE_UNSUPPORTED_DATA,
+    parse_json,
+    wake_message,
+    ready_message,
+    sleep_message,
+    stats_message,
+)
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake_daemon.config import WakeDaemonConfig, load_wake_daemon_config
-from bobe.wake_daemon.engine import (
-    WhisperWakeEngine,
-    WhisperWakeSession,
-    whisper_engine_key,
-    warn_if_phrases_unsupported,
-)
+from bobe.wake_daemon.engine import WhisperWakeEngine, WhisperWakeSession, warn_if_phrases_unsupported
 from bobe.wake_daemon.launcher import ClaudeCodeLauncher
 from bobe.wake_daemon.claude_session import ClaudeCodeSessionManager
 
@@ -46,14 +51,14 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
     if not (runtime.token or "").strip():
         raise ValueError("BOBE_WAKE_TOKEN must be set to a non-empty value")
     warn_if_phrases_unsupported(runtime)
-    engines: dict[tuple[str, str, str, str | None, str | None], WhisperWakeEngine] = {}
 
     def shared_engine() -> WhisperWakeEngine:
-        key = whisper_engine_key(runtime)
-        engine = engines.get(key)
+        # Lazily create the one shared engine; the engine's own load lock
+        # makes the actual model load single-flight across threads.
+        engine: WhisperWakeEngine | None = app.state.wake_engine
         if engine is None:
             engine = WhisperWakeEngine(runtime)
-            engines[key] = engine
+            app.state.wake_engine = engine
         return engine
 
     def preload_whisper_model() -> None:
@@ -80,7 +85,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 await asyncio.to_thread(manager_shutdown)
 
     app = FastAPI(title="BoBe Wake Daemon", version="0.1.0", lifespan=lifespan)
-    app.state.wake_engines = engines
+    app.state.wake_engine = None
     app.state.claude_code_launcher = ClaudeCodeLauncher(runtime)
     app.state.claude_code_session_manager = ClaudeCodeSessionManager(runtime)
 

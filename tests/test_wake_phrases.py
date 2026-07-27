@@ -3,7 +3,6 @@ import unicodedata
 
 from bobe.wake.phrases import (
     matches_wake_phrase,
-    matches_sleep_phrase,
     normalize_transcript,
     matches_sleep_command,
 )
@@ -72,28 +71,6 @@ def test_punctuated_custom_wake_phrase_matches():
     assert matches_wake_phrase("hey bobe", phrase="hey, bobe")
     assert matches_wake_phrase("Hey, Bobe!", phrase="hey, bobe")
     assert matches_wake_phrase("hey bobby", phrase="Hey, Bobe.")  # variants still apply
-
-
-def test_matches_sleep_phrase():
-    assert matches_sleep_phrase("go to sleep")
-    assert matches_sleep_phrase("please go to sleep now")
-    assert matches_sleep_phrase("got to sleep")
-    assert matches_sleep_phrase("κοιμήσου")
-    assert not matches_sleep_phrase("hey bobe")
-    assert not matches_sleep_phrase("")
-
-
-def test_punctuated_custom_sleep_phrase_matches():
-    assert matches_sleep_phrase("It's bedtime.", ("it's bedtime",))
-    assert matches_sleep_phrase("time to rest now", ("time to  rest",))
-
-
-def test_sleep_phrase_matches_decomposed_unicode_both_ways():
-    nfd = unicodedata.normalize("NFD", "κοιμήσου")
-    # NFD transcript against the NFC default phrase.
-    assert matches_sleep_phrase(nfd)
-    # NFD-configured custom phrase against an NFC transcript.
-    assert matches_sleep_phrase("κοιμήσου", (nfd,))
 
 
 def test_matches_sleep_command_exact_and_with_fillers():

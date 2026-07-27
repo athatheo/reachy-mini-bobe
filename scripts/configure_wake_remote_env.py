@@ -6,19 +6,14 @@ import socket
 import argparse
 from pathlib import Path
 
+from _common import _read_token
+
 
 def _detect_host(default: str) -> str:
     try:
         return socket.gethostname().split(".")[0] or default
     except Exception:
         return default
-
-
-def _read_token(daemon_env: Path) -> str:
-    for line in daemon_env.read_text(encoding="utf-8").splitlines():
-        if line.startswith("BOBE_WAKE_TOKEN="):
-            return line.split("=", 1)[1].strip()
-    raise SystemExit(f"BOBE_WAKE_TOKEN not found in {daemon_env}")
 
 
 def _upsert(lines: list[str], key: str, value: str) -> None:

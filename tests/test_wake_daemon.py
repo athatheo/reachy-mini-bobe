@@ -59,12 +59,6 @@ def test_whisper_language_env_override():
     assert load_wake_daemon_config({**_TEST_ENV, "WHISPER_LANGUAGE": "auto"}).whisper_language is None
 
 
-def test_whisper_prompt_helpers():
-    from bobe.wake_daemon.config import whisper_initial_prompt_from_phrase
-
-    assert whisper_initial_prompt_from_phrase("hey bobe") == "Bobe."
-
-
 def test_whisper_prompt_env_override():
     config = load_wake_daemon_config(
         {
