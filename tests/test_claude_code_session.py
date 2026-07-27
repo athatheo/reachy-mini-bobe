@@ -3,6 +3,7 @@
 import json
 
 import pytest
+from conftest import JsonResponse, make_opener
 
 from bobe.claude_code_session import (
     ClaudeCodeSessionSettings,
@@ -50,20 +51,7 @@ def test_request_send_requires_config():
 @pytest.mark.asyncio
 async def test_start_posts_to_session_endpoint():
     calls = []
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps({"ok": True, "session_id": "session-1"}).encode()
-
-    def fake_opener(request, *, timeout):
-        calls.append((request, timeout))
-        return FakeResponse()
+    fake_opener = make_opener({"ok": True, "session_id": "session-1"}, calls)
 
     controller = ClaudeCodeSessionController(
         settings_loader=lambda: ClaudeCodeSessionSettings(
@@ -86,20 +74,7 @@ async def test_start_posts_to_session_endpoint():
 @pytest.mark.asyncio
 async def test_confirmed_command_posts_to_send_endpoint():
     calls = []
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps({"ok": True, "output": "done"}).encode()
-
-    def fake_opener(request, *, timeout):
-        calls.append(request)
-        return FakeResponse()
+    fake_opener = make_opener({"ok": True, "output": "done"}, calls)
 
     controller = ClaudeCodeSessionController(
         settings_loader=lambda: ClaudeCodeSessionSettings(
@@ -114,7 +89,7 @@ async def test_confirmed_command_posts_to_send_endpoint():
 
     assert result is not None
     assert result["status"] == "sent"
-    request = calls[0]
+    request, _ = calls[0]
     assert request.full_url == "http://mac.local:8765/v1/claude-code/session/send"
     assert json.loads(request.data.decode()) == {"command": "run tests"}
 
@@ -124,20 +99,6 @@ def _settings():
         base_url="http://mac.local:8765/v1/claude-code",
         token="control-token",
     )
-
-
-class _JsonResponse:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def read(self):
-        return json.dumps(self._payload).encode()
 
 
 @pytest.mark.asyncio
@@ -158,9 +119,9 @@ async def test_accepted_command_polls_status_until_result():
 
     def fake_opener(request, *, timeout):
         if request.full_url.endswith("/session/send"):
-            return _JsonResponse({"ok": True, "accepted": True, "running": True, "session_id": "s1"})
+            return JsonResponse({"ok": True, "accepted": True, "running": True, "session_id": "s1"})
         assert request.full_url.endswith("/session/status")
-        return _JsonResponse(next(status_payloads))
+        return JsonResponse(next(status_payloads))
 
     now = {"value": 0.0}
 
@@ -188,8 +149,8 @@ async def test_accepted_command_still_running_reports_running_not_failure():
 
     def fake_opener(request, *, timeout):
         if request.full_url.endswith("/session/send"):
-            return _JsonResponse({"ok": True, "accepted": True, "running": True, "session_id": "s1"})
-        return _JsonResponse(
+            return JsonResponse({"ok": True, "accepted": True, "running": True, "session_id": "s1"})
+        return JsonResponse(
             {"ok": True, "active": True, "session_id": "s1", "running": True, "last_result": None}
         )
 
@@ -217,8 +178,8 @@ async def test_accepted_command_still_running_reports_running_not_failure():
 async def test_accepted_command_reports_stopped_session():
     def fake_opener(request, *, timeout):
         if request.full_url.endswith("/session/send"):
-            return _JsonResponse({"ok": True, "accepted": True, "running": True, "session_id": "s1"})
-        return _JsonResponse({"ok": True, "active": False, "session_id": None, "running": False, "last_result": None})
+            return JsonResponse({"ok": True, "accepted": True, "running": True, "session_id": "s1"})
+        return JsonResponse({"ok": True, "active": False, "session_id": None, "running": False, "last_result": None})
 
     now = {"value": 0.0}
 

@@ -33,15 +33,7 @@ from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
-from bobe.claude_code_client import transcript_attempts_confirmation
-from bobe.claude_code_launch import (
-    maybe_confirm_claude_code_launch,
-    pending_launch_confirmation_instruction,
-)
-from bobe.claude_code_session import (
-    maybe_confirm_claude_code_command,
-    pending_command_confirmation_instruction,
-)
+from bobe.claude_code_confirmation import resolve_confirmation
 from bobe.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -763,47 +755,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self._transition_to_sleep("sleep phrase")
         return True
 
-    async def _maybe_launch_claude_code_from_transcript(self, transcript: str | None) -> bool:
-        """Return True after handling an exact Claude Code launch confirmation."""
-        result = await maybe_confirm_claude_code_launch(transcript, correct_mismatch=False)
-        return await self._handle_claude_code_confirmation_result(
-            result,
-            fallback_message="Claude Code launch request handled.",
-        )
-
-    async def _maybe_send_claude_code_command_from_transcript(self, transcript: str | None) -> bool:
-        """Return True after handling an exact Claude Code command confirmation."""
-        result = await maybe_confirm_claude_code_command(transcript, correct_mismatch=False)
-        return await self._handle_claude_code_confirmation_result(
-            result,
-            fallback_message="Claude Code command request handled.",
-        )
-
-    async def _maybe_correct_claude_code_confirmation(self, transcript: str) -> bool:
-        """Return True after correcting a garbled confirmation attempt.
-
-        Runs only once the transcript matched NEITHER exact confirmation
-        phrase, and mentions every phrase still pending so the user knows what
-        to repeat even when a launch and a command are pending at once.
-        """
-        if not transcript_attempts_confirmation(transcript):
-            return False
-        instructions = [
-            instruction
-            for instruction in (
-                pending_launch_confirmation_instruction(),
-                pending_command_confirmation_instruction(),
-            )
-            if instruction
-        ]
-        if not instructions:
-            return False
-        message = " ".join(("That wasn't the exact confirmation phrase.", *instructions))
-        return await self._handle_claude_code_confirmation_result(
-            {"status": "confirmation_mismatch", "message": message},
-            fallback_message=message,
-        )
-
     def _start_claude_code_confirmation(self, transcript: str) -> None:
         """Run the Claude Code confirmation flow as a background task.
 
@@ -821,33 +772,20 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         task.add_done_callback(self._claude_code_tasks.discard)
 
     async def _run_claude_code_confirmation(self, transcript: str) -> None:
-        """Handle launch then command confirmations, surfacing results when done."""
+        """Resolve any pending Claude Code confirmation, surfacing the result when done."""
         try:
-            # Exact matches on BOTH controllers first: with a launch and a
-            # command pending at once, one controller's corrective mismatch
-            # reply must never intercept the other's exactly-spoken phrase.
-            if await self._maybe_launch_claude_code_from_transcript(transcript):
-                return
-            if await self._maybe_send_claude_code_command_from_transcript(transcript):
-                return
-            await self._maybe_correct_claude_code_confirmation(transcript)
+            result = await resolve_confirmation(transcript)
+            if result is not None:
+                await self._handle_claude_code_confirmation_result(result)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Claude Code confirmation handling failed")
 
-    async def _handle_claude_code_confirmation_result(
-        self,
-        result: dict[str, Any] | None,
-        *,
-        fallback_message: str,
-    ) -> bool:
-        """Return True after surfacing a local Claude Code confirmation result."""
-        if result is None:
-            return False
-
+    async def _handle_claude_code_confirmation_result(self, result: dict[str, Any]) -> None:
+        """Surface a local Claude Code confirmation result to the UI and the voice."""
         await self._cancel_in_flight_response()
-        message = str(result.get("message") or fallback_message)
+        message = str(result.get("message") or "Claude Code request handled.")
         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": message}))
         if self.connection:
             await self._safe_response_create(
@@ -856,7 +794,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 },
             )
         self.wake_session.touch()
-        return True
 
     def _record_user_transcript(self, transcript: str | None) -> None:
         """Track the latest user transcript for early sleep detection."""

@@ -13,10 +13,10 @@ from bobe.env_utils import parse_float, clean_optional
 from bobe.claude_code_client import (
     DEFAULT_CONFIRM_TTL_S,
     DEFAULT_REQUEST_TIMEOUT_S,
+    ConfirmationGate,
     request_daemon_json,
     derive_daemon_http_url,
     transcript_matches_phrase,
-    transcript_attempts_confirmation,
 )
 
 
@@ -45,15 +45,6 @@ class ClaudeCodeSessionSettings:
         return bool(self.base_url and self.token)
 
 
-@dataclass
-class PendingClaudeCodeCommand:
-    """A pending, not-yet-confirmed Claude Code instruction."""
-
-    command: str
-    requested_at: float
-    expires_at: float
-
-
 class ClaudeCodeSessionController:
     """Owns pending voice commands and calls the Mac session API."""
 
@@ -70,7 +61,19 @@ class ClaudeCodeSessionController:
         self._clock = clock
         self._opener = opener
         self._sleep = sleeper or asyncio.sleep
-        self._pending: PendingClaudeCodeCommand | None = None
+        self._gate = ConfirmationGate(
+            phrase=COMMAND_CONFIRMATION_PHRASE,
+            instruction=COMMAND_CONFIRMATION_INSTRUCTION,
+            no_pending_reply={
+                "status": "no_pending_command",
+                "message": "No Claude Code command is pending.",
+            },
+            expired_reply={
+                "status": "expired",
+                "message": "Claude Code command confirmation expired. Tell me the command again.",
+            },
+            clock=clock,
+        )
 
     async def start(self) -> dict[str, Any]:
         """Start or reuse a daemon-owned Claude Code session."""
@@ -87,16 +90,10 @@ class ClaudeCodeSessionController:
 
         settings = self._settings_loader()
         if not settings.is_configured:
-            self._pending = None
+            self._gate.clear()
             return _missing_config()
 
-        now = self._clock()
-        ttl = max(1.0, settings.confirm_ttl_s)
-        self._pending = PendingClaudeCodeCommand(
-            command=clean_command,
-            requested_at=now,
-            expires_at=now + ttl,
-        )
+        ttl = self._gate.stage(clean_command, ttl_s=settings.confirm_ttl_s)
         return {
             "status": "pending_confirmation",
             "confirmation_phrase": COMMAND_CONFIRMATION_PHRASE,
@@ -113,42 +110,21 @@ class ClaudeCodeSessionController:
     ) -> dict[str, Any] | None:
         """Send a pending command only after the exact confirmation phrase.
 
-        With ``correct_mismatch`` (the default), a garbled confirmation attempt
-        while a command is pending returns a corrective ``confirmation_mismatch``
-        response instead of failing silently. Orchestrators coordinating several
-        pending confirmations pass ``False`` so a corrective reply here can never
-        shadow another controller's exactly-spoken phrase; they build the
-        correction themselves once every exact match has failed.
+        See :meth:`bobe.claude_code_client.ConfirmationGate.consume` for the
+        ``correct_mismatch`` coordination contract used by orchestrators with
+        several pending confirmations.
         """
-        if not command_confirmation_phrase_matches(transcript):
-            if correct_mismatch and self.has_pending() and transcript_attempts_confirmation(transcript):
-                # Don't fail silently while a command is pending: keep the pending
-                # command alive and tell the user the exact phrase to repeat.
-                return {
-                    "status": "confirmation_mismatch",
-                    "message": (
-                        f"That wasn't the exact confirmation phrase. {COMMAND_CONFIRMATION_INSTRUCTION}"
-                    ),
-                }
+        outcome = self._gate.consume(transcript, correct_mismatch=correct_mismatch)
+        if outcome is None:
             return None
-
-        pending = self._pending
-        if pending is None:
-            return {"status": "no_pending_command", "message": "No Claude Code command is pending."}
-
-        now = self._clock()
-        self._pending = None
-        if now > pending.expires_at:
-            return {
-                "status": "expired",
-                "message": "Claude Code command confirmation expired. Tell me the command again.",
-            }
+        if not outcome.confirmed:
+            return outcome.reply
 
         settings = self._settings_loader()
         if not settings.is_configured:
             return _missing_config()
 
-        result = await asyncio.to_thread(self._post, settings, "/session/send", {"command": pending.command})
+        result = await asyncio.to_thread(self._post, settings, "/session/send", {"command": outcome.payload})
         if result.get("ok"):
             if result.get("accepted"):
                 # New daemons accept the command and run it in the background;
@@ -219,7 +195,7 @@ class ClaudeCodeSessionController:
 
     async def stop(self) -> dict[str, Any]:
         """Stop the managed Claude Code session."""
-        self._pending = None
+        self._gate.clear()
         settings = self._settings_loader()
         if not settings.is_configured:
             return _missing_config()
@@ -227,13 +203,7 @@ class ClaudeCodeSessionController:
 
     def has_pending(self) -> bool:
         """Return whether a non-expired command confirmation is pending."""
-        pending = self._pending
-        if pending is None:
-            return False
-        if self._clock() > pending.expires_at:
-            self._pending = None
-            return False
-        return True
+        return self._gate.has_pending()
 
     def _post(self, settings: ClaudeCodeSessionSettings, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request(settings, "POST", path, payload)

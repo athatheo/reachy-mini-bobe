@@ -1,9 +1,9 @@
 # ruff: noqa: D103
 
-import json
 import http.client
 
 import pytest
+from conftest import make_opener
 
 from bobe.claude_code_client import DEFAULT_REQUEST_TIMEOUT_S, request_daemon_json
 from bobe.claude_code_launch import (
@@ -94,20 +94,7 @@ def test_request_requires_robot_endpoint_and_token():
 @pytest.mark.asyncio
 async def test_confirm_posts_to_mac_endpoint():
     calls = []
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self):
-            return json.dumps({"ok": True, "workdir": "/tmp/repos/bobe"}).encode()
-
-    def fake_opener(request, *, timeout):
-        calls.append((request, timeout))
-        return FakeResponse()
+    fake_opener = make_opener({"ok": True, "workdir": "/tmp/repos/bobe"}, calls)
 
     controller = ClaudeCodeLaunchController(
         settings_loader=lambda: ClaudeCodeLaunchSettings(

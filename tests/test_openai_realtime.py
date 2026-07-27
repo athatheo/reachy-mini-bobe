@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from conftest import JsonResponse, make_opener
 
 import bobe.openai_realtime as rt_mod
 import bobe.tools.background_tool_manager as btm_mod
@@ -39,14 +40,27 @@ class SupervisorFakeConn:
     - "hold": stays connected until close()/server_close() is called.
     - "iter_fail": raises ``fail_exc`` on the first iteration.
     - "update_fail": session.update raises RuntimeError.
+    - "append_fail": like "hold", but every input_audio_buffer.append raises.
+
+    When ``event_source`` is given, iteration instead yields events awaited
+    from that queue; a ``None`` sentinel ends iteration. ``response_api``
+    replaces the built-in recording ``conn.response`` stub.
     """
 
-    def __init__(self, mode: str, fail_exc: type[Exception] = RuntimeError) -> None:
-        """Initialize the stub with a scripted mode."""
+    def __init__(
+        self,
+        mode: str,
+        fail_exc: type[Exception] = RuntimeError,
+        event_source: "asyncio.Queue[Any] | None" = None,
+        response_api: Any = None,
+    ) -> None:
+        """Initialize the stub with a scripted mode and optional hooks."""
         self.mode = mode
         self.fail_exc = fail_exc
+        self.event_source = event_source
         self.closed = asyncio.Event()
         self.response_creates: list[dict[str, Any]] = []
+        self.appended: list[str] = []
         outer = self
 
         class _Session:
@@ -55,8 +69,10 @@ class SupervisorFakeConn:
                     raise RuntimeError("session.update failed (simulated)")
 
         class _InputAudioBuffer:
-            async def append(self, **_kw: Any) -> None:
-                return None
+            async def append(self, *, audio: str) -> None:
+                if outer.mode == "append_fail":
+                    raise RuntimeError("append failed (simulated)")
+                outer.appended.append(audio)
 
             async def clear(self) -> None:
                 return None
@@ -78,7 +94,7 @@ class SupervisorFakeConn:
         self.session = _Session()
         self.input_audio_buffer = _InputAudioBuffer()
         self.conversation = _Conversation()
-        self.response = _Response()
+        self.response = response_api if response_api is not None else _Response()
 
     async def __aenter__(self) -> "SupervisorFakeConn":
         return self
@@ -97,7 +113,12 @@ class SupervisorFakeConn:
     def __aiter__(self) -> "SupervisorFakeConn":
         return self
 
-    async def __anext__(self) -> None:
+    async def __anext__(self) -> Any:
+        if self.event_source is not None:
+            event = await self.event_source.get()
+            if event is None:  # sentinel → end iteration
+                raise StopAsyncIteration
+            return event
         if self.mode == "iter_fail":
             raise self.fail_exc("abrupt close (simulated)")
         if self.mode == "clean":
@@ -110,11 +131,14 @@ def _install_supervisor_fakes(
     monkeypatch: Any,
     conn_modes: list[str],
     fail_exc: type[Exception] = RuntimeError,
+    event_source: "asyncio.Queue[Any] | None" = None,
+    response_api: Any = None,
 ) -> dict[str, Any]:
     """Patch AsyncOpenAI so the Nth connect() yields a SupervisorFakeConn(conn_modes[N]).
 
     Connects beyond the scripted list default to "hold". Also patches prompt
     loaders and shrinks the retry backoff so supervised retries run instantly.
+    ``event_source`` and ``response_api`` are forwarded to every connection.
     Returns a state dict with the connect count and created connections.
     """
     state: dict[str, Any] = {"connects": 0, "conns": []}
@@ -124,7 +148,7 @@ def _install_supervisor_fakes(
             index = state["connects"]
             state["connects"] += 1
             mode = conn_modes[index] if index < len(conn_modes) else "hold"
-            conn = SupervisorFakeConn(mode, fail_exc=fail_exc)
+            conn = SupervisorFakeConn(mode, fail_exc=fail_exc, event_source=event_source, response_api=response_api)
             state["conns"].append(conn)
             return conn
 
@@ -418,13 +442,9 @@ async def test_session_finally_does_not_clobber_newer_connection(monkeypatch: An
 @pytest.mark.asyncio
 async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None:
     """Append failure while awake closes the session and the supervisor reconnects."""
-    monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
-    monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
-    monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
-    monkeypatch.setattr(rt_mod, "_MAX_SESSION_RETRY_DELAY_S", 0.01)
+    state = _install_supervisor_fakes(monkeypatch, ["append_fail", "hold"])
     monkeypatch.setattr(rt_mod, "_RESTART_CONNECT_TIMEOUT_S", 2.0)
 
-    session_attempts = {"n": 0}
     restart_calls = {"n": 0}
     original_restart = rt_mod.OpenaiRealtimeHandler._restart_session
 
@@ -433,78 +453,6 @@ async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None
         await original_restart(self)
 
     monkeypatch.setattr(rt_mod.OpenaiRealtimeHandler, "_restart_session", _counting_restart)
-
-    class FakeInputAudioBuffer:
-        def __init__(self, *, fail_append: bool) -> None:
-            self.fail_append = fail_append
-            self.appended: list[str] = []
-
-        async def append(self, *, audio: str) -> None:
-            if self.fail_append:
-                raise RuntimeError("append failed (simulated)")
-            self.appended.append(audio)
-
-        async def clear(self) -> None:
-            return None
-
-    class FakeSession:
-        async def update(self, **_kw: Any) -> None:
-            return None
-
-    class FakeConn:
-        def __init__(self, *, fail_append: bool) -> None:
-            self.session = FakeSession()
-            self.input_audio_buffer = FakeInputAudioBuffer(fail_append=fail_append)
-            self._closed = False
-            self._iter_wait = asyncio.Event()
-
-            class _Item:
-                async def create(self, **_kw: Any) -> None:
-                    return None
-
-            class _Conversation:
-                item = _Item()
-
-            self.conversation = _Conversation()
-
-            class _Response:
-                async def create(self, **_kw: Any) -> None:
-                    return None
-
-                async def cancel(self, **_kw: Any) -> None:
-                    return None
-
-            self.response = _Response()
-
-        async def __aenter__(self) -> "FakeConn":
-            return self
-
-        async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-            return False
-
-        async def close(self) -> None:
-            self._closed = True
-            self._iter_wait.set()
-
-        def __aiter__(self) -> "FakeConn":
-            return self
-
-        async def __anext__(self) -> None:
-            if self._closed:
-                raise StopAsyncIteration
-            await self._iter_wait.wait()
-            raise StopAsyncIteration
-
-    class FakeRealtime:
-        def connect(self, **_kw: Any) -> FakeConn:
-            session_attempts["n"] += 1
-            return FakeConn(fail_append=session_attempts["n"] == 1)
-
-    class FakeClient:
-        def __init__(self, **_kw: Any) -> None:
-            self.realtime = FakeRealtime()
-
-    monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
 
     handler = _build_wake_enabled_handler()
     handler.wake_session.wake()
@@ -517,13 +465,14 @@ async def test_receive_append_failure_restarts_session(monkeypatch: Any) -> None
 
         assert restart_calls["n"] >= 1
         await _wait_until(lambda: handler.connection is not None)
-        assert not handler.connection.input_audio_buffer.fail_append
+        assert handler.connection is state["conns"][1]
+        assert handler.connection.mode != "append_fail"
         # The reconnect came from the supervisor, not from _restart_session.
         assert handler._realtime_session_task is not None
         assert handler._realtime_session_task.get_name() == "openai-realtime-session"
 
         await handler.receive(_mic_frame())
-        assert len(handler.connection.input_audio_buffer.appended) == 1
+        assert len(handler.connection.appended) == 1
     finally:
         await _finish_supervisor(handler, startup_task)
 
@@ -885,21 +834,8 @@ async def test_completed_user_transcript_sleep_phrase_closes_session() -> None:
 @pytest.mark.asyncio
 async def test_completed_confirmation_phrase_launches_claude_code() -> None:
     """Only a completed exact confirmation transcript triggers the local launch gate."""
-    calls = []
-
-    class FakeResponse:
-        def __enter__(self) -> "FakeResponse":
-            return self
-
-        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-            return False
-
-        def read(self) -> bytes:
-            return b'{"ok": true}'
-
-    def fake_opener(request: Any, *, timeout: float) -> FakeResponse:
-        calls.append((request, timeout))
-        return FakeResponse()
+    calls: list[Any] = []
+    fake_opener = make_opener({"ok": True}, calls)
 
     controller = ClaudeCodeLaunchController(
         settings_loader=lambda: ClaudeCodeLaunchSettings(
@@ -983,21 +919,8 @@ def test_partial_confirmation_transcript_does_not_launch_claude_code() -> None:
 @pytest.mark.asyncio
 async def test_completed_command_confirmation_sends_claude_code_command() -> None:
     """Only completed exact command confirmation sends a staged Claude Code command."""
-    calls = []
-
-    class FakeResponse:
-        def __enter__(self) -> "FakeResponse":
-            return self
-
-        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-            return False
-
-        def read(self) -> bytes:
-            return b'{"ok": true, "output": "done"}'
-
-    def fake_opener(request: Any, *, timeout: float) -> FakeResponse:
-        calls.append((request, timeout))
-        return FakeResponse()
+    calls: list[Any] = []
+    fake_opener = make_opener({"ok": True, "output": "done"}, calls)
 
     controller = ClaudeCodeSessionController(
         settings_loader=lambda: ClaudeCodeSessionSettings(
@@ -1065,20 +988,11 @@ async def test_command_confirmation_http_runs_off_the_event_dispatcher() -> None
     entered = threading.Event()
     release = threading.Event()
 
-    class FakeResponse:
-        def __enter__(self) -> "FakeResponse":
-            return self
-
-        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-            return False
-
-        def read(self) -> bytes:
-            return b'{"ok": true, "output": "done"}'
-
-    def slow_opener(request: Any, *, timeout: float) -> FakeResponse:
+    def _block_until_released() -> None:
         entered.set()
         assert release.wait(timeout=5.0)
-        return FakeResponse()
+
+    slow_opener = make_opener({"ok": True, "output": "done"}, before_response=_block_until_released)
 
     controller = ClaudeCodeSessionController(
         settings_loader=lambda: ClaudeCodeSessionSettings(
@@ -1139,22 +1053,6 @@ def test_partial_command_confirmation_does_not_send_claude_code_command() -> Non
         reset_claude_code_session_controller()
 
 
-class _JsonOkResponse:
-    """Context-manager HTTP response stub returning a fixed JSON body."""
-
-    def __init__(self, body: bytes) -> None:
-        self._body = body
-
-    def __enter__(self) -> "_JsonOkResponse":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        return False
-
-    def read(self) -> bytes:
-        return self._body
-
-
 def _stage_both_claude_code_pendings(
     *,
     launch_opener: Any,
@@ -1192,9 +1090,9 @@ async def test_command_confirmation_works_while_launch_is_also_pending() -> None
     """
     command_calls = []
 
-    def command_opener(request: Any, *, timeout: float) -> _JsonOkResponse:
+    def command_opener(request: Any, *, timeout: float) -> JsonResponse:
         command_calls.append(request)
-        return _JsonOkResponse(b'{"ok": true, "output": "done"}')
+        return JsonResponse({"ok": True, "output": "done"})
 
     launch_controller, session_controller = _stage_both_claude_code_pendings(
         launch_opener=lambda *args, **kwargs: pytest.fail("the launch endpoint must not be called"),
@@ -1225,9 +1123,9 @@ async def test_launch_confirmation_works_while_command_is_also_pending() -> None
     """With both pending, the exact launch phrase launches instead of a correction."""
     launch_calls = []
 
-    def launch_opener(request: Any, *, timeout: float) -> _JsonOkResponse:
+    def launch_opener(request: Any, *, timeout: float) -> JsonResponse:
         launch_calls.append(request)
-        return _JsonOkResponse(b'{"ok": true}')
+        return JsonResponse({"ok": True})
 
     launch_controller, session_controller = _stage_both_claude_code_pendings(
         launch_opener=launch_opener,
@@ -1653,9 +1551,6 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     FakeCCE = type("FakeCCE", (Exception,), {})
     monkeypatch.setattr(rt_mod, "ConnectionClosedError", FakeCCE)
-    monkeypatch.setattr(rt_mod, "get_realtime_session_instructions", lambda: "test")
-    monkeypatch.setattr(rt_mod, "get_session_voice", lambda: "alloy")
-    monkeypatch.setattr(rt_mod, "get_tool_specs", lambda: [])
 
     N_TOOL_RESULTS = 400
     REJECT_CALL_NUMBERS = {1, 3, 5, 10, 25, 50, 75, 100, 150, 200, 300, 399}
@@ -1755,58 +1650,11 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
 
     fake_response_api = FakeResponseAPI()
 
-    class FakeSession:
-        async def update(self, **_kw: Any) -> None:
-            pass
-
-    class FakeInputAudioBuffer:
-        async def append(self, **_kw: Any) -> None:
-            pass
-
-    class FakeItem:
-        async def create(self, **_kw: Any) -> None:
-            pass
-
-    class FakeConversation:
-        item = FakeItem()
-
-    class FakeConn:
-        session = FakeSession()
-        input_audio_buffer = FakeInputAudioBuffer()
-        conversation = FakeConversation()
-        response = fake_response_api
-
-        async def __aenter__(self) -> "FakeConn":
-            return self
-
-        async def __aexit__(self, *_a: Any) -> bool:
-            return False
-
-        async def close(self) -> None:
-            pass
-
-        def __aiter__(self) -> "FakeConn":
-            return self
-
-        async def __anext__(self) -> FakeEvent:
-            event: FakeEvent = await event_queue.get()
-            if event is None:  # sentinel → end iteration
-                raise StopAsyncIteration
-            return event
-
-    class FakeRealtime:
-        def connect(self, **_kw: Any) -> FakeConn:
-            return FakeConn()
-
-    class FakeClient:
-        def __init__(self, **_kw: Any) -> None:
-            self.realtime = FakeRealtime()
-
-    monkeypatch.setattr(rt_mod, "AsyncOpenAI", FakeClient)
+    _install_supervisor_fakes(monkeypatch, ["hold"], event_source=event_queue, response_api=fake_response_api)
 
     # Patch dispatch_tool_call so tools complete with a result.
     async def _fake_dispatch(tool_name: str, args_json: str, deps: Any, **_kw: Any) -> dict[str, Any]:
-        await asyncio.sleep(random.uniform(0.3, 0.5))
+        await asyncio.sleep(random.uniform(0.03, 0.05))
         return {"ok": True, "tool": tool_name}
 
     monkeypatch.setattr(btm_mod, "dispatch_tool_call", _fake_dispatch)
@@ -1839,8 +1687,14 @@ async def test_response_sender_retries_on_active_response_rejection(monkeypatch:
             ),
         )
 
-    # Yield so spawned tool tasks, the listener, and the sender can drain.
-    await asyncio.sleep(5)
+    # Wait (bounded) until the pipeline drained: every expected response.create
+    # landed and no server events or queued requests remain in flight.
+    await _wait_until(
+        lambda: fake_response_api._call_count >= EXPECTED_TOTAL_CALLS
+        and event_queue.empty()
+        and handler._pending_responses.empty(),
+        timeout=10.0,
+    )
 
     # ---- Tear down ----
 
@@ -1921,12 +1775,19 @@ async def test_response_sender_loop_times_out_waiting_for_response_done(
 
     sender_task = asyncio.create_task(handler._response_sender_loop())
 
-    # Give enough time for both requests to time out (0.3s each + margin)
-    await asyncio.sleep(1.5)
+    # Wait (bounded) until both requests hit the response.done timeout.
+    await _wait_until(
+        lambda: len([r for r in caplog.records if "Timed out waiting for response.done" in r.getMessage()]) >= 2,
+        timeout=5.0,
+    )
 
-    handler.connection = None  # signal the loop to exit
-    handler._response_done_event.set()
-    await asyncio.wait_for(sender_task, timeout=2.0)
+    # The loop parks in _pending_responses.get(); cancel() is its exit path
+    # (the loop catches CancelledError there and returns cleanly).
+    sender_task.cancel()
+    try:
+        await sender_task
+    except asyncio.CancelledError:
+        pass
 
     assert create_count == 2, f"Expected 2 response.create calls, got {create_count}"
 
@@ -1975,9 +1836,13 @@ async def test_response_sender_loop_times_out_waiting_for_previous_response(
     # Wait for the request to be sent (after timing out on the pre-condition)
     await asyncio.wait_for(created.wait(), timeout=2.0)
 
-    handler.connection = None
-    handler._response_done_event.set()
-    await asyncio.wait_for(sender_task, timeout=2.0)
+    # The loop parks in _pending_responses.get(); cancel() is its exit path
+    # (the loop catches CancelledError there and returns cleanly).
+    sender_task.cancel()
+    try:
+        await sender_task
+    except asyncio.CancelledError:
+        pass
 
     timeout_logs = [r for r in caplog.records if "Timed out waiting for previous response" in r.getMessage()]
     assert len(timeout_logs) == 1, f"Expected 1 pre-condition timeout warning, got {len(timeout_logs)}"

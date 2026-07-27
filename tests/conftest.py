@@ -1,7 +1,9 @@
-"""Pytest configuration for path setup."""
+"""Pytest configuration for path setup and shared test stubs."""
 
 import os
 import sys
+import json
+from typing import Any, Callable
 from pathlib import Path
 
 import pytest
@@ -28,3 +30,44 @@ def _stub_wake_detector_unless_real(monkeypatch: pytest.MonkeyPatch, request: py
     if request.node.get_closest_marker("wake_detector"):
         return
     monkeypatch.setattr("bobe.openai_realtime.create_wake_detector", lambda *args, **kwargs: None)
+
+
+class JsonResponse:
+    """Context-manager urllib response stub returning a fixed JSON payload."""
+
+    def __init__(self, payload: Any) -> None:
+        """Store the payload serialized by read()."""
+        self._payload = payload
+
+    def __enter__(self) -> "JsonResponse":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        """Return the JSON-encoded payload."""
+        return json.dumps(self._payload).encode()
+
+
+def make_opener(
+    payload: Any,
+    calls: list[tuple[Any, float]] | None = None,
+    *,
+    before_response: Callable[[], None] | None = None,
+) -> Callable[..., JsonResponse]:
+    """Build a urllib opener stub returning a fresh JsonResponse(payload) per call.
+
+    When ``calls`` is given, each invocation records a ``(request, timeout)``
+    tuple. An optional ``before_response`` hook runs (and may block) before
+    the response is constructed, mirroring a slow network round-trip.
+    """
+
+    def _opener(request: Any, *, timeout: float) -> JsonResponse:
+        if before_response is not None:
+            before_response()
+        if calls is not None:
+            calls.append((request, timeout))
+        return JsonResponse(payload)
+
+    return _opener

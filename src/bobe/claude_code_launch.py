@@ -42,14 +42,6 @@ class ClaudeCodeLaunchSettings:
         return bool(self.launch_url and self.launch_token)
 
 
-@dataclass
-class PendingClaudeCodeLaunch:
-    """A pending, not-yet-confirmed launch request."""
-
-    requested_at: float
-    expires_at: float
-
-
 class ClaudeCodeLaunchController:
     """Owns pending launch state and the Mac endpoint call."""
 
@@ -62,15 +54,26 @@ class ClaudeCodeLaunchController:
     ) -> None:
         """Initialize the controller with injectable clock and HTTP opener."""
         self._settings_loader = settings_loader or load_claude_code_launch_settings
-        self._clock = clock
         self._opener = opener
-        self._pending: PendingClaudeCodeLaunch | None = None
+        self._gate = ConfirmationGate(
+            phrase=CONFIRMATION_PHRASE,
+            instruction=CONFIRMATION_INSTRUCTION,
+            no_pending_reply={
+                "status": "no_pending_launch",
+                "message": "No Claude Code launch is pending.",
+            },
+            expired_reply={
+                "status": "expired",
+                "message": "Claude Code launch confirmation expired. Ask me to launch it again.",
+            },
+            clock=clock,
+        )
 
     def request(self) -> dict[str, Any]:
         """Create a pending launch request if the robot is configured."""
         settings = self._settings_loader()
         if not settings.is_configured:
-            self._pending = None
+            self._gate.clear()
             return {
                 "status": "missing_config",
                 "message": (
@@ -79,22 +82,17 @@ class ClaudeCodeLaunchController:
                 ),
             }
 
-        now = self._clock()
-        self._pending = PendingClaudeCodeLaunch(
-            requested_at=now,
-            expires_at=now + max(1.0, settings.confirm_ttl_s),
-        )
+        ttl = self._gate.stage(None, ttl_s=settings.confirm_ttl_s)
         return {
             "status": "pending_confirmation",
             "confirmation_phrase": CONFIRMATION_PHRASE,
-            "expires_in_s": round(max(1.0, settings.confirm_ttl_s), 1),
+            "expires_in_s": round(ttl, 1),
             "message": CONFIRMATION_INSTRUCTION,
         }
 
     def cancel(self) -> dict[str, Any]:
         """Cancel any pending launch request."""
-        had_pending = self._pending is not None
-        self._pending = None
+        had_pending = self._gate.clear()
         return {
             "status": "cancelled" if had_pending else "nothing_pending",
             "message": "Claude Code launch cancelled." if had_pending else "No Claude Code launch was pending.",
@@ -102,13 +100,7 @@ class ClaudeCodeLaunchController:
 
     def has_pending(self) -> bool:
         """Return whether a non-expired launch confirmation is pending."""
-        pending = self._pending
-        if pending is None:
-            return False
-        if self._clock() > pending.expires_at:
-            self._pending = None
-            return False
-        return True
+        return self._gate.has_pending()
 
     async def maybe_confirm_from_transcript(
         self,
@@ -118,37 +110,15 @@ class ClaudeCodeLaunchController:
     ) -> dict[str, Any] | None:
         """Launch only when a completed transcript is the exact confirmation phrase.
 
-        With ``correct_mismatch`` (the default), a garbled confirmation attempt
-        while a launch is pending returns a corrective ``confirmation_mismatch``
-        response instead of failing silently. Orchestrators coordinating several
-        pending confirmations pass ``False`` so a corrective reply here can never
-        shadow another controller's exactly-spoken phrase; they build the
-        correction themselves once every exact match has failed.
+        See :meth:`bobe.claude_code_client.ConfirmationGate.consume` for the
+        ``correct_mismatch`` coordination contract used by orchestrators with
+        several pending confirmations.
         """
-        if not confirmation_phrase_matches(transcript):
-            if correct_mismatch and self.has_pending() and transcript_attempts_confirmation(transcript):
-                # Don't fail silently while a launch is pending: keep the pending
-                # request alive and tell the user the exact phrase to repeat.
-                return {
-                    "status": "confirmation_mismatch",
-                    "message": f"That wasn't the exact confirmation phrase. {CONFIRMATION_INSTRUCTION}",
-                }
+        outcome = self._gate.consume(transcript, correct_mismatch=correct_mismatch)
+        if outcome is None:
             return None
-
-        pending = self._pending
-        if pending is None:
-            return {
-                "status": "no_pending_launch",
-                "message": "No Claude Code launch is pending.",
-            }
-
-        now = self._clock()
-        self._pending = None
-        if now > pending.expires_at:
-            return {
-                "status": "expired",
-                "message": "Claude Code launch confirmation expired. Ask me to launch it again.",
-            }
+        if not outcome.confirmed:
+            return outcome.reply
 
         settings = self._settings_loader()
         if not settings.is_configured:
