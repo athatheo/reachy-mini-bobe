@@ -24,7 +24,6 @@ flowchart TB
 
     subgraph Cloud["Cloud APIs"]
         OpenAI@{ label: "<span style='font-size:17px;font-weight:bold;'>OpenAI Realtime</span><br><span style='font-size:13px;color:#7b1fa2;'>Speech I/O + tool calls + vision</span>" }
-        Claude@{ label: "<span style='font-size:16px;font-weight:bold;'>Anthropic Claude</span><br><span style='font-size:13px;color:#7b1fa2;'>Answers via ask_claude tool</span>" }
     end
 
     Profiles@{ label: "<span style='font-size:16px;font-weight:bold;'>Profile</span><br><span style='font-size:12px;color:#6a1b9a;'>instructions.txt + tools.txt<br/>+ profile-local Python tools</span>" }
@@ -43,9 +42,7 @@ flowchart TB
     Orchestrator -- motion requests --> Motion
     Motion -- commands --> Robot
 
-    OpenAI -- ask_claude tool --> Handlers
-    Handlers -- Claude API --> Claude
-    Claude -- answer --> Handlers
+    OpenAI -- tool calls --> Handlers
     Handlers -- tool results --> OpenAI
 
     Profiles -- defines enabled tools --> Handlers
@@ -60,7 +57,6 @@ flowchart TB
     User:::userStyle
     UI:::uiStyle
     OpenAI:::aiStyle
-    Claude:::aiStyle
     Orchestrator:::aiStyle
     Motion:::coreStyle
     Profiles:::toolStyle

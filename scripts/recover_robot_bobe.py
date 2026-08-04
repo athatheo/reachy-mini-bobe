@@ -33,7 +33,7 @@ def main() -> None:
             "\nRecovery steps:\n"
             "1. Power-cycle the robot or run: sudo systemctl restart reachy-mini-daemon\n"
             "2. Wait ~60s, then start BoBe from the Reachy dashboard\n"
-            "3. Open http://%s:7860/ and confirm OpenAI + Anthropic keys\n"
+            "3. Open http://%s:7860/ and confirm the OpenAI key\n"
             "4. On the Mac: uv run bobe-wake-daemon\n"
             "5. Redeploy if needed: uv run python scripts/deploy_robot_wake.py\n"
             % args.robot_host,

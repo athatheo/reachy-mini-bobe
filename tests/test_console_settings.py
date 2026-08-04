@@ -15,7 +15,6 @@ from bobe.env_file import (
     upsert_env_keys,
     persist_api_settings,
     is_plausible_openai_key,
-    is_plausible_anthropic_key,
 )
 from bobe.wake_env import REMOTE_WAKE_KEYS, persist_wake_env
 from bobe.settings_server import SettingsUIServer, _redact_wake_debug_for_public
@@ -29,33 +28,23 @@ def _clear_wake_env(monkeypatch) -> None:
 
 def test_persist_api_settings_writes_explicit_provider_keys(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
     monkeypatch.setattr(config, "OPENAI_API_KEY", None)
 
     persist_api_settings(
         str(tmp_path),
         openai_api_key=" sk-proj-test-openai-key ",
-        anthropic_api_key=" sk-ant-test-anthropic-key ",
-        claude_model=" claude-test ",
     )
 
     assert os.environ["OPENAI_API_KEY"] == "sk-proj-test-openai-key"
-    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-test-anthropic-key"
-    assert os.environ["CLAUDE_MODEL"] == "claude-test"
     assert config.OPENAI_API_KEY == "sk-proj-test-openai-key"
 
     env_text = (tmp_path / ".env").read_text()
     assert "OPENAI_API_KEY=sk-proj-test-openai-key" in env_text
-    assert "ANTHROPIC_API_KEY=sk-ant-test-anthropic-key" in env_text
-    assert "CLAUDE_MODEL=claude-test" in env_text
 
 
 def test_persist_api_settings_does_not_bake_template_lines(tmp_path, monkeypatch):
     """A missing instance .env must not be seeded from .env.example templates."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
     monkeypatch.setattr(config, "OPENAI_API_KEY", None)
     (tmp_path / ".env.example").write_text(
         "BOBE_WAKE_TOKEN=\nBOBE_WAKE_GAIN=1.75\nHF_TOKEN=\n", encoding="utf-8"
@@ -64,8 +53,6 @@ def test_persist_api_settings_does_not_bake_template_lines(tmp_path, monkeypatch
     persist_api_settings(
         str(tmp_path),
         openai_api_key="sk-proj-test-openai-key",
-        anthropic_api_key="sk-ant-test-anthropic-key",
-        claude_model="claude-test",
     )
 
     env_text = (tmp_path / ".env").read_text()
@@ -113,8 +100,6 @@ def test_concurrent_api_and_wake_persist_keep_both_key_sets(tmp_path, monkeypatc
     """Serialized read-modify-write: neither writer may drop the other's keys."""
     _clear_wake_env(monkeypatch)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
     monkeypatch.setattr(config, "OPENAI_API_KEY", None)
 
     def write_api() -> None:
@@ -122,8 +107,6 @@ def test_concurrent_api_and_wake_persist_keep_both_key_sets(tmp_path, monkeypatc
             persist_api_settings(
                 str(tmp_path),
                 openai_api_key="sk-proj-test-openai-key",
-                anthropic_api_key="sk-ant-test-anthropic-key",
-                claude_model="claude-test",
             )
 
     def write_wake() -> None:
@@ -142,7 +125,6 @@ def test_concurrent_api_and_wake_persist_keep_both_key_sets(tmp_path, monkeypatc
 
     env_text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "OPENAI_API_KEY=sk-proj-test-openai-key" in env_text
-    assert "ANTHROPIC_API_KEY=sk-ant-test-anthropic-key" in env_text
     assert "BOBE_WAKE_TOKEN=secret-token" in env_text
     assert "BOBE_WAKE_REMOTE_URL=ws://192.168.1.114:8765/v1/stream" in env_text
 

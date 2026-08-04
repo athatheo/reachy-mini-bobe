@@ -5,7 +5,7 @@ colorFrom: purple
 colorTo: gray
 sdk: static
 pinned: false
-short_description: Claude-backed Reachy Mini assistant named BoBe.
+short_description: Reachy Mini voice assistant named BoBe.
 tags:
   - reachy_mini
   - reachy_mini_python_app
@@ -18,9 +18,7 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 ## Current milestone
 
 - Remote wake word: say `Hey Bobe` to wake BoBe (Mac-side Whisper daemon; robot streams PCM while asleep).
-- Voice input/output uses the official Reachy Mini conversation app pipeline.
-- Normal assistant answers are routed through Claude with the `ask_claude` profile tool.
-- Claude Code can be launched on the Mac mini after a second spoken confirmation, and follow-up commands can be sent to a managed Claude Code session after command confirmation.
+- Voice input/output uses the official Reachy Mini conversation app pipeline; the realtime model answers questions directly.
 - Expressive robot responses use the existing Reachy Mini motion tools, including `play_emotion`, `move_head`, and `sweep_look`.
 
 ## Privacy model
@@ -30,24 +28,18 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 - The window closes (chime + antennas relaxed) when you say `go to sleep` (or Greek `κοιμήσου`) or after `BOBE_WAKE_TIMEOUT_S` (default 300s) without session activity.
 - Tune with `BOBE_WAKE_REMOTE_URL`, `BOBE_WAKE_TOKEN`, `BOBE_WAKE_GAIN`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_WAKE_PHRASE`, `BOBE_SLEEP_PHRASE`. Wake-word gating is always on: say the wake phrase to stream, `go to sleep` to stop.
 
-Claude Code control is disabled by default. To enable it, set a launch-specific token on both robot and Mac. Terminal launch requires `confirm launch Claude Code`; managed follow-up commands require `confirm Claude command`.
-
 ## Configuration
 
 Copy `.env.example` to `.env` for local development and set the keys you need:
 
 ```env
 OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
-CLAUDE_MODEL="claude-sonnet-4-6"
 BOBE_WAKE_BACKEND=remote
 BOBE_WAKE_REMOTE_URL=ws://Mac.local:8765/v1/stream
 BOBE_WAKE_TOKEN=
-# Optional: required for confirmed Claude Code voice launch/session control
-BOBE_CLAUDE_CODE_LAUNCH_TOKEN=
 ```
 
-The OpenAI key is used by the inherited realtime speech bridge. The Anthropic key is used by BoBe's `ask_claude` tool for Claude-backed answers.
+The OpenAI key is used by the inherited realtime speech bridge.
 
 ## Remote wake runbook (Mac + robot)
 
@@ -68,28 +60,6 @@ Defaults: WebSocket on port **8765**, path `/v1/stream`, Whisper model `distil-s
 
 Note the Mac hostname or IP (e.g. `Mac.local` or `192.168.1.114`).
 
-To opt in to Claude Code voice launch and managed sessions on the Mac, add a separate launch/control token to `config/wake-daemon.env`:
-
-```env
-BOBE_CLAUDE_CODE_LAUNCH_ENABLED=1
-BOBE_CLAUDE_CODE_LAUNCH_TOKEN=<separate long random secret>
-BOBE_CLAUDE_CODE_WORKDIR=~/repos/bobe-claude-code-workspace
-BOBE_CLAUDE_CODE_BIN=claude
-BOBE_CLAUDE_CODE_PERMISSION_MODE=default
-```
-
-The daemon exposes these token-protected Claude Code endpoints:
-
-```text
-POST /v1/launch/claude-code
-POST /v1/claude-code/session/start
-POST /v1/claude-code/session/send
-GET  /v1/claude-code/session/status
-POST /v1/claude-code/session/stop
-```
-
-Managed session commands use `claude -p --session-id ... --output-format json` in the configured workspace, so BoBe can send follow-up instructions without GUI keystroke injection.
-
 ### 2. Robot: configure wake settings
 
 Set these in the robot app instance `.env` (Reachy settings UI or instance file):
@@ -99,10 +69,6 @@ BOBE_WAKE_BACKEND=remote
 BOBE_WAKE_REMOTE_URL=ws://Mac.local:8765/v1/stream
 BOBE_WAKE_TOKEN=<same secret as Mac>
 BOBE_WAKE_GAIN=1.75
-BOBE_CLAUDE_CODE_LAUNCH_TOKEN=<same Claude Code launch secret as Mac>
-# Optional; derived from BOBE_WAKE_REMOTE_URL when unset:
-# BOBE_CLAUDE_CODE_LAUNCH_URL=http://Mac.local:8765/v1/launch/claude-code
-# BOBE_CLAUDE_CODE_CONTROL_URL=http://Mac.local:8765/v1/claude-code
 ```
 
 Restart the BoBe app after saving. The settings page at `/wake-config` can persist the same values when running headless.
@@ -112,9 +78,7 @@ Restart the BoBe app after saving. The settings page at `/wake-config` can persi
 1. Daemon running on Mac; firewall allows inbound **8765** from the robot.
 2. Start BoBe on the robot; check `/status`: `wake_enabled`, `wake_backend=remote`, `wake_debug.connected=true`.
 3. Say **Hey Bobe** → chime + antennas up; Realtime session opens.
-4. Optional Claude Code launch: ask BoBe to launch Claude Code, then say **confirm launch Claude Code** when prompted.
-5. Optional managed command: ask BoBe to tell Claude Code something, then say **confirm Claude command** when prompted.
-6. Say **go to sleep** (or wait for `BOBE_WAKE_TIMEOUT_S`) → session closes.
+4. Say **go to sleep** (or wait for `BOBE_WAKE_TIMEOUT_S`) → session closes.
 
 ### 4. Optional: deploy script
 
@@ -124,7 +88,7 @@ If you use the robot apps API, `scripts/deploy_robot_wake.py` can install/update
 
 ```bash
 uv sync --group dev
-uv run pytest tests/test_claude.py
+uv run pytest
 uv run reachy-mini-app-assistant check .
 ```
 
@@ -141,7 +105,3 @@ Simulation can validate app startup and UI wiring, but physical audio, wake-word
 
 - `src/bobe/profiles/_bobe_locked_profile/instructions.txt`: BoBe's system behavior.
 - `src/bobe/profiles/_bobe_locked_profile/tools.txt`: enabled tool list.
-- `src/bobe/profiles/_bobe_locked_profile/ask_claude.py`: Claude-backed answer tool.
-- `src/bobe/profiles/_bobe_locked_profile/launch_claude_code.py`: confirmed Claude Code launch request tool.
-- `src/bobe/profiles/_bobe_locked_profile/send_claude_code_command.py`: confirmed managed Claude Code command tool.
-
