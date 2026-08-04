@@ -121,6 +121,7 @@ class SettingsUIServer:
                 {
                     "has_key": has_openai_key,
                     "has_openai_key": has_openai_key,
+                    "openai_connected": openai_connected,
                     "wake_enabled": wake_enabled,
                     "wake_error": wake_error,
                     "awake": awake,

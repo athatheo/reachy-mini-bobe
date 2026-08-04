@@ -8,7 +8,6 @@ starts. Keys are persisted to the app instance's private ``.env`` file when
 available.
 """
 
-import os
 import time
 import asyncio
 import logging
