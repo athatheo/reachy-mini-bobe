@@ -21,7 +21,7 @@ from scipy.signal import resample
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
 from bobe.config import config
-from bobe.env_file import is_plausible_openai_key, is_plausible_anthropic_key
+from bobe.env_file import is_plausible_openai_key
 from bobe.openai_realtime import OpenaiRealtimeHandler
 
 
@@ -51,9 +51,7 @@ class LocalStream:
 
     def _required_api_keys_configured(self) -> bool:
         """Return whether all explicit user-provided keys are configured."""
-        return is_plausible_openai_key(str(config.OPENAI_API_KEY or "")) and is_plausible_anthropic_key(
-            os.getenv("ANTHROPIC_API_KEY")
-        )
+        return is_plausible_openai_key(str(config.OPENAI_API_KEY or ""))
 
     def launch(self) -> None:
         """Start the recorder/player and run the async processing loops.
@@ -71,7 +69,7 @@ class LocalStream:
         # Never auto-download shared/demo keys. Wait for explicit user-provided keys.
         if not self._required_api_keys_configured():
             logger.warning(
-                "Required API keys missing. Open the app settings page to enter OpenAI and Anthropic keys."
+                "Required API key missing. Open the app settings page to enter the OpenAI key."
             )
             warned_at = time.monotonic()
             try:
@@ -81,7 +79,7 @@ class LocalStream:
                         return
                     if time.monotonic() - warned_at >= 30.0:
                         logger.warning(
-                            "Still waiting for OpenAI and Anthropic API keys in settings (http://<robot>:7860/)."
+                            "Still waiting for the OpenAI API key in settings (http://<robot>:7860/)."
                         )
                         warned_at = time.monotonic()
                     time.sleep(0.2)

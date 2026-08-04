@@ -1,12 +1,6 @@
 # BoBe's enabled tools.
-# `ask_claude` provides Claude-backed answers; motion tools add expression.
+# Motion tools add expression; answers come from the realtime model itself.
 
-ask_claude
-launch_claude_code
-start_claude_code_session
-send_claude_code_command
-get_claude_code_status
-stop_claude_code_session
 play_emotion
 stop_emotion
 move_head

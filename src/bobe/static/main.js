@@ -76,14 +76,12 @@ function startStatusPolling({ loading, loadingText, onInitialReady, timeoutMs = 
   setInterval(tick, 1000);
 }
 
-async function saveKeys({ openaiApiKey, anthropicApiKey, claudeModel }) {
+async function saveKeys({ openaiApiKey }) {
   const resp = await fetch("/api_keys", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       openai_api_key: openaiApiKey,
-      anthropic_api_key: anthropicApiKey,
-      claude_model: claudeModel,
     }),
   });
   const data = await resp.json().catch(() => ({}));
@@ -95,10 +93,6 @@ async function saveKeys({ openaiApiKey, anthropicApiKey, claudeModel }) {
 
 function looksLikeOpenAIKey(value) {
   return value.startsWith("sk-") && value.length >= 20;
-}
-
-function looksLikeAnthropicKey(value) {
-  return value.startsWith("sk-ant-") && value.length >= 20;
 }
 
 function show(el, flag) {
@@ -265,8 +259,6 @@ function init() {
   const saveBtn = document.getElementById("save-btn");
   const changeKeyBtn = document.getElementById("change-key-btn");
   const openaiInput = document.getElementById("openai-api-key");
-  const anthropicInput = document.getElementById("anthropic-api-key");
-  const modelInput = document.getElementById("claude-model");
 
   show(loading, true);
   show(formPanel, false);
@@ -276,7 +268,6 @@ function init() {
     loading,
     loadingText,
     onInitialReady(st) {
-      modelInput.value = (st && st.claude_model) || "claude-sonnet-4-6";
       if (!st) {
         show(loading, true);
         show(formPanel, false);
@@ -299,44 +290,35 @@ function init() {
       show(configuredPanel, false);
       show(formPanel, true);
       openaiInput.value = "";
-      anthropicInput.value = "";
       statusEl.textContent = "";
       statusEl.className = "status";
     });
 
-    for (const input of [openaiInput, anthropicInput, modelInput]) {
-      input.addEventListener("input", () => markError(input, false));
-    }
+    openaiInput.addEventListener("input", () => markError(openaiInput, false));
 
     saveBtn.addEventListener("click", async () => {
       const openaiApiKey = openaiInput.value.trim();
-      const anthropicApiKey = anthropicInput.value.trim();
-      const claudeModel = modelInput.value.trim() || "claude-sonnet-4-6";
 
       markError(openaiInput, !looksLikeOpenAIKey(openaiApiKey));
-      markError(anthropicInput, !looksLikeAnthropicKey(anthropicApiKey));
-      markError(modelInput, !claudeModel);
 
-      if (!looksLikeOpenAIKey(openaiApiKey) || !looksLikeAnthropicKey(anthropicApiKey) || !claudeModel) {
-        statusEl.textContent = "Please enter valid OpenAI and Anthropic keys plus a Claude model.";
+      if (!looksLikeOpenAIKey(openaiApiKey)) {
+        statusEl.textContent = "Please enter a valid OpenAI key.";
         statusEl.className = "status warn";
         return;
       }
 
-      statusEl.textContent = "Saving private keys...";
+      statusEl.textContent = "Saving private key...";
       statusEl.className = "status";
       try {
-        await saveKeys({ openaiApiKey, anthropicApiKey, claudeModel });
+        await saveKeys({ openaiApiKey });
         statusEl.textContent = "Saved. Reloading...";
         statusEl.className = "status ok";
         window.location.reload();
       } catch (e) {
         if (e.message === "invalid_openai_api_key") {
           statusEl.textContent = "OpenAI key should start with sk-.";
-        } else if (e.message === "invalid_anthropic_api_key") {
-          statusEl.textContent = "Anthropic key should start with sk-ant-.";
         } else {
-          statusEl.textContent = "Failed to save keys. Please try again.";
+          statusEl.textContent = "Failed to save the key. Please try again.";
         }
         statusEl.className = "status error";
       }

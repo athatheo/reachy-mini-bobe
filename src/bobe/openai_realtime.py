@@ -33,7 +33,6 @@ from bobe.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
-from bobe.claude_code_confirmation import resolve_confirmation
 from bobe.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -205,9 +204,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._wake_transition_task: asyncio.Task[None] | None = None
         self._wake_retry_delay_s: float = _WAKE_RETRY_INITIAL_DELAY_S
         self._next_wake_retry_at: float = 0.0
-        # Claude Code confirmations do HTTP round-trips to the Mac; they run as
-        # background tasks so the realtime event dispatcher never blocks on them.
-        self._claude_code_tasks: set[asyncio.Task[None]] = set()
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         # The factory is looked up in this module's namespace at call time so
@@ -755,46 +751,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self._transition_to_sleep("sleep phrase")
         return True
 
-    def _start_claude_code_confirmation(self, transcript: str) -> None:
-        """Run the Claude Code confirmation flow as a background task.
-
-        Confirming a launch/command does an HTTP round-trip to the Mac (and may
-        poll the daemon for several seconds). Awaiting that inline in the
-        realtime event dispatcher would stall all event processing (audio
-        deltas, VAD, tool calls), so the flow runs off the dispatcher and posts
-        its result via output_queue/_safe_response_create when done.
-        """
-        task = asyncio.create_task(
-            self._run_claude_code_confirmation(transcript),
-            name="claude-code-confirmation",
-        )
-        self._claude_code_tasks.add(task)
-        task.add_done_callback(self._claude_code_tasks.discard)
-
-    async def _run_claude_code_confirmation(self, transcript: str) -> None:
-        """Resolve any pending Claude Code confirmation, surfacing the result when done."""
-        try:
-            result = await resolve_confirmation(transcript)
-            if result is not None:
-                await self._handle_claude_code_confirmation_result(result)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Claude Code confirmation handling failed")
-
-    async def _handle_claude_code_confirmation_result(self, result: dict[str, Any]) -> None:
-        """Surface a local Claude Code confirmation result to the UI and the voice."""
-        await self._cancel_in_flight_response()
-        message = str(result.get("message") or "Claude Code request handled.")
-        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": message}))
-        if self.connection:
-            await self._safe_response_create(
-                response={
-                    "instructions": f"Say exactly this to the user: {message}",
-                },
-            )
-        self.wake_session.touch()
-
     def _record_user_transcript(self, transcript: str | None) -> None:
         """Track the latest user transcript for early sleep detection."""
         if transcript:
@@ -816,9 +772,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
         if await self._maybe_sleep_from_transcript(transcript):
             return
-        # Claude Code confirmations can block on HTTP for many seconds; never
-        # await them here, inside the realtime event dispatcher.
-        self._start_claude_code_confirmation(transcript)
         self.wake_session.touch()
 
     def _reset_per_session_response_state(self) -> None:
@@ -1344,10 +1297,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Stop the local wake-word detector thread
         self.wake_gate.stop()
 
-        # Stop any in-flight wake transition and Claude Code confirmation tasks.
-        background_tasks = [self._wake_transition_task, *self._claude_code_tasks]
+        # Stop any in-flight wake transition task.
+        background_tasks = [self._wake_transition_task]
         self._wake_transition_task = None
-        self._claude_code_tasks.clear()
         for background_task in background_tasks:
             if background_task is None or background_task.done():
                 continue

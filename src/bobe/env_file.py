@@ -6,7 +6,6 @@ import logging
 import threading
 from pathlib import Path
 
-from bobe.claude import DEFAULT_CLAUDE_MODEL
 from bobe.config import config
 
 
@@ -21,12 +20,6 @@ def is_plausible_openai_key(value: str | None) -> bool:
     """Return whether a value looks like an OpenAI API key."""
     key = (value or "").strip()
     return key.startswith("sk-") and len(key) >= 20
-
-
-def is_plausible_anthropic_key(value: str | None) -> bool:
-    """Return whether a value looks like an Anthropic API key."""
-    key = (value or "").strip()
-    return key.startswith("sk-ant-") and len(key) >= 20
 
 
 def _read_lines_if_exists(path: Path) -> list[str] | None:
@@ -101,16 +94,12 @@ def persist_api_settings(
     instance_path: str | None,
     *,
     openai_api_key: str,
-    anthropic_api_key: str,
-    claude_model: str,
 ) -> None:
     """Persist explicit API settings to environment and instance ``.env``."""
     values = {
         "OPENAI_API_KEY": openai_api_key.strip(),
-        "ANTHROPIC_API_KEY": anthropic_api_key.strip(),
-        "CLAUDE_MODEL": (claude_model or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL,
     }
-    if not values["OPENAI_API_KEY"] or not values["ANTHROPIC_API_KEY"]:
+    if not values["OPENAI_API_KEY"]:
         return
 
     os.environ.update(values)

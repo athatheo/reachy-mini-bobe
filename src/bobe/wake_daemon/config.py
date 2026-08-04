@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from bobe.env_utils import parse_int, parse_bool, parse_float
+from bobe.env_utils import parse_int, parse_float
 from bobe.wake.phrases import WAKE_PHRASE
 
 
@@ -18,12 +18,6 @@ DEFAULT_MIN_SPEECH_MS = 250
 DEFAULT_MAX_UTTERANCE_S = 3.0
 DEFAULT_SPEECH_RMS = 450.0
 DEFAULT_REFRACTORY_S = 2.5
-DEFAULT_CLAUDE_CODE_WORKDIR = "~/repos/bobe-claude-code-workspace"
-DEFAULT_CLAUDE_CODE_BIN = "claude"
-DEFAULT_CLAUDE_CODE_LAUNCH_COOLDOWN_S = 30.0
-DEFAULT_CLAUDE_CODE_COMMAND_TIMEOUT_S = 300.0
-DEFAULT_CLAUDE_CODE_OUTPUT_LIMIT_CHARS = 6000
-DEFAULT_CLAUDE_CODE_PERMISSION_MODE = "default"
 
 
 @dataclass(frozen=True)
@@ -45,14 +39,6 @@ class WakeDaemonConfig:
     max_utterance_s: float = DEFAULT_MAX_UTTERANCE_S
     speech_rms: float = DEFAULT_SPEECH_RMS
     refractory_s: float = DEFAULT_REFRACTORY_S
-    claude_code_launch_enabled: bool = False
-    claude_code_launch_token: str | None = None
-    claude_code_workdir: str = DEFAULT_CLAUDE_CODE_WORKDIR
-    claude_code_bin: str = DEFAULT_CLAUDE_CODE_BIN
-    claude_code_launch_cooldown_s: float = DEFAULT_CLAUDE_CODE_LAUNCH_COOLDOWN_S
-    claude_code_command_timeout_s: float = DEFAULT_CLAUDE_CODE_COMMAND_TIMEOUT_S
-    claude_code_output_limit_chars: int = DEFAULT_CLAUDE_CODE_OUTPUT_LIMIT_CHARS
-    claude_code_permission_mode: str = DEFAULT_CLAUDE_CODE_PERMISSION_MODE
 
 
 def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConfig:
@@ -64,10 +50,6 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
 
     def _float(name: str, default: float) -> float:
         return parse_float(source.get(name), default)
-
-    def _bool(name: str, default: bool = False) -> bool:
-        value = parse_bool(source.get(name))
-        return default if value is None else value
 
     token = (source.get("BOBE_WAKE_TOKEN") or "").strip()
     if not token:
@@ -110,25 +92,4 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
         max_utterance_s=max(0.5, _float("VAD_MAX_UTTERANCE_S", DEFAULT_MAX_UTTERANCE_S)),
         speech_rms=max(50.0, _float("VAD_SPEECH_RMS", DEFAULT_SPEECH_RMS)),
         refractory_s=max(0.5, _float("WAKE_REFRACTORY_S", DEFAULT_REFRACTORY_S)),
-        claude_code_launch_enabled=_bool("BOBE_CLAUDE_CODE_LAUNCH_ENABLED"),
-        claude_code_launch_token=_optional("BOBE_CLAUDE_CODE_LAUNCH_TOKEN"),
-        claude_code_workdir=source.get("BOBE_CLAUDE_CODE_WORKDIR", DEFAULT_CLAUDE_CODE_WORKDIR).strip()
-        or DEFAULT_CLAUDE_CODE_WORKDIR,
-        claude_code_bin=source.get("BOBE_CLAUDE_CODE_BIN", DEFAULT_CLAUDE_CODE_BIN).strip() or DEFAULT_CLAUDE_CODE_BIN,
-        claude_code_launch_cooldown_s=max(
-            0.0,
-            _float("BOBE_CLAUDE_CODE_LAUNCH_COOLDOWN_S", DEFAULT_CLAUDE_CODE_LAUNCH_COOLDOWN_S),
-        ),
-        claude_code_command_timeout_s=max(
-            1.0,
-            _float("BOBE_CLAUDE_CODE_COMMAND_TIMEOUT_S", DEFAULT_CLAUDE_CODE_COMMAND_TIMEOUT_S),
-        ),
-        claude_code_output_limit_chars=max(
-            500,
-            _int("BOBE_CLAUDE_CODE_OUTPUT_LIMIT_CHARS", DEFAULT_CLAUDE_CODE_OUTPUT_LIMIT_CHARS),
-        ),
-        claude_code_permission_mode=(
-            source.get("BOBE_CLAUDE_CODE_PERMISSION_MODE", DEFAULT_CLAUDE_CODE_PERMISSION_MODE).strip()
-            or DEFAULT_CLAUDE_CODE_PERMISSION_MODE
-        ),
     )

@@ -14,9 +14,8 @@ from pydantic import BaseModel
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.staticfiles import StaticFiles
 
-from bobe.claude import DEFAULT_CLAUDE_MODEL
 from bobe.config import config
-from bobe.env_file import persist_api_settings, is_plausible_openai_key, is_plausible_anthropic_key
+from bobe.env_file import persist_api_settings, is_plausible_openai_key
 from bobe.wake_env import persist_wake_env, is_wake_remote_host_allowed
 from bobe.wake.phrases import WAKE_PHRASE
 from bobe.openai_realtime import OpenaiRealtimeHandler
@@ -37,8 +36,6 @@ class ApiSettingsPayload(BaseModel):
     """POST /api_keys payload."""
 
     openai_api_key: str
-    anthropic_api_key: str
-    claude_model: str = DEFAULT_CLAUDE_MODEL
 
 
 class WakeConfigPayload(BaseModel):
@@ -104,9 +101,7 @@ class SettingsUIServer:
         @app.get("/status")
         def _status() -> JSONResponse:
             openai_key = os.getenv("OPENAI_API_KEY") or str(config.OPENAI_API_KEY or "")
-            anthropic_key = os.getenv("ANTHROPIC_API_KEY") or ""
             has_openai_key = is_plausible_openai_key(openai_key)
-            has_anthropic_key = is_plausible_anthropic_key(anthropic_key)
 
             handler = self.handler
             wake_config = getattr(handler, "wake_config", None) if handler else None
@@ -118,17 +113,14 @@ class SettingsUIServer:
             wake_debug = wake_detector.debug_state() if wake_detector is not None else None
             wake_remote_url = getattr(wake_config, "remote_url", None) if wake_config else None
             openai_connected = bool(getattr(handler, "connection", None)) if handler else False
-            authenticated = has_openai_key and has_anthropic_key
+            authenticated = has_openai_key
             if not authenticated:
                 wake_debug = _redact_wake_debug_for_public(wake_debug)
 
             return JSONResponse(
                 {
-                    "has_key": has_openai_key and has_anthropic_key,
+                    "has_key": has_openai_key,
                     "has_openai_key": has_openai_key,
-                    "has_anthropic_key": has_anthropic_key,
-                    "openai_connected": openai_connected,
-                    "claude_model": os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
                     "wake_enabled": wake_enabled,
                     "wake_error": wake_error,
                     "awake": awake,
@@ -176,17 +168,11 @@ class SettingsUIServer:
         @app.post("/api_keys")
         def _set_api_keys(payload: Annotated[ApiSettingsPayload, Body()]) -> JSONResponse:
             openai_key = (payload.openai_api_key or "").strip()
-            anthropic_key = (payload.anthropic_api_key or "").strip()
-            claude_model = (payload.claude_model or DEFAULT_CLAUDE_MODEL).strip() or DEFAULT_CLAUDE_MODEL
             if not is_plausible_openai_key(openai_key):
                 return JSONResponse({"ok": False, "error": "invalid_openai_api_key"}, status_code=400)
-            if not is_plausible_anthropic_key(anthropic_key):
-                return JSONResponse({"ok": False, "error": "invalid_anthropic_api_key"}, status_code=400)
             persist_api_settings(
                 self.instance_path,
                 openai_api_key=openai_key,
-                anthropic_api_key=anthropic_key,
-                claude_model=claude_model,
             )
             return JSONResponse({"ok": True})
 
