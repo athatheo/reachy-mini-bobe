@@ -19,6 +19,7 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 
 - Remote wake word: say `Hey Bobe` to wake BoBe (Mac-side Whisper daemon; robot streams PCM while asleep).
 - Voice input/output uses the official Reachy Mini conversation app pipeline; the realtime model answers questions directly.
+- Hermes integration: the `ask_hermes` tool forwards personal-agent requests to Hermes on the Mac, and Hermes can push spoken announcements to the robot (see below).
 - Expressive robot responses use the existing Reachy Mini motion tools, including `play_emotion`, `move_head`, and `sweep_look`.
 
 ## Privacy model
@@ -37,9 +38,27 @@ OPENAI_API_KEY=
 BOBE_WAKE_BACKEND=remote
 BOBE_WAKE_REMOTE_URL=ws://Mac.local:8765/v1/stream
 BOBE_WAKE_TOKEN=
+# Optional: Hermes personal-agent integration (see "Hermes integration")
+BOBE_HERMES_URL=http://192.168.1.172:8642/v1
+BOBE_HERMES_API_KEY=
 ```
 
 The OpenAI key is used by the inherited realtime speech bridge.
+
+## Hermes integration
+
+BoBe connects two ways to [Hermes](https://github.com/NousResearch/hermes-agent)-style personal agents running on the Mac:
+
+- **Voice → Hermes**: the `ask_hermes` profile tool sends requests straight to Hermes's OpenAI-compatible API server and speaks the answer. The realtime model decides when to delegate (tasks, messages, kanban, "ask Hermes …").
+- **Hermes → BoBe**: the wake daemon exposes `POST /v1/announce` (authenticated with `BOBE_WAKE_TOKEN`); messages are relayed over the robot's existing wake WebSocket and spoken aloud — the robot wakes first if asleep. A Hermes platform plugin in `integrations/hermes-bobe-plugin/` registers `bobe` as a delivery channel ("send it to bobe", cron `deliver=bobe`).
+
+Setup:
+
+1. **Enable the Hermes API server** (Mac, `~/.hermes/.env`): `API_SERVER_ENABLED=true`, `API_SERVER_KEY=$(openssl rand -hex 32)`, `API_SERVER_HOST=<Mac LAN IP>`, then `hermes gateway restart`.
+2. **Robot env**: set `BOBE_HERMES_URL=http://<Mac LAN IP>:8642/v1` and `BOBE_HERMES_API_KEY=<same key>`.
+3. **Install the plugin** (Mac): copy `integrations/hermes-bobe-plugin/` to `~/.hermes/plugins/bobe/`, set `BOBE_WAKE_TOKEN` in `~/.hermes/.env` (the wake daemon's token), enable `platforms: bobe: enabled: true` in `~/.hermes/config.yaml`, then `hermes gateway restart`.
+
+Verify: `curl -X POST http://127.0.0.1:8765/v1/announce -H "X-BoBe-Wake-Token: $BOBE_WAKE_TOKEN" -H 'Content-Type: application/json' -d '{"message":"hello"}'` with the robot app running → the robot says "hello".
 
 ## Remote wake runbook (Mac + robot)
 

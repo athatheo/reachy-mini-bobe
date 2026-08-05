@@ -19,7 +19,8 @@ flowchart TB
     end
 
     subgraph MacSide["Mac (wake daemon host)"]
-        WakeDaemon@{ label: "<span style='font-size:16px;font-weight:bold;'>bobe-wake-daemon</span><br><span style='font-size:13px;color:#0277bd;'>WhisperWakeEngine + WebSocket</span>" }
+        WakeDaemon@{ label: "<span style='font-size:16px;font-weight:bold;'>bobe-wake-daemon</span><br><span style='font-size:13px;color:#0277bd;'>WhisperWakeEngine + WebSocket + /v1/announce</span>" }
+        Hermes@{ label: "<span style='font-size:16px;font-weight:bold;'>Hermes agent</span><br><span style='font-size:13px;color:#7b1fa2;'>Personal agent + bobe channel plugin</span>" }
     end
 
     subgraph Cloud["Cloud APIs"]
@@ -45,6 +46,10 @@ flowchart TB
     OpenAI -- tool calls --> Handlers
     Handlers -- tool results --> OpenAI
 
+    Handlers -- ask_hermes HTTP --> Hermes
+    Hermes -- announce --> WakeDaemon
+    WakeDaemon -- announce event --> WakeClient
+
     Profiles -- defines enabled tools --> Handlers
     Handlers -- camera / tracking --> Camera
     Robot -- camera frames --> Camera
@@ -57,6 +62,7 @@ flowchart TB
     User:::userStyle
     UI:::uiStyle
     OpenAI:::aiStyle
+    Hermes:::aiStyle
     Orchestrator:::aiStyle
     Motion:::coreStyle
     Profiles:::toolStyle

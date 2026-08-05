@@ -1,6 +1,7 @@
 # BoBe's enabled tools.
-# Motion tools add expression; answers come from the realtime model itself.
+# `ask_hermes` reaches the user's Hermes agent; motion tools add expression.
 
+ask_hermes
 play_emotion
 stop_emotion
 move_head

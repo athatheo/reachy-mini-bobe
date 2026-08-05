@@ -21,6 +21,7 @@ from bobe.wake.protocol import (
     MSG_READY,
     MSG_SLEEP,
     MSG_STATS,
+    MSG_ANNOUNCE,
     CLOSE_POLICY_VIOLATION,
     parse_json,
     hello_message,
@@ -60,10 +61,12 @@ class RemoteWakeClient:
         phrase: str = WAKE_PHRASE,
         sample_rate: int = WAKE_SAMPLE_RATE,
         on_sleep: Any | None = None,
+        on_announce: Any | None = None,
         sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
     ) -> None:
         self._on_wake = on_wake
         self._on_sleep = on_sleep
+        self._on_announce = on_announce
         self._phrase = phrase.strip().casefold() or WAKE_PHRASE
         self._sleep_phrases = sleep_phrases
         self._url = url
@@ -436,6 +439,15 @@ class RemoteWakeClient:
         if self._on_sleep is not None:
             self._on_sleep()
 
+    def _handle_announce_payload(self, payload: dict[str, Any]) -> None:
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return
+        self._log_event("info", f"Announcement received: {text!r}")
+        logger.info("Remote announcement received (text=%r)", text)
+        if self._on_announce is not None:
+            self._on_announce(text)
+
     async def _recv_loop(self, ws: Any) -> None:
         async for message in ws:
             if self._stop_event.is_set():
@@ -464,3 +476,5 @@ class RemoteWakeClient:
                 self._handle_wake_payload(payload)
             elif msg_type == MSG_SLEEP:
                 self._handle_sleep_payload(payload)
+            elif msg_type == MSG_ANNOUNCE:
+                self._handle_announce_payload(payload)

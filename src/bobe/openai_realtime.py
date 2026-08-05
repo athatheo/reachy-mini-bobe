@@ -204,6 +204,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._wake_transition_task: asyncio.Task[None] | None = None
         self._wake_retry_delay_s: float = _WAKE_RETRY_INITIAL_DELAY_S
         self._next_wake_retry_at: float = 0.0
+        # Hermes announcements run as background tasks so the realtime event
+        # dispatcher never blocks; announcements received while asleep wait
+        # here until the wake transition opens a session to speak through.
+        self._announce_tasks: set[asyncio.Task[None]] = set()
+        self._pending_announcements: list[str] = []
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         # The factory is looked up in this module's namespace at call time so
@@ -751,6 +756,39 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self._transition_to_sleep("sleep phrase")
         return True
 
+    def _start_announcement(self, text: str) -> None:
+        """Handle a Hermes announcement without stalling the mic loop."""
+        if self._shutdown_requested:
+            return
+        task = asyncio.create_task(self._handle_announcement(text), name="announcement")
+        self._announce_tasks.add(task)
+        task.add_done_callback(self._announce_tasks.discard)
+
+    async def _handle_announcement(self, text: str) -> None:
+        """Speak an announcement now, or park it and wake the robot first."""
+        try:
+            if self.wake_gate.enabled and not self.wake_session.awake:
+                self._pending_announcements.append(text)
+                self.wake_session.request_wake()
+                return
+            await self._speak_announcement(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Announcement handling failed")
+
+    async def _speak_announcement(self, text: str) -> None:
+        """Surface an announcement to the UI and have the voice read it verbatim."""
+        await self._cancel_in_flight_response()
+        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": text}))
+        if self.connection:
+            await self._safe_response_create(
+                response={
+                    "instructions": f"Say exactly this to the user: {text}",
+                },
+            )
+        self.wake_session.touch()
+
     def _record_user_transcript(self, transcript: str | None) -> None:
         """Track the latest user transcript for early sleep detection."""
         if transcript:
@@ -1172,6 +1210,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         logger.info("Wake word heard: streaming audio to OpenAI until timeout or sleep phrase")
         await self._play_chime(ascending=True)
         self._queue_antenna_cue(awake=True)
+
+        # Deliver announcements that arrived while asleep and woke us up.
+        pending = self._pending_announcements
+        self._pending_announcements = []
+        for text in pending:
+            await self._speak_announcement(text)
         return True
 
     async def _transition_to_sleep(self, reason: str) -> None:
@@ -1245,6 +1289,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             elif event == "expired":
                 await self._transition_to_sleep("inactivity timeout")
 
+            for announcement in self.wake_gate.drain_announcements():
+                self._start_announcement(announcement)
+
             if not self.wake_gate.awake:
                 self.wake_gate.buffer_frame(upstream_frame.reshape(-1))
                 self.wake_gate.feed(audio_frame, input_sample_rate)
@@ -1297,9 +1344,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Stop the local wake-word detector thread
         self.wake_gate.stop()
 
-        # Stop any in-flight wake transition task.
-        background_tasks = [self._wake_transition_task]
+        # Stop any in-flight wake transition and announcement tasks.
+        background_tasks = [self._wake_transition_task, *self._announce_tasks]
         self._wake_transition_task = None
+        self._announce_tasks.clear()
         for background_task in background_tasks:
             if background_task is None or background_task.done():
                 continue

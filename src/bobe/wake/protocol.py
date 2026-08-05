@@ -19,6 +19,7 @@ MSG_WAKE = "wake"
 MSG_SLEEP = "sleep"
 MSG_STATS = "stats"
 MSG_LISTEN = "listen"
+MSG_ANNOUNCE = "announce"
 
 # WebSocket close codes used by the daemon handshake (RFC 6455).
 CLOSE_UNSUPPORTED_DATA = 1003
@@ -70,6 +71,14 @@ def sleep_message(*, transcript: str, latency_ms: float) -> dict[str, Any]:
         "type": MSG_SLEEP,
         "transcript": transcript,
         "latency_ms": round(latency_ms, 1),
+    }
+
+
+def announce_message(*, text: str) -> dict[str, Any]:
+    """Build a daemon-to-robot announcement the robot should speak."""
+    return {
+        "type": MSG_ANNOUNCE,
+        "text": text,
     }
 
 

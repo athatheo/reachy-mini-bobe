@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from bobe.wake.phrases import matches_wake_phrase
@@ -24,6 +24,7 @@ from bobe.wake.protocol import (
     ready_message,
     sleep_message,
     stats_message,
+    announce_message,
 )
 from bobe.wake.constants import WAKE_SAMPLE_RATE
 from bobe.wake_daemon.config import WakeDaemonConfig, load_wake_daemon_config
@@ -67,6 +68,8 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
 
     app = FastAPI(title="BoBe Wake Daemon", version="0.1.0", lifespan=lifespan)
     app.state.wake_engine = None
+    # Authenticated robot wake streams, used to push announcements robot-ward.
+    app.state.stream_connections = set()
 
     @app.get("/status")
     def status() -> JSONResponse:
@@ -78,6 +81,35 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 "model": runtime.whisper_model,
             }
         )
+
+    @app.post("/v1/announce")
+    async def announce(request: Request) -> JSONResponse:
+        provided_token = (request.headers.get("x-bobe-wake-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, runtime.token or ""):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        message = str(payload.get("message") or "").strip() if isinstance(payload, dict) else ""
+        if not message:
+            return JSONResponse({"ok": False, "error": "empty_message"}, status_code=400)
+
+        connections = list(app.state.stream_connections)
+        if not connections:
+            return JSONResponse({"ok": False, "error": "no_robot_connected"}, status_code=409)
+
+        delivered = 0
+        for connection in connections:
+            try:
+                await connection.send_json(announce_message(text=message))
+                delivered += 1
+            except Exception:
+                logger.warning("Failed to deliver announcement to a robot stream", exc_info=True)
+        if delivered == 0:
+            return JSONResponse({"ok": False, "error": "delivery_failed"}, status_code=502)
+        return JSONResponse({"ok": True, "delivered": delivered})
 
     @app.websocket("/v1/stream")
     async def stream(websocket: WebSocket) -> None:
@@ -125,6 +157,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
             match_phrase = runtime.phrase.casefold()
             session = shared_engine().session(replace(runtime, phrase=match_phrase))
             await websocket.send_json(ready_message(engine="faster-whisper", phrase=match_phrase))
+            app.state.stream_connections.add(websocket)
 
             while True:
                 message = await websocket.receive()
@@ -203,5 +236,7 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         except Exception:
             logger.exception("Wake stream failed")
             raise
+        finally:
+            app.state.stream_connections.discard(websocket)
 
     return app

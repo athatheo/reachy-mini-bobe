@@ -226,6 +226,7 @@ def create_wake_detector(
     config: WakeConfig,
     *,
     on_sleep: Callable[[], None] | None = None,
+    on_announce: Callable[[str], None] | None = None,
 ) -> RemoteWakeClient | None:
     """Instantiate the configured wake-word backend."""
     error = wake_detector_error(config)
@@ -241,6 +242,7 @@ def create_wake_detector(
         gain=config.gain,
         phrase=config.phrase,
         on_sleep=on_sleep,
+        on_announce=on_announce,
         sleep_phrases=config.sleep_phrases,
     )
 
@@ -278,10 +280,15 @@ class WakeGate:
         self.config = load_wake_config() if config is None else config
         self.session = WakeSession(timeout_s=self.config.timeout_s)
         self.buffer = AudioRingBuffer(sample_rate=input_sample_rate)
+        # Announcements arrive on the detector thread; the handler's mic loop
+        # drains them on the event loop via drain_announcements().
+        self._announce_lock = threading.Lock()
+        self._announcements: list[str] = []
         self.detector = detector_factory(
             on_wake=self.session.request_wake,
             config=self.config,
             on_sleep=self.session.request_sleep,
+            on_announce=self.request_announce,
         )
         self.enabled = self.detector is not None
         self.error: str | None
@@ -308,6 +315,20 @@ class WakeGate:
         elif self.session.expired():
             return "expired"
         return None
+
+    def request_announce(self, text: str) -> None:
+        """Queue an announcement (thread-safe; called from the detector thread)."""
+        if not text:
+            return
+        with self._announce_lock:
+            self._announcements.append(text)
+
+    def drain_announcements(self) -> list[str]:
+        """Return and clear queued announcements (consumed by the mic loop)."""
+        with self._announce_lock:
+            pending = self._announcements
+            self._announcements = []
+        return pending
 
     def feed(self, audio_frame: NDArray[Any], input_sample_rate: int) -> None:
         """Forward mic audio to the local wake detector, restarting it if needed."""

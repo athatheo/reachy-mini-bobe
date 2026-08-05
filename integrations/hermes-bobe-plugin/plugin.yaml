@@ -1,0 +1,21 @@
+name: bobe-platform
+label: BoBe
+kind: platform
+version: 1.0.0
+description: >
+  BoBe (Reachy Mini) announcement channel for Hermes Agent. Outbound-only:
+  messages sent to this channel are POSTed to the BoBe wake daemon on this
+  Mac, which relays them over the robot's wake WebSocket so the robot speaks
+  them aloud. There is no inbound side — voice requests reach Hermes through
+  the API server instead.
+author: athatheoc
+requires_env:
+  - name: BOBE_WAKE_TOKEN
+    description: "Shared secret of the BoBe wake daemon (same value as the daemon's BOBE_WAKE_TOKEN)"
+    prompt: "BoBe wake daemon token"
+    password: true
+optional_env:
+  - name: BOBE_ANNOUNCE_URL
+    description: "Wake daemon announce endpoint (default: http://127.0.0.1:8765/v1/announce)"
+    prompt: "BoBe announce URL (or empty)"
+    password: false

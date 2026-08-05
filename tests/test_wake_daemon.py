@@ -368,3 +368,84 @@ def test_stream_accepts_valid_hello_token():
     assert ready["type"] == "ready"
     assert ready["phrase"] == "hey bobe"
 
+
+
+def _announce_client():
+    from bobe.wake_daemon.server import create_app
+
+    return TestClient(create_app(load_wake_daemon_config(_TEST_ENV)))
+
+
+def test_announce_rejects_bad_token():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/announce",
+        headers={"X-BoBe-Wake-Token": "wrong-token"},
+        json={"message": "hello"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "unauthorized"
+
+
+def test_announce_rejects_empty_message():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/announce",
+        headers={"X-BoBe-Wake-Token": "test-token"},
+        json={},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "empty_message"
+
+
+def test_announce_without_robot_returns_conflict():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/announce",
+        headers={"X-BoBe-Wake-Token": "test-token"},
+        json={"message": "hello"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "no_robot_connected"
+
+
+def test_announce_forwards_to_connected_robot_stream():
+    client = _announce_client()
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+
+        response = client.post(
+            "/v1/announce",
+            headers={"X-BoBe-Wake-Token": "test-token"},
+            json={"message": "Build finished."},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "delivered": 1}
+        frame = ws.receive_json()
+
+    assert frame == {"type": "announce", "text": "Build finished."}
+
+
+def test_announce_after_stream_disconnect_returns_conflict():
+    client = _announce_client()
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+
+    response = client.post(
+        "/v1/announce",
+        headers={"X-BoBe-Wake-Token": "test-token"},
+        json={"message": "hello"},
+    )
+
+    assert response.status_code == 409
