@@ -17,14 +17,16 @@ then run ``hermes gateway restart``. After that, "send it to bobe",
 cron ``deliver=bobe``, and webhook delivery all reach the robot's voice.
 """
 
+# ruff: noqa: D102, D107, D401 — runs inside Hermes, not this repo; keep it
+# close to the upstream ntfy plugin's shape rather than this repo's docstyle.
+
 import os
 import logging
 from typing import Any, Dict, List, Optional
 
 import httpx
-
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import SendResult, BasePlatformAdapter
 
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,10 @@ class BobeAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """POST the message to the wake daemon; the robot speaks it."""
         return await _post_announcement(self._url, self._token, content)
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """There is a single implicit channel: the robot's voice."""
+        return {"name": "BoBe robot", "type": "dm"}
 
 
 async def _standalone_send(

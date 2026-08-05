@@ -1875,3 +1875,63 @@ def test_persist_api_key_never_overwrites_existing_env(tmp_path: Any, monkeypatc
     handler._persist_api_key_if_needed()
 
     assert (tmp_path / ".env").read_text(encoding="utf-8") == existing
+
+
+# ---- Hermes announcements ----
+
+
+@pytest.mark.asyncio
+async def test_announcement_speaks_immediately_while_awake() -> None:
+    """An announcement arriving while awake is surfaced and spoken right away."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+
+    await handler._handle_announcement("Build finished.")
+
+    output = await handler.output_queue.get()
+    assert output.args[0] == {"role": "assistant", "content": "Build finished."}
+    assert handler._pending_announcements == []
+    assert handler.wake_session.awake
+
+
+@pytest.mark.asyncio
+async def test_announcement_while_asleep_queues_and_requests_wake() -> None:
+    """An announcement arriving while asleep parks the text and wakes the robot."""
+    handler = _build_wake_enabled_handler()
+
+    await handler._handle_announcement("Build finished.")
+
+    assert handler._pending_announcements == ["Build finished."]
+    assert handler.wake_session.consume_wake_request()
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_receive_drains_gate_announcements() -> None:
+    """Announcements queued by the detector thread are picked up by the mic loop."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_gate.request_announce("Ping from Hermes")
+
+    await handler.receive(_mic_frame())
+    for task in list(handler._announce_tasks):
+        await task
+
+    assert handler._pending_announcements == ["Ping from Hermes"]
+    assert handler.wake_session.consume_wake_request()
+
+
+def test_remote_client_dispatches_announcements() -> None:
+    """The remote wake client forwards announce payloads to its callback."""
+    from bobe.wake.remote_client import RemoteWakeClient
+
+    received: list[str] = []
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://mac.test:8765/v1/stream",
+        on_announce=received.append,
+    )
+
+    client._handle_announce_payload({"text": "Build finished."})
+    client._handle_announce_payload({"text": "   "})
+
+    assert received == ["Build finished."]
