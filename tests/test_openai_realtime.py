@@ -976,6 +976,7 @@ async def test_camera_tool_result_never_inlines_base64_as_text() -> None:
     injects hundreds of KB of raw tokens and breaks every camera invocation.
     """
     handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
     connection = RecordingItemConnection()
     handler.connection = connection
 
@@ -1014,6 +1015,7 @@ async def test_any_tool_result_with_b64_im_uses_image_attachment_path() -> None:
     input_image treatment instead of inlining base64 as raw text tokens.
     """
     handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
     connection = RecordingItemConnection()
     handler.connection = connection
 
@@ -1042,6 +1044,7 @@ async def test_any_tool_result_with_b64_im_uses_image_attachment_path() -> None:
 async def test_non_camera_tool_result_output_is_unchanged() -> None:
     """Regular tool results still serialize verbatim into the function output."""
     handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
     connection = RecordingItemConnection()
     handler.connection = connection
 
@@ -1090,6 +1093,7 @@ async def test_handle_tool_result_survives_cleanly_closed_socket() -> None:
     from websockets.exceptions import ConnectionClosedOK
 
     handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
     handler._connected_event.set()
     handler._response_done_event.clear()
     handler.connection = RaisingItemConnection(
@@ -1115,6 +1119,7 @@ async def test_handle_tool_result_swallows_unexpected_send_errors(caplog: Any) -
     """Non-connection send failures are logged, not propagated to the listener."""
     caplog.set_level(logging.ERROR)
     handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
     connection = RaisingItemConnection(RuntimeError("send failed (simulated)"))
     handler.connection = connection
 
@@ -1935,3 +1940,117 @@ def test_remote_client_dispatches_announcements() -> None:
     client._handle_announce_payload({"text": "   "})
 
     assert received == ["Build finished."]
+
+
+# ---- "Go to sleep" hard-interrupt behavior ----
+
+
+@pytest.mark.asyncio
+async def test_local_sleep_drains_pending_responses_and_cancels_tools() -> None:
+    """A spoken sleep command silences queued responses and abandons running tools."""
+    from types import SimpleNamespace
+
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    handler._pending_responses.put_nowait({"response": {"instructions": "queued"}})
+    cancelled: list[str] = []
+
+    async def fake_cancel(tool_id: str, log: bool = True) -> bool:
+        cancelled.append(tool_id)
+        return True
+
+    handler.tool_manager = SimpleNamespace(
+        get_running_tools=lambda: [SimpleNamespace(id="tool-1")],
+        cancel_tool=fake_cancel,
+    )
+
+    await handler._transition_to_sleep("local sleep phrase")
+
+    assert not handler.wake_session.awake
+    assert handler._pending_responses.empty()
+    assert cancelled == ["tool-1"]
+
+
+@pytest.mark.asyncio
+async def test_tool_result_dropped_while_asleep() -> None:
+    """A tool finishing after sleep must not speak, emit UI output, or queue a response."""
+    handler = _build_wake_enabled_handler()  # asleep by default
+
+    notification = btm_mod.ToolNotification(
+        id="t1", tool_name="ask_hermes", status=ToolState.COMPLETED, result={"answer": "late"}
+    )
+    await handler._handle_tool_result(notification)
+
+    assert handler.output_queue.empty()
+    assert handler._pending_responses.empty()
+
+
+@pytest.mark.asyncio
+async def test_manual_sleep_holds_announcements_until_next_wake() -> None:
+    """After a spoken sleep, announcements queue but never wake the robot."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    await handler._transition_to_sleep("local sleep phrase")
+
+    await handler._handle_announcement("Build finished.")
+
+    assert handler._pending_announcements == ["Build finished."]
+    assert not handler.wake_session.consume_wake_request()
+
+
+@pytest.mark.asyncio
+async def test_timeout_sleep_still_allows_announce_wake() -> None:
+    """An inactivity-timeout sleep keeps the ambient announce-wake behavior."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    await handler._transition_to_sleep("inactivity timeout")
+
+    await handler._handle_announcement("Build finished.")
+
+    assert handler._pending_announcements == ["Build finished."]
+    assert handler.wake_session.consume_wake_request()
+
+
+@pytest.mark.asyncio
+async def test_wake_restores_announce_wake_and_drains_held_announcements() -> None:
+    """A real wake resets the announce policy and speaks what was held."""
+    handler = _build_wake_enabled_handler()
+    handler.connection = FakeGatingConnection()
+    handler.wake_session.wake()
+    await handler._transition_to_sleep("local sleep phrase")
+    await handler._handle_announcement("Held one.")
+    assert handler._announce_wake_allowed is False
+
+    assert await handler._transition_to_awake()
+
+    assert handler._announce_wake_allowed is True
+    assert handler._pending_announcements == []
+    outputs = []
+    while not handler.output_queue.empty():
+        outputs.append(handler.output_queue.get_nowait())
+    # The queue also carries chime audio tuples; look only at AdditionalOutputs.
+    assert any(
+        getattr(o, "args", [None])[0] == {"role": "assistant", "content": "Held one."} for o in outputs
+    )
+
+
+@pytest.mark.asyncio
+async def test_speak_announcement_parks_when_sleep_races_in() -> None:
+    """An announce task that loses the race to sleep parks instead of speaking."""
+    handler = _build_wake_enabled_handler()  # asleep
+
+    await handler._speak_announcement("Late one.")
+
+    assert handler._pending_announcements == ["Late one."]
+    assert handler.output_queue.empty()
+
+
+def test_sleep_request_gates_responses_before_transition() -> None:
+    """The daemon's sleep event blocks responses one frame before the transition runs."""
+    handler = _build_wake_enabled_handler()
+    handler.wake_session.wake()
+    assert handler._session_accepts_responses()
+
+    handler.wake_session.request_sleep()
+
+    assert not handler._session_accepts_responses()

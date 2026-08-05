@@ -166,6 +166,12 @@ class WakeSession:
         with self._lock:
             self._sleep_requested = True
 
+    @property
+    def sleep_requested(self) -> bool:
+        """Return whether a sleep request is pending (thread-safe)."""
+        with self._lock:
+            return self._sleep_requested
+
     def consume_sleep_request(self) -> bool:
         """Return True once per pending sleep request while awake."""
         with self._lock:

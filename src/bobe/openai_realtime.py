@@ -209,6 +209,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # here until the wake transition opens a session to speak through.
         self._announce_tasks: set[asyncio.Task[None]] = set()
         self._pending_announcements: list[str] = []
+        # A spoken "go to sleep" flips this off so announcements queue without
+        # waking the robot; any real wake flips it back on.
+        self._announce_wake_allowed: bool = True
 
         # Local wake-word gating: while asleep, mic audio never leaves the robot.
         # The factory is looked up in this module's namespace at call time so
@@ -278,9 +281,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     def _session_accepts_responses(self) -> bool:
         """Return whether assistant responses should play (wake gating or always-on fallback)."""
+        if self._sleep_pending:
+            return False
         if not self.wake_gating_enabled:
-            return not self._sleep_pending
-        return self.wake_session.awake and not self._sleep_pending
+            return True
+        # sleep_requested closes the gap between the daemon's sleep event
+        # (detector thread) and the mic frame that runs the sleep transition.
+        return self.wake_session.awake and not self.wake_session.sleep_requested
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -592,6 +599,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def _handle_tool_result(self, bg_tool: ToolNotification) -> None:
         """Process the result of a tool call."""
+        if not self._session_accepts_responses():
+            # Sleep means silence: results (and cancellation errors) of tools
+            # that were still running when the user said "go to sleep" are
+            # dropped instead of being spoken into a sleeping session.
+            logger.info(
+                "Dropping result of tool '%s' (id=%s): robot is asleep",
+                bg_tool.tool_name,
+                bg_tool.id,
+            )
+            return
         if bg_tool.error is not None:
             logger.error("Tool '%s' (id=%s) failed with error: %s", bg_tool.tool_name, bg_tool.id, bg_tool.error)
             tool_result = {"error": bg_tool.error}
@@ -769,7 +786,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         try:
             if self.wake_gate.enabled and not self.wake_session.awake:
                 self._pending_announcements.append(text)
-                self.wake_session.request_wake()
+                if self._announce_wake_allowed:
+                    self.wake_session.request_wake()
+                else:
+                    logger.info("Holding announcement until the next wake (user asked for sleep): %r", text)
                 return
             await self._speak_announcement(text)
         except asyncio.CancelledError:
@@ -779,6 +799,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def _speak_announcement(self, text: str) -> None:
         """Surface an announcement to the UI and have the voice read it verbatim."""
+        if self.wake_gate.enabled and not self.wake_session.awake:
+            # Sleep landed between scheduling and speaking; hold the text for
+            # the next wake instead of talking into a sleeping session.
+            self._pending_announcements.append(text)
+            return
         await self._cancel_in_flight_response()
         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": text}))
         if self.connection:
@@ -1211,7 +1236,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         await self._play_chime(ascending=True)
         self._queue_antenna_cue(awake=True)
 
-        # Deliver announcements that arrived while asleep and woke us up.
+        # A real wake restores announce-wake behavior after a spoken sleep.
+        self._announce_wake_allowed = True
+
+        # Deliver announcements that arrived (or were held) while asleep.
         pending = self._pending_announcements
         self._pending_announcements = []
         for text in pending:
@@ -1220,25 +1248,35 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def _transition_to_sleep(self, reason: str) -> None:
         """Close the streaming window; audio stays on the robot again."""
+        user_requested = reason in ("local sleep phrase", "sleep phrase")
         self.wake_gate.sleep()
         self._sleep_pending = False
         logger.info("Going to sleep (%s): audio stays local until the wake word", reason)
+
+        # A spoken sleep command wins permanently: announcements queue but must
+        # not wake the robot until the next real wake. Timeout sleeps keep the
+        # ambient announce-wake behavior.
+        if user_requested:
+            self._announce_wake_allowed = False
 
         # Release the listening freeze: once asleep no audio reaches OpenAI, so
         # server VAD can never deliver the speech_stopped that normally undoes
         # speech_started's freeze (frozen antennas, suppressed breathing).
         self.deps.movement_manager.set_listening(False)
 
-        # Stop any in-flight answer (e.g. the auto-response to "go to sleep").
-        if self.connection:
-            try:
-                await self.connection.response.cancel()
-            except Exception as e:
-                logger.debug("No active response to cancel on sleep: %s", e)
-            try:
-                await self.connection.input_audio_buffer.clear()
-            except Exception as e:
-                logger.debug("Could not clear input buffer on sleep: %s", e)
+        # Stop any in-flight answer (e.g. the auto-response to "go to sleep"),
+        # and drop everything queued behind it: sleep must silence queued
+        # responses and pending UI partials, not just the response playing now.
+        await self._cancel_in_flight_response()
+        self._reset_per_session_response_state()
+        self._partial_debouncer.cancel()
+
+        # Sleep means silence: abandon running background tools. Their results
+        # (including the cancellation errors) are dropped by
+        # _handle_tool_result's asleep gate.
+        for tool in self.tool_manager.get_running_tools():
+            await self.tool_manager.cancel_tool(tool.id)
+
         # fastrtc's StreamHandlerBase declares _clear_queue as an Optional
         # callback; console.LocalStream installs it.
         if self._clear_queue is not None:

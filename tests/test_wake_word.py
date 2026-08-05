@@ -219,3 +219,10 @@ def test_wake_detector_error_none_when_remote_configured():
         }
     )
     assert wake_detector_error(config) is None
+
+
+def test_wake_session_sleep_requested_property():
+    session = WakeSession()
+    assert not session.sleep_requested
+    session.request_sleep()
+    assert session.sleep_requested
