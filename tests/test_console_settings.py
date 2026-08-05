@@ -306,3 +306,27 @@ def test_wake_config_still_validates_provided_url(tmp_path, monkeypatch):
     )
     assert resp.status_code == 400
     assert resp.json()["error"] == "invalid_remote_url"
+
+
+def test_hermes_config_persists_values(tmp_path, monkeypatch):
+    monkeypatch.delenv("BOBE_HERMES_URL", raising=False)
+    monkeypatch.delenv("BOBE_HERMES_API_KEY", raising=False)
+    client, _ = _settings_client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/hermes-config",
+        json={"url": "http://mac.test:8642/v1/", "api_key": "hermes-key"},
+    )
+
+    assert response.json()["ok"] is True
+    env_text = (tmp_path / ".env").read_text()
+    assert "BOBE_HERMES_URL=http://mac.test:8642/v1" in env_text
+    assert "BOBE_HERMES_API_KEY=hermes-key" in env_text
+    assert os.environ["BOBE_HERMES_URL"] == "http://mac.test:8642/v1"
+
+
+def test_hermes_config_rejects_bad_input(tmp_path, monkeypatch):
+    client, _ = _settings_client(tmp_path, monkeypatch)
+
+    assert client.post("/hermes-config", json={"url": "mac:8642", "api_key": "k"}).status_code == 400
+    assert client.post("/hermes-config", json={"url": "http://mac:8642", "api_key": " "}).status_code == 400

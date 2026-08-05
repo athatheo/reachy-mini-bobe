@@ -15,7 +15,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.staticfiles import StaticFiles
 
 from bobe.config import config
-from bobe.env_file import persist_api_settings, is_plausible_openai_key
+from bobe.env_file import (
+    ENV_FILE_LOCK,
+    read_env_lines,
+    upsert_env_keys,
+    write_env_lines,
+    persist_api_settings,
+    is_plausible_openai_key,
+)
 from bobe.wake_env import persist_wake_env, is_wake_remote_host_allowed
 from bobe.wake.phrases import WAKE_PHRASE
 from bobe.openai_realtime import OpenaiRealtimeHandler
@@ -45,6 +52,13 @@ class WakeConfigPayload(BaseModel):
     remote_url: str | None = None
     token: str
     gain: float | None = None
+
+
+class HermesConfigPayload(BaseModel):
+    """POST /hermes-config payload."""
+
+    url: str
+    api_key: str
 
 
 _settings_server: SettingsUIServer | None = None
@@ -165,6 +179,30 @@ class SettingsUIServer:
                 logger.warning("Failed to persist wake config: %s", exc)
                 return JSONResponse({"ok": False, "error": "persist_failed"}, status_code=500)
             return JSONResponse({"ok": True, "env_path": str(env_path), "restart_required": True})
+
+        @app.post("/hermes-config")
+        def _hermes_config(payload: Annotated[HermesConfigPayload, Body()]) -> JSONResponse:
+            url = (payload.url or "").strip().rstrip("/")
+            api_key = (payload.api_key or "").strip()
+            if not url.startswith(("http://", "https://")):
+                return JSONResponse({"ok": False, "error": "invalid_url"}, status_code=400)
+            if not api_key:
+                return JSONResponse({"ok": False, "error": "missing_api_key"}, status_code=400)
+            if self.instance_path is None:
+                return JSONResponse({"ok": False, "error": "missing_instance_path"}, status_code=500)
+
+            # ask_hermes reads these at call time, so no app restart is needed.
+            values = {"BOBE_HERMES_URL": url, "BOBE_HERMES_API_KEY": api_key}
+            os.environ.update(values)
+            try:
+                env_path = Path(self.instance_path) / ".env"
+                with ENV_FILE_LOCK:
+                    lines = upsert_env_keys(read_env_lines(env_path), values)
+                    write_env_lines(env_path, lines)
+            except Exception as exc:
+                logger.warning("Failed to persist Hermes config: %s", exc)
+                return JSONResponse({"ok": False, "error": "persist_failed"}, status_code=500)
+            return JSONResponse({"ok": True, "env_path": str(env_path)})
 
         @app.post("/api_keys")
         def _set_api_keys(payload: Annotated[ApiSettingsPayload, Body()]) -> JSONResponse:
