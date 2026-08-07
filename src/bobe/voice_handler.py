@@ -16,7 +16,7 @@ backend"). The fastrtc ``AsyncStreamHandler`` contract (receive/emit) is kept
 so both the Gradio stream and the headless ``LocalStream`` drive it unchanged.
 """
 
-import time
+import json
 import base64
 import asyncio
 import logging
@@ -35,7 +35,7 @@ from bobe.wake_word import (
     AudioRingBuffer,
     create_wake_detector,
 )
-from bobe.tools.core_tools import ToolDependencies
+from bobe.tools.core_tools import ToolDependencies, dispatch_tool_call
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ class BobeVoiceHandler(AsyncStreamHandler):
         self._announce_tasks: set[asyncio.Task[None]] = set()
         self._pending_announcements: list[str] = []
         self._pending_speech: list[Tuple[NDArray[np.int16], int]] = []
+        self._pending_emotes: list[str] = []
         # A spoken "go to sleep" flips this off so announcements queue without
         # waking the robot; any real wake flips it back on.
         self._announce_wake_allowed: bool = True
@@ -201,6 +202,10 @@ class BobeVoiceHandler(AsyncStreamHandler):
         self._pending_announcements = []
         for text in pending:
             await self._speak_announcement(text)
+        pending_emotes = self._pending_emotes
+        self._pending_emotes = []
+        for emotion in pending_emotes:
+            await self._handle_emote(emotion)
         pending_speech = self._pending_speech
         self._pending_speech = []
         for pcm, rate in pending_speech:
@@ -295,6 +300,34 @@ class BobeVoiceHandler(AsyncStreamHandler):
         except Exception:
             logger.exception("Speech clip handling failed")
 
+    def _start_emote(self, emotion: str) -> None:
+        """Play a Hermes-requested emotion move without stalling the mic loop."""
+        if self._shutdown_requested:
+            return
+        task = asyncio.create_task(self._handle_emote(emotion), name="emote")
+        self._announce_tasks.add(task)
+        task.add_done_callback(self._announce_tasks.discard)
+
+    async def _handle_emote(self, emotion: str) -> None:
+        """Queue the emotion move; asleep emotes park until the next wake.
+
+        Emotes normally accompany a spoken reply, so the parked emote plays
+        right when the reply's speech clip wakes the robot.
+        """
+        try:
+            if self.wake_gate.enabled and not self.wake_session.awake:
+                self._pending_emotes.append(emotion)
+                return
+            result = await dispatch_tool_call("play_emotion", json.dumps({"emotion": emotion}), self.deps)
+            if isinstance(result, dict) and result.get("error"):
+                logger.warning("Emote %r failed: %s", emotion, result["error"])
+            else:
+                logger.info("Emote queued: %r", emotion)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Emote handling failed")
+
     async def _play_speech_clip(self, pcm: NDArray[np.int16], rate: int) -> None:
         """Queue a PCM clip for the speaker at (near) real-time pace.
 
@@ -375,6 +408,8 @@ class BobeVoiceHandler(AsyncStreamHandler):
             self._start_announcement(announcement)
         for speech_pcm, speech_rate in self.wake_gate.drain_speech():
             self._start_speech_clip(speech_pcm, speech_rate)
+        for emotion in self.wake_gate.drain_emotes():
+            self._start_emote(emotion)
 
         self.wake_gate.feed(audio_frame, input_sample_rate)
 
@@ -406,12 +441,3 @@ class BobeVoiceHandler(AsyncStreamHandler):
                 self.output_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-
-
-# Backward-compatible alias: external callers (tests, settings) may still
-# reference the old class name during the transition.
-OpenaiRealtimeHandler = BobeVoiceHandler
-
-
-# time is still exported for tests that monkeypatch pacing clocks.
-_ = time

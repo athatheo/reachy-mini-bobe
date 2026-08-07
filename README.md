@@ -18,54 +18,48 @@ BoBe is a Reachy Mini assistant foundation. It starts from Pollen Robotics' offi
 ## Current milestone
 
 - Remote wake word: say `Hey Bobe` to wake BoBe (Mac-side Whisper daemon; robot streams PCM while asleep).
-- Voice input/output uses the official Reachy Mini conversation app pipeline; the realtime model answers questions directly.
-- Hermes integration: the `ask_hermes` tool forwards personal-agent requests to Hermes on the Mac, and Hermes can push spoken announcements to the robot (see below).
-- Expressive robot responses use the existing Reachy Mini motion tools, including `play_emotion`, `move_head`, and `sweep_look`.
+- Conversations run entirely through [Hermes](https://github.com/NousResearch/hermes-agent): the wake daemon's converse mode transcribes utterances locally, the Hermes agent answers, and its TTS reply audio plays through the robot's speaker. No cloud realtime-speech API is involved.
+- Hermes can push spoken announcements and TTS clips to the robot ("send it to bobe", cron `deliver=bobe`).
+- Expressive robot motion via the Reachy Mini motion tools (`play_emotion`, `move_head`, `sweep_look`).
 
 ## Privacy model
 
-- While asleep, microphone PCM streams from the robot to a Mac-side wake daemon over WebSocket. A short in-memory ring buffer on the robot is continuously discarded; nothing goes to OpenAI until wake.
-- Saying `Hey Bobe` opens a streaming window (chime + antennas up). During that window audio streams to OpenAI Realtime for transcription and speech, like any cloud voice assistant.
+- While asleep, microphone PCM streams from the robot to a Mac-side wake daemon over WebSocket; the daemon listens for the wake phrase with local Whisper. Audio never leaves the LAN.
+- Saying `Hey Bobe` opens a conversation window (chime + antennas up). Awake audio still only reaches the Mac daemon; utterance *transcripts* go to your Hermes agent, whose configured LLM/TTS providers may be cloud services.
 - The window closes (chime + antennas relaxed) when you say `go to sleep` (or Greek `κοιμήσου`) or after `BOBE_WAKE_TIMEOUT_S` (default 300s) without session activity.
-- Tune with `BOBE_WAKE_REMOTE_URL`, `BOBE_WAKE_TOKEN`, `BOBE_WAKE_GAIN`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_WAKE_PHRASE`, `BOBE_SLEEP_PHRASE`. Wake-word gating is always on: say the wake phrase to stream, `go to sleep` to stop.
+- Tune with `BOBE_WAKE_REMOTE_URL`, `BOBE_WAKE_TOKEN`, `BOBE_WAKE_GAIN`, `BOBE_WAKE_TIMEOUT_S`, `BOBE_WAKE_PHRASE`, `BOBE_SLEEP_PHRASE`.
 
 ## Configuration
 
 Copy `.env.example` to `.env` for local development and set the keys you need:
 
 ```env
-OPENAI_API_KEY=
 BOBE_WAKE_BACKEND=remote
 BOBE_WAKE_REMOTE_URL=ws://Mac.local:8765/v1/stream
 BOBE_WAKE_TOKEN=
-# Optional: Hermes personal-agent integration (see "Hermes integration")
+# Hermes personal-agent integration (see "Hermes integration")
 BOBE_HERMES_URL=http://192.168.1.172:8642/v1
 BOBE_HERMES_API_KEY=
 ```
 
-The OpenAI key is used by the inherited realtime speech bridge.
-
 ## Hermes integration
 
-BoBe connects two ways to [Hermes](https://github.com/NousResearch/hermes-agent)-style personal agents running on the Mac:
+Hermes **is** BoBe's voice pipeline (requires Hermes ≥ 0.20.0 with the
+`integrations/hermes-bobe-plugin/` installed on the Mac):
 
-- **Voice → Hermes**: the `ask_hermes` profile tool sends requests straight to Hermes's OpenAI-compatible API server and speaks the answer. The realtime model decides when to delegate (tasks, messages, kanban, "ask Hermes …").
-- **Hermes → BoBe**: the wake daemon exposes `POST /v1/announce` (authenticated with `BOBE_WAKE_TOKEN`); messages are relayed over the robot's existing wake WebSocket and spoken aloud — the robot wakes first if asleep. A Hermes platform plugin in `integrations/hermes-bobe-plugin/` registers `bobe` as a delivery channel ("send it to bobe", cron `deliver=bobe`).
+- **Voice → Hermes**: while awake the robot streams mic PCM to the Mac wake
+  daemon, whose **converse mode** segments utterances with local Whisper and
+  hands the transcripts to the Hermes `bobe` platform plugin
+  (`GET /v1/utterances` long-poll). Hermes answers as the full agent (tools,
+  kanban, memory).
+- **Hermes → BoBe**: reply audio (auto-TTS) is POSTed to the daemon's
+  `POST /v1/speak`, decoded to PCM, and played through the robot's speaker
+  with head-wobble sync. Plain-text pushes go to `POST /v1/announce` and are
+  synthesized by the plugin when possible. The robot wakes first if asleep.
 
-### Hermes voice backend (no OpenAI Realtime)
-
-Set `BOBE_VOICE_BACKEND=hermes` (robot instance `.env`, or `voice_backend` in a
-`POST /wake-config`) to run conversations entirely through Hermes instead of
-OpenAI Realtime. While awake the robot keeps streaming mic PCM to the Mac wake
-daemon, whose **converse mode** segments utterances with Whisper and hands the
-transcripts to the Hermes `bobe` platform plugin (`GET /v1/utterances`
-long-poll). Hermes answers as the full agent; its TTS reply audio is POSTed to
-the daemon's `/v1/speak`, decoded to PCM, and played through the robot's
-speaker (with head-wobble sync). Sleep phrases and the inactivity timeout work
-exactly as in openai mode; turn-taking is half-duplex (the daemon pauses
-capture while a reply plays — there is no echo cancellation). Requires Hermes
-≥ 0.20.0 with the updated `integrations/hermes-bobe-plugin/`. Robot-motion
-voice commands (`play_emotion`, dances) are currently openai-mode only.
+Turn-taking is half-duplex: the daemon pauses capture while a reply plays
+(there is no echo cancellation). Sleep phrases and the inactivity timeout
+behave the same asleep and awake.
 
 Setup:
 

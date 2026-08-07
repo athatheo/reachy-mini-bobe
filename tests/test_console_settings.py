@@ -8,7 +8,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from bobe.config import config
-from bobe.console import LocalStream
 from bobe.env_file import (
     read_env_lines,
     parse_env_lines,
@@ -129,16 +128,6 @@ def test_concurrent_api_and_wake_persist_keep_both_key_sets(tmp_path, monkeypatc
     assert "BOBE_WAKE_REMOTE_URL=ws://192.168.1.114:8765/v1/stream" in env_text
 
 
-def test_required_api_keys_configured_requires_openai_key(monkeypatch):
-    stream = LocalStream(SimpleNamespace(), SimpleNamespace())
-
-    monkeypatch.setattr(config, "OPENAI_API_KEY", None)
-    assert not stream._required_api_keys_configured()
-
-    monkeypatch.setattr(config, "OPENAI_API_KEY", "sk-proj-test-openai-key")
-    assert stream._required_api_keys_configured()
-
-
 def test_api_key_shape_validation_rejects_dummy_values():
     assert not is_plausible_openai_key("x")
     assert is_plausible_openai_key("sk-proj-test-openai-key")
@@ -206,7 +195,7 @@ def test_status_includes_wake_debug_with_api_keys(tmp_path, monkeypatch):
 def test_status_reports_wake_error_when_gating_disabled(tmp_path, monkeypatch):
     from unittest.mock import MagicMock
 
-    from bobe.openai_realtime import OpenaiRealtimeHandler
+    from bobe.voice_handler import BobeVoiceHandler
     from bobe.tools.core_tools import ToolDependencies
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -215,7 +204,7 @@ def test_status_reports_wake_error_when_gating_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "OPENAI_API_KEY", None)
 
     deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
-    handler = OpenaiRealtimeHandler(deps)
+    handler = BobeVoiceHandler(deps)
     app = FastAPI()
     SettingsUIServer(str(tmp_path), lambda: handler).mount(app)
     client = TestClient(app)

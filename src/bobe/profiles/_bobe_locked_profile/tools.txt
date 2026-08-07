@@ -1,7 +1,6 @@
-# BoBe's enabled tools.
-# `ask_hermes` reaches the user's Hermes agent; motion tools add expression.
+# BoBe's enabled tools. Conversations run through Hermes directly (the wake
+# daemon's converse mode); motion tools add expression via the emote lane.
 
-ask_hermes
 play_emotion
 stop_emotion
 move_head

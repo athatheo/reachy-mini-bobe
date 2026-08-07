@@ -133,15 +133,15 @@ else:
 class Config:
     """Configuration class for the conversation app."""
 
-    # Required
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # The key is downloaded in console.py if needed
+    # Optional: only used by settings-UI authentication gating (voice runs
+    # through Hermes; no OpenAI client exists in the app).
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
     # Optional. HF_TOKEN is read directly from the environment by huggingface_hub.
-    MODEL_NAME = os.getenv("MODEL_NAME", "gpt-realtime-2.1")
     HF_HOME = os.getenv("HF_HOME", "./cache")
     LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
 
-    logger.debug(f"Model: {MODEL_NAME}, HF_HOME: {HF_HOME}, Vision Model: {LOCAL_VISION_MODEL}")
+    logger.debug(f"HF_HOME: {HF_HOME}, Vision Model: {LOCAL_VISION_MODEL}")
 
     _profiles_directory_env = os.getenv("REACHY_MINI_EXTERNAL_PROFILES_DIRECTORY")
     PROFILES_DIRECTORY = (

@@ -26,6 +26,21 @@ TRANSCRIPT_HISTORY_MAX = 30
 ListenMode = Literal["wake", "sleep", "converse"]
 
 
+# Whisper's classic hallucinations on silence/noise. Deliberately short and
+# conservative: real one-word commands ("yes", "no", "stop") must pass.
+_JUNK_UTTERANCES = frozenset(
+    {"you", "the", "uh", "um", "hmm", "mm", "bye", "thank you", "thanks", "thank you for watching"}
+)
+
+
+def is_junk_utterance(transcript: str) -> bool:
+    """Return True for transcripts that are almost certainly noise, not speech."""
+    cleaned = "".join(ch for ch in transcript if ch.isalnum() or ch.isspace()).strip().casefold()
+    if len(cleaned) < 2:
+        return True
+    return cleaned in _JUNK_UTTERANCES
+
+
 def warn_if_phrases_unsupported(
     config: WakeDaemonConfig,
     sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
@@ -319,6 +334,12 @@ class WhisperWakeSession:
             if matches_sleep_command(transcript, self._sleep_phrases):
                 # The sleep already fired from a partial (refractory) — the
                 # finalized tail must not reach the agent as an utterance.
+                return None
+            if is_junk_utterance(transcript):
+                # Whisper hallucinates short tokens on ambient noise (". . .",
+                # "You", "Thank you."); answering them aloud creates a
+                # feedback loop that keeps the robot awake indefinitely.
+                logger.info("Dropped junk utterance (transcript=%r)", transcript)
                 return None
             logger.info("Utterance captured (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
             return {

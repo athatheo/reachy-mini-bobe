@@ -31,6 +31,7 @@ and anything the robot hears in converse mode reaches the agent.
 # close to the upstream ntfy plugin's shape rather than this repo's docstyle.
 
 import os
+import re
 import time
 import asyncio
 import logging
@@ -65,6 +66,10 @@ POLL_AUTH_BACKOFF_S = 60.0
 TTS_TEXT_SUPPRESS_S = 5.0
 # The robot is a single implicit channel.
 ROBOT_CHAT_ID = "robot"
+# Optional expression tag the agent may put at the START of a bobe reply, e.g.
+# "[emotion:amazed1] That is wonderful news!". Stripped before TTS/announce
+# and forwarded to the robot's motion system.
+EMOTION_TAG_RE = re.compile(r"^\s*\[emotion:\s*([a-z0-9_-]+)\s*\]\s*", re.IGNORECASE)
 
 
 def _announce_url(extra: Dict[str, Any]) -> str:
@@ -127,6 +132,8 @@ class BobeAdapter(BasePlatformAdapter):
         self._token = _wake_token(extra)
         self._poll_task: Optional[asyncio.Task] = None
         self._suppress_text_until = 0.0
+        self._emote_url = _daemon_endpoint(self._url, "emote")
+        self._pending_emotion: Optional[str] = None
 
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """Robot conversations are voice-first: always answer VOICE with TTS.
@@ -218,6 +225,35 @@ class BobeAdapter(BasePlatformAdapter):
     # Outbound: agent replies -> robot
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _split_emotion_tag(content: str) -> tuple[Optional[str], str]:
+        """Return (emotion, text-without-tag) for a leading [emotion:NAME] tag."""
+        match = EMOTION_TAG_RE.match(content or "")
+        if not match:
+            return None, content
+        return match.group(1).lower(), content[match.end():]
+
+    def prepare_tts_text(self, text: str) -> str:
+        """Strip a leading emotion tag (stashing it for play_tts) before TTS."""
+        emotion, stripped = self._split_emotion_tag(text)
+        if emotion:
+            self._pending_emotion = emotion
+        return super().prepare_tts_text(stripped)
+
+    async def _post_emote(self, emotion: str) -> None:
+        """Best-effort relay of an emotion move to the robot."""
+        try:
+            async with httpx.AsyncClient(timeout=SEND_TIMEOUT_S) as client:
+                resp = await client.post(
+                    self._emote_url,
+                    json={"emotion": emotion},
+                    headers={"X-BoBe-Wake-Token": self._token},
+                )
+            if resp.status_code >= 300:
+                logger.warning("[%s] Emote %r not delivered (HTTP %s)", self.name, emotion, resp.status_code)
+        except Exception as exc:
+            logger.warning("[%s] Emote %r not delivered: %s", self.name, emotion, exc)
+
     async def send(
         self,
         chat_id: str,
@@ -237,6 +273,11 @@ class BobeAdapter(BasePlatformAdapter):
         if time.monotonic() < self._suppress_text_until:
             logger.debug("[%s] Suppressing text echo after TTS delivery", self.name)
             return SendResult(success=True, message_id="bobe-tts-audio")
+        emotion, content = self._split_emotion_tag(content)
+        if emotion:
+            await self._post_emote(emotion)
+        if not content.strip():
+            return SendResult(success=True, message_id="bobe-emote-only")
         tts_result = await self._synthesize_and_speak(content)
         if tts_result is not None and tts_result.success:
             return tts_result
@@ -318,6 +359,9 @@ class BobeAdapter(BasePlatformAdapter):
 
     async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
         """Deliver auto-TTS reply audio straight to the robot's speaker."""
+        emotion, self._pending_emotion = self._pending_emotion, None
+        if emotion:
+            await self._post_emote(emotion)
         result = await self._post_speech(audio_path)
         if result.success:
             self._suppress_text_until = time.monotonic() + TTS_TEXT_SUPPRESS_S
@@ -385,6 +429,14 @@ def register(ctx) -> None:
             "Messages to bobe are spoken aloud by a home robot, and voice "
             "questions heard by the robot arrive from this channel. "
             "Write short, plain spoken sentences — no markdown, no links, "
-            "no code, nothing sensitive."
+            "no code, nothing sensitive. OPTIONAL expression: you may start "
+            "a reply with ONE tag like [emotion:amazed1] and the robot will "
+            "perform that motion while speaking. Use it sparingly — only "
+            "when the moment clearly calls for it (great news, a blunder, "
+            "a warm greeting); most replies should have NO tag. Available: "
+            "welcoming1 (greeting), loving1 (affection), amazed1 (wow), "
+            "surprised1, thoughtful2 (pondering), understanding1 (nod), "
+            "proud3 (success cheer), success1, oops1 (blunder), sad1, "
+            "no1 (firm no), enthusiastic2 (good news)."
         ),
     )

@@ -500,3 +500,17 @@ def test_remote_client_evicts_stale_speak_buffers(monkeypatch):
 
     assert "stale" not in client._speak_buffers
     assert len(received) == 1
+
+
+def test_remote_client_dispatches_emotes():
+    received = []
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://mac:8765/v1/stream",
+        on_emote=received.append,
+    )
+
+    client._handle_emote_payload({"type": "emote", "emotion": "amazed1"})
+    client._handle_emote_payload({"type": "emote", "emotion": "  "})
+
+    assert received == ["amazed1"]

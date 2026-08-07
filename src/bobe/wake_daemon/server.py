@@ -23,6 +23,7 @@ from bobe.wake.protocol import (
     CLOSE_UNSUPPORTED_DATA,
     parse_json,
     wake_message,
+    emote_message,
     ready_message,
     sleep_message,
     speak_message,
@@ -208,6 +209,35 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         app.state.speak_suppress_until = time.monotonic() + seconds + 2.0
         logger.info("Relayed speech clip %s (%.1fs) to %d robot stream(s)", clip_id, seconds, delivered)
         return JSONResponse({"ok": True, "delivered": delivered, "seconds": seconds})
+
+    @app.post("/v1/emote")
+    async def emote(request: Request) -> JSONResponse:
+        """Relay an emotion-move request (from the Hermes plugin) to the robot."""
+        provided_token = (request.headers.get("x-bobe-wake-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, runtime.token or ""):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        emotion = str(payload.get("emotion") or "").strip() if isinstance(payload, dict) else ""
+        if not emotion:
+            return JSONResponse({"ok": False, "error": "empty_emotion"}, status_code=400)
+
+        connections = list(app.state.stream_connections)
+        if not connections:
+            return JSONResponse({"ok": False, "error": "no_robot_connected"}, status_code=409)
+        delivered = 0
+        for connection in connections:
+            try:
+                await connection.send_json(emote_message(emotion=emotion))
+                delivered += 1
+            except Exception:
+                logger.warning("Failed to deliver emote to a robot stream", exc_info=True)
+        if delivered == 0:
+            return JSONResponse({"ok": False, "error": "delivery_failed"}, status_code=502)
+        logger.info("Relayed emote %r to %d robot stream(s)", emotion, delivered)
+        return JSONResponse({"ok": True, "delivered": delivered})
 
     @app.get("/v1/utterances")
     async def utterances(request: Request) -> JSONResponse:

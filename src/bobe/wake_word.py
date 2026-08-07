@@ -1,10 +1,9 @@
 """Wake-word session gating for BoBe.
 
-While asleep, microphone audio stays on the robot and is streamed to the Mac
-wake daemon (Whisper), which listens for the wake phrase. Nothing is sent to
-OpenAI until wake. After wake, audio streams to the realtime backend and the
-daemon switches to sleep-phrase detection until timeout, local sleep, or the
-OpenAI transcript fallback.
+Microphone audio streams to the Mac wake daemon (Whisper) in every state.
+While asleep the daemon listens only for the wake phrase; after wake it
+switches to converse mode — capturing utterances for the Hermes agent and
+watching for sleep phrases — until timeout or a spoken sleep command.
 """
 
 from __future__ import annotations
@@ -234,6 +233,7 @@ def create_wake_detector(
     on_sleep: Callable[[], None] | None = None,
     on_announce: Callable[[str], None] | None = None,
     on_speech: Callable[[NDArray[np.int16], int], None] | None = None,
+    on_emote: Callable[[str], None] | None = None,
 ) -> RemoteWakeClient | None:
     """Instantiate the configured wake-word backend."""
     error = wake_detector_error(config)
@@ -251,6 +251,7 @@ def create_wake_detector(
         on_sleep=on_sleep,
         on_announce=on_announce,
         on_speak=on_speech,
+        on_emote=on_emote,
         sleep_phrases=config.sleep_phrases,
     )
 
@@ -294,6 +295,7 @@ class WakeGate:
         self._announce_lock = threading.Lock()
         self._announcements: list[str] = []
         self._speech_clips: list[tuple[NDArray[np.int16], int]] = []
+        self._emotes: list[str] = []
         detector_kwargs: dict[str, Any] = {
             "on_wake": self.session.request_wake,
             "config": self.config,
@@ -301,7 +303,11 @@ class WakeGate:
             "on_announce": self.request_announce,
         }
         try:
-            self.detector = detector_factory(on_speech=self.request_speech, **detector_kwargs)
+            self.detector = detector_factory(
+                on_speech=self.request_speech,
+                on_emote=self.request_emote,
+                **detector_kwargs,
+            )
         except TypeError:
             # Older factories/test stubs predate the speech downlink.
             self.detector = detector_factory(**detector_kwargs)
@@ -357,6 +363,20 @@ class WakeGate:
         with self._announce_lock:
             pending = self._speech_clips
             self._speech_clips = []
+        return pending
+
+    def request_emote(self, emotion: str) -> None:
+        """Queue an emotion move (thread-safe; called from the detector thread)."""
+        if not emotion:
+            return
+        with self._announce_lock:
+            self._emotes.append(emotion)
+
+    def drain_emotes(self) -> list[str]:
+        """Return and clear queued emotion moves (consumed by the mic loop)."""
+        with self._announce_lock:
+            pending = self._emotes
+            self._emotes = []
         return pending
 
     def feed(self, audio_frame: NDArray[Any], input_sample_rate: int) -> None:

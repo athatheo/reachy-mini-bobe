@@ -1,7 +1,6 @@
 import os
 
 import bobe.config as config_mod
-from bobe.config import config
 from bobe.instance import load_instance_env, _migrate_legacy_env, resolve_instance_path
 
 
@@ -35,7 +34,6 @@ def test_load_instance_env_never_erases_live_values_with_empty_lines(tmp_path, m
     monkeypatch.setenv("BOBE_WAKE_TOKEN", "live-token")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("MODEL_NAME", "old-model")
-    monkeypatch.setattr(config, "MODEL_NAME", "old-model")
 
     env_path = load_instance_env(tmp_path)
 
@@ -44,7 +42,6 @@ def test_load_instance_env_never_erases_live_values_with_empty_lines(tmp_path, m
     assert "OPENAI_API_KEY" not in os.environ
     # Non-empty persisted values still override the process environment.
     assert os.environ["MODEL_NAME"] == "test-model"
-    assert config.MODEL_NAME == "test-model"
 
 
 def test_env_layering_repo_env_fills_gaps_then_instance_env_overrides(tmp_path, monkeypatch):

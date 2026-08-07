@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional
 import gradio as gr
 from fastapi import FastAPI
 from fastrtc import Stream
-from gradio.utils import get_space
 
 from reachy_mini import ReachyMini, ReachyMiniApp
 from bobe.utils import (
@@ -63,7 +62,7 @@ def run(
     # Putting these dependencies here makes the dashboard faster to load when the conversation app is installed
     from bobe.moves import MovementManager
     from bobe.console import LocalStream
-    from bobe.openai_realtime import OpenaiRealtimeHandler
+    from bobe.voice_handler import BobeVoiceHandler
     from bobe.tools.core_tools import ToolDependencies
     from bobe.audio.head_wobbler import HeadWobbler
 
@@ -143,33 +142,18 @@ def run(
         resizable=True,
     )
 
-    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+    handler = BobeVoiceHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
     if handler_box is not None:
         handler_box[0] = handler
 
     stream_manager: gr.Blocks | LocalStream | None = None
 
     if args.gradio:
-        api_key_textbox = gr.Textbox(
-            label="OPENAI API Key",
-            type="password",
-            value=os.getenv("OPENAI_API_KEY") if not get_space() else "",
-        )
-
-        from bobe.gradio_personality import PersonalityUI
-
-        personality_ui = PersonalityUI()
-        personality_ui.create_components()
-
         stream = Stream(
             handler=handler,
             mode="send-receive",
             modality="audio",
-            additional_inputs=[
-                chatbot,
-                api_key_textbox,
-                *personality_ui.additional_inputs_ordered(),
-            ],
+            additional_inputs=[chatbot],
             additional_outputs=[chatbot],
             additional_outputs_handler=update_chatbot,
             ui_args={"title": "Talk with Reachy Mini"},
@@ -179,8 +163,6 @@ def run(
             app = FastAPI()
         else:
             app = settings_app
-
-        personality_ui.wire_events(handler, stream_manager)
 
         app = gr.mount_gradio_app(app, stream.ui, path="/")
     else:

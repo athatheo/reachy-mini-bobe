@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 from bobe.wake.phrases import WAKE_PHRASE, DEFAULT_SLEEP_PHRASES, matches_wake_phrase, matches_sleep_command
 from bobe.wake.protocol import (
     MSG_WAKE,
+    MSG_EMOTE,
     MSG_READY,
     MSG_SLEEP,
     MSG_SPEAK,
@@ -70,12 +71,14 @@ class RemoteWakeClient:
         on_sleep: Any | None = None,
         on_announce: Any | None = None,
         on_speak: Any | None = None,
+        on_emote: Any | None = None,
         sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
     ) -> None:
         self._on_wake = on_wake
         self._on_sleep = on_sleep
         self._on_announce = on_announce
         self._on_speak = on_speak
+        self._on_emote = on_emote
         # Partial speech clips being reassembled: id -> (last_chunk_at, rate, chunks).
         self._speak_buffers: dict[str, tuple[float, int, list[NDArray[np.int16]]]] = {}
         self._phrase = phrase.strip().casefold() or WAKE_PHRASE
@@ -465,6 +468,15 @@ class RemoteWakeClient:
         if self._on_announce is not None:
             self._on_announce(text)
 
+    def _handle_emote_payload(self, payload: dict[str, Any]) -> None:
+        emotion = str(payload.get("emotion") or "").strip()
+        if not emotion:
+            return
+        self._log_event("info", f"Emote received: {emotion!r}")
+        logger.info("Remote emote received (emotion=%r)", emotion)
+        if self._on_emote is not None:
+            self._on_emote(emotion)
+
     def _evict_stale_speak_buffers(self, now: float) -> None:
         stale = [
             clip_id
@@ -549,3 +561,5 @@ class RemoteWakeClient:
                 self._handle_announce_payload(payload)
             elif msg_type == MSG_SPEAK:
                 self._handle_speak_payload(payload)
+            elif msg_type == MSG_EMOTE:
+                self._handle_emote_payload(payload)

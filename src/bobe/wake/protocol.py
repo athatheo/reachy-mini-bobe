@@ -21,6 +21,7 @@ MSG_STATS = "stats"
 MSG_LISTEN = "listen"
 MSG_ANNOUNCE = "announce"
 MSG_SPEAK = "speak"
+MSG_EMOTE = "emote"
 
 # WebSocket close codes used by the daemon handshake (RFC 6455).
 CLOSE_UNSUPPORTED_DATA = 1003
@@ -80,6 +81,14 @@ def announce_message(*, text: str) -> dict[str, Any]:
     return {
         "type": MSG_ANNOUNCE,
         "text": text,
+    }
+
+
+def emote_message(*, emotion: str) -> dict[str, Any]:
+    """Build a daemon-to-robot request to play a recorded emotion move."""
+    return {
+        "type": MSG_EMOTE,
+        "emotion": emotion,
     }
 
 

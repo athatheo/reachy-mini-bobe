@@ -73,7 +73,4 @@ def load_instance_env(instance_path: Path | str | None) -> Path | None:
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     if openai_key:
         config.OPENAI_API_KEY = openai_key
-    model_name = os.getenv("MODEL_NAME", "").strip()
-    if model_name:
-        config.MODEL_NAME = model_name
     return env_path

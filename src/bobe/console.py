@@ -1,12 +1,4 @@
-"""Bidirectional local audio stream for headless (no Gradio) mode.
-
-If required API keys are not available via environment/.env, launch() waits
-until non-technical users enter them through the settings page that
-``bootstrap_settings_ui`` (called from the Reachy Mini Apps entrypoint in
-``bobe.main``) mounts on the apps settings server before the voice handler
-starts. Keys are persisted to the app instance's private ``.env`` file when
-available.
-"""
+"""Bidirectional local audio stream for headless (no Gradio) mode."""
 
 import time
 import asyncio
@@ -19,9 +11,7 @@ from scipy.signal import resample
 
 from reachy_mini import ReachyMini
 from reachy_mini.media.media_manager import MediaBackend
-from bobe.config import config
-from bobe.env_file import is_plausible_openai_key
-from bobe.openai_realtime import OpenaiRealtimeHandler
+from bobe.voice_handler import BobeVoiceHandler
 
 
 logger = logging.getLogger(__name__)
@@ -32,7 +22,7 @@ class LocalStream:
 
     def __init__(
         self,
-        handler: OpenaiRealtimeHandler,
+        handler: BobeVoiceHandler,
         robot: ReachyMini,
     ):
         """Initialize the stream with an OpenAI realtime handler and pipelines."""
@@ -48,53 +38,12 @@ class LocalStream:
         # lands before the asyncio loop exists is never lost.
         self._close_requested = threading.Event()
 
-    def _required_api_keys_configured(self) -> bool:
-        """Return whether all explicit user-provided keys are configured."""
-        if getattr(self.handler, "voice_backend", "openai") == "hermes":
-            # The Hermes backend talks only to the LAN wake daemon; no OpenAI
-            # key is required to start conversing.
-            return True
-        return is_plausible_openai_key(str(config.OPENAI_API_KEY or ""))
-
     def launch(self) -> None:
-        """Start the recorder/player and run the async processing loops.
-
-        If the OpenAI key is missing, wait for the user to provide it via the
-        settings UI (mounted by ``bobe.main``) before starting streams.
-        """
+        """Start the recorder/player and run the async processing loops."""
         if self._close_requested.is_set():
             logger.info("Close already requested; not starting LocalStream.")
             return
 
-        # The instance .env was already loaded by main.run(); config.OPENAI_API_KEY
-        # is kept in sync there and by the settings endpoints.
-
-        # Never auto-download shared/demo keys. Wait for explicit user-provided keys.
-        if not self._required_api_keys_configured():
-            logger.warning(
-                "Required API key missing. Open the app settings page to enter the OpenAI key."
-            )
-            warned_at = time.monotonic()
-            try:
-                while not self._required_api_keys_configured():
-                    if self._close_requested.is_set():
-                        logger.info("Close requested while waiting for API keys.")
-                        return
-                    if time.monotonic() - warned_at >= 30.0:
-                        logger.warning(
-                            "Still waiting for the OpenAI API key in settings (http://<robot>:7860/)."
-                        )
-                        warned_at = time.monotonic()
-                    time.sleep(0.2)
-            except KeyboardInterrupt:
-                logger.info("Interrupted while waiting for API keys.")
-                return
-
-        if self._close_requested.is_set():
-            logger.info("Close requested before media startup; aborting launch.")
-            return
-
-        # Start media after key is set/available
         self._robot.media.start_recording()
         self._robot.media.start_playing()
         time.sleep(1)  # give some time to the pipelines to start

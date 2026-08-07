@@ -25,7 +25,7 @@ from bobe.env_file import (
 )
 from bobe.wake_env import persist_wake_env, is_wake_remote_host_allowed
 from bobe.wake.phrases import WAKE_PHRASE
-from bobe.openai_realtime import OpenaiRealtimeHandler
+from bobe.voice_handler import BobeVoiceHandler
 
 
 logger = logging.getLogger(__name__)
@@ -52,8 +52,6 @@ class WakeConfigPayload(BaseModel):
     remote_url: str | None = None
     token: str
     gain: float | None = None
-    # Optional voice backend switch: "openai" | "hermes" (None keeps current).
-    voice_backend: str | None = None
 
 
 class HermesConfigPayload(BaseModel):
@@ -88,13 +86,13 @@ def _redact_wake_debug_for_public(
 class SettingsUIServer:
     """Registers BoBe settings routes on the Reachy Mini settings app."""
 
-    def __init__(self, instance_path: str | None, get_handler: Callable[[], OpenaiRealtimeHandler | None]) -> None:
+    def __init__(self, instance_path: str | None, get_handler: Callable[[], BobeVoiceHandler | None]) -> None:
         self.instance_path = instance_path
         self._get_handler = get_handler
         self._mounted = False
 
     @property
-    def handler(self) -> OpenaiRealtimeHandler | None:
+    def handler(self) -> BobeVoiceHandler | None:
         return self._get_handler()
 
     def mount(self, app: FastAPI) -> None:
@@ -128,7 +126,6 @@ class SettingsUIServer:
             wake_detector = getattr(handler, "_wake_detector", None) if handler else None
             wake_debug = wake_detector.debug_state() if wake_detector is not None else None
             wake_remote_url = getattr(wake_config, "remote_url", None) if wake_config else None
-            openai_connected = bool(getattr(handler, "connection", None)) if handler else False
             authenticated = has_openai_key
             if not authenticated:
                 wake_debug = _redact_wake_debug_for_public(wake_debug)
@@ -137,8 +134,8 @@ class SettingsUIServer:
                 {
                     "has_key": has_openai_key,
                     "has_openai_key": has_openai_key,
-                    "openai_connected": openai_connected,
-                    "voice_backend": getattr(handler, "voice_backend", "openai") if handler else "openai",
+                    "openai_connected": False,
+                    "voice_backend": "hermes",
                     "wake_enabled": wake_enabled,
                     "wake_error": wake_error,
                     "awake": awake,
@@ -170,11 +167,6 @@ class SettingsUIServer:
                 return JSONResponse({"ok": False, "error": "missing_token"}, status_code=400)
             if self.instance_path is None:
                 return JSONResponse({"ok": False, "error": "missing_instance_path"}, status_code=500)
-            voice_backend: str | None = None
-            if payload.voice_backend is not None:
-                voice_backend = payload.voice_backend.strip().lower()
-                if voice_backend not in ("openai", "hermes"):
-                    return JSONResponse({"ok": False, "error": "invalid_voice_backend"}, status_code=400)
             try:
                 env_path = persist_wake_env(
                     self.instance_path,
@@ -183,11 +175,6 @@ class SettingsUIServer:
                     token=token,
                     gain=max(1.0, float(payload.gain)) if payload.gain is not None else None,
                 )
-                if voice_backend is not None:
-                    os.environ["BOBE_VOICE_BACKEND"] = voice_backend
-                    with ENV_FILE_LOCK:
-                        lines = upsert_env_keys(read_env_lines(env_path), {"BOBE_VOICE_BACKEND": voice_backend})
-                        write_env_lines(env_path, lines)
             except Exception as exc:
                 logger.warning("Failed to persist wake config: %s", exc)
                 return JSONResponse({"ok": False, "error": "persist_failed"}, status_code=500)
@@ -234,7 +221,7 @@ class SettingsUIServer:
 def bootstrap_settings_ui(
     app: FastAPI | None,
     instance_path: str | None,
-    get_handler: Callable[[], OpenaiRealtimeHandler | None],
+    get_handler: Callable[[], BobeVoiceHandler | None],
 ) -> SettingsUIServer | None:
     """Mount settings routes immediately when the Reachy settings server starts."""
     global _settings_server

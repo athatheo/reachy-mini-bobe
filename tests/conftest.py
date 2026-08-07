@@ -29,7 +29,7 @@ def _stub_wake_detector_unless_real(monkeypatch: pytest.MonkeyPatch, request: py
     """Avoid spinning up ONNX wake detectors in handler tests."""
     if request.node.get_closest_marker("wake_detector"):
         return
-    monkeypatch.setattr("bobe.openai_realtime.create_wake_detector", lambda *args, **kwargs: None)
+    monkeypatch.setattr("bobe.voice_handler.create_wake_detector", lambda *args, **kwargs: None)
 
 
 class JsonResponse:

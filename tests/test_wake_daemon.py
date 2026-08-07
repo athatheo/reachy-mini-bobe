@@ -715,3 +715,64 @@ def test_inject_utterance_roundtrip():
     )
     assert got.status_code == 200
     assert [event["text"] for event in got.json()["events"]] == ["ping"]
+
+
+# ---- /v1/emote ----
+
+
+def test_emote_rejects_bad_token():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/emote",
+        headers={"X-BoBe-Wake-Token": "wrong"},
+        json={"emotion": "amazed1"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_emote_requires_emotion_and_robot():
+    client = _announce_client()
+
+    empty = client.post("/v1/emote", headers={"X-BoBe-Wake-Token": "test-token"}, json={})
+    assert empty.status_code == 400
+
+    no_robot = client.post(
+        "/v1/emote", headers={"X-BoBe-Wake-Token": "test-token"}, json={"emotion": "amazed1"}
+    )
+    assert no_robot.status_code == 409
+
+
+def test_emote_relays_to_robot_stream():
+    client = _announce_client()
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+
+        response = client.post(
+            "/v1/emote",
+            headers={"X-BoBe-Wake-Token": "test-token"},
+            json={"emotion": "amazed1"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {"ok": True, "delivered": 1}
+        frame = ws.receive_json()
+
+    assert frame == {"type": "emote", "emotion": "amazed1"}
+
+
+def test_converse_mode_drops_junk_utterances(monkeypatch):
+    from bobe.wake_daemon.engine import is_junk_utterance
+
+    assert is_junk_utterance(". . . . . .")
+    assert is_junk_utterance("You")
+    assert is_junk_utterance("Thank you.")
+    assert not is_junk_utterance("yes")
+    assert not is_junk_utterance("no")
+    assert not is_junk_utterance("stop the music")
+
+    session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: ". . . . . .")
+    session.set_listen_mode("converse")
+    assert _feed_utterance(session, ". . . . . .") is None
