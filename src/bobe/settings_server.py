@@ -52,6 +52,8 @@ class WakeConfigPayload(BaseModel):
     remote_url: str | None = None
     token: str
     gain: float | None = None
+    # Optional voice backend switch: "openai" | "hermes" (None keeps current).
+    voice_backend: str | None = None
 
 
 class HermesConfigPayload(BaseModel):
@@ -136,6 +138,7 @@ class SettingsUIServer:
                     "has_key": has_openai_key,
                     "has_openai_key": has_openai_key,
                     "openai_connected": openai_connected,
+                    "voice_backend": getattr(handler, "voice_backend", "openai") if handler else "openai",
                     "wake_enabled": wake_enabled,
                     "wake_error": wake_error,
                     "awake": awake,
@@ -167,6 +170,11 @@ class SettingsUIServer:
                 return JSONResponse({"ok": False, "error": "missing_token"}, status_code=400)
             if self.instance_path is None:
                 return JSONResponse({"ok": False, "error": "missing_instance_path"}, status_code=500)
+            voice_backend: str | None = None
+            if payload.voice_backend is not None:
+                voice_backend = payload.voice_backend.strip().lower()
+                if voice_backend not in ("openai", "hermes"):
+                    return JSONResponse({"ok": False, "error": "invalid_voice_backend"}, status_code=400)
             try:
                 env_path = persist_wake_env(
                     self.instance_path,
@@ -175,6 +183,11 @@ class SettingsUIServer:
                     token=token,
                     gain=max(1.0, float(payload.gain)) if payload.gain is not None else None,
                 )
+                if voice_backend is not None:
+                    os.environ["BOBE_VOICE_BACKEND"] = voice_backend
+                    with ENV_FILE_LOCK:
+                        lines = upsert_env_keys(read_env_lines(env_path), {"BOBE_VOICE_BACKEND": voice_backend})
+                        write_env_lines(env_path, lines)
             except Exception as exc:
                 logger.warning("Failed to persist wake config: %s", exc)
                 return JSONResponse({"ok": False, "error": "persist_failed"}, status_code=500)

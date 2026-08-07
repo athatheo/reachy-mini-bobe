@@ -50,6 +50,10 @@ class LocalStream:
 
     def _required_api_keys_configured(self) -> bool:
         """Return whether all explicit user-provided keys are configured."""
+        if getattr(self.handler, "voice_backend", "openai") == "hermes":
+            # The Hermes backend talks only to the LAN wake daemon; no OpenAI
+            # key is required to start conversing.
+            return True
         return is_plausible_openai_key(str(config.OPENAI_API_KEY or ""))
 
     def launch(self) -> None:

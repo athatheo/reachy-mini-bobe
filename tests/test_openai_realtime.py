@@ -2125,3 +2125,78 @@ async def test_play_speech_clip_stops_when_sleep_lands_mid_clip():
     await handler._play_speech_clip(pcm, 24000)
 
     assert handler.output_queue.empty()
+
+
+# ---- hermes voice backend ----
+
+
+def _hermes_handler(monkeypatch):
+    monkeypatch.setenv("BOBE_VOICE_BACKEND", "hermes")
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    return handler
+
+
+def test_voice_backend_defaults_to_openai():
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    assert handler.voice_backend == "openai"
+
+
+def test_voice_backend_invalid_value_falls_back(monkeypatch):
+    monkeypatch.setenv("BOBE_VOICE_BACKEND", "banana")
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    assert handler.voice_backend == "openai"
+
+
+@pytest.mark.asyncio
+async def test_hermes_backend_start_up_parks_until_shutdown(monkeypatch):
+    handler = _hermes_handler(monkeypatch)
+
+    startup = asyncio.create_task(handler.start_up())
+    await asyncio.sleep(0.05)
+    assert not startup.done()
+    # No OpenAI client is ever created in hermes mode.
+    assert not hasattr(handler, "client")
+
+    handler._shutdown_requested = True
+    handler._restart_requested.set()
+    await asyncio.wait_for(startup, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_hermes_backend_receive_never_touches_openai(monkeypatch):
+    handler = _hermes_handler(monkeypatch)
+    handler.wake_gating_enabled = True
+    handler.wake_session.wake()
+    handler.connection = MagicMock()
+    handler.connection.input_audio_buffer.append = MagicMock(side_effect=AssertionError("must not stream"))
+
+    frame = (24000, np.zeros((1, 480), dtype=np.int16))
+    await handler.receive(frame)
+
+    handler.connection.input_audio_buffer.append.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hermes_backend_wake_transition_skips_openai(monkeypatch):
+    handler = _hermes_handler(monkeypatch)
+    handler.wake_gating_enabled = True
+    listen_calls = []
+    handler.wake_gate.detector = type(
+        "FakeDetector",
+        (),
+        {
+            "listen_for_converse": lambda self: listen_calls.append("converse"),
+            "listen_for_sleep": lambda self: listen_calls.append("sleep"),
+        },
+    )()
+
+    ok = await handler._transition_to_awake()
+
+    assert ok is True
+    assert handler.wake_session.awake
+    assert listen_calls == ["converse"]
+    # Chime was queued even without any OpenAI connection.
+    assert not handler.output_queue.empty()

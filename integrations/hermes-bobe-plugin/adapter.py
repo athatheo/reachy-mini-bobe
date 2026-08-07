@@ -128,14 +128,19 @@ class BobeAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._suppress_text_until = 0.0
 
+    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+        """Robot conversations are voice-first: always answer VOICE with TTS.
+
+        Overridden (rather than seeding ``_auto_tts_enabled_chats`` on
+        connect) because the gateway re-syncs those sets from its persisted
+        ``/voice`` store after connect, wiping any adapter-side opt-in.
+        """
+        return True
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self._token:
             logger.warning("[%s] BOBE_WAKE_TOKEN not configured", self.name)
             return False
-        # Robot conversations are voice-first: opt the channel into auto-TTS
-        # so VOICE-typed utterances get spoken replies even when the global
-        # ``voice.auto_tts`` default is off.
-        self._auto_tts_enabled_chats.add(ROBOT_CHAT_ID)
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll_utterances(), name="bobe-utterance-poll")
         self._mark_connected()
@@ -220,15 +225,64 @@ class BobeAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """POST the message to the wake daemon; the robot speaks it.
+        """Speak the message on the robot: synthesized TTS, or text announce.
 
         Skipped briefly after a successful TTS delivery: the gateway sends the
         reply text after ``play_tts`` and the robot must not speak it twice.
+        TTS-first matters for pushes ("send it to bobe", cron): with the
+        Hermes voice backend the robot has no realtime model to read text
+        aloud, so a synthesized clip is the only spoken path. The text
+        announce remains as fallback (and feeds the robot's UI/log).
         """
         if time.monotonic() < self._suppress_text_until:
             logger.debug("[%s] Suppressing text echo after TTS delivery", self.name)
             return SendResult(success=True, message_id="bobe-tts-audio")
+        tts_result = await self._synthesize_and_speak(content)
+        if tts_result is not None and tts_result.success:
+            return tts_result
         return await _post_announcement(self._url, self._token, content)
+
+    async def _synthesize_and_speak(self, content: str) -> Optional[SendResult]:
+        """Synthesize ``content`` with the configured TTS and play it on the robot.
+
+        Returns None when TTS is unavailable/failed so callers fall back to a
+        plain text announce.
+        """
+        cleanup_paths: set = set()
+        try:
+            from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+            from gateway.platforms.base import build_auto_tts_output_path
+
+            if not check_tts_requirements():
+                return None
+            speech_text = self.prepare_tts_text(content)
+            if not speech_text:
+                return None
+            audio_path = build_auto_tts_output_path(self.platform)
+            cleanup_paths.add(audio_path)
+            import json as _json
+
+            tts_result_str = await asyncio.to_thread(
+                text_to_speech_tool, text=speech_text, output_path=audio_path
+            )
+            tts_data = _json.loads(tts_result_str)
+            if not tts_data.get("success", True):
+                return None
+            produced = tts_data.get("file_path") or audio_path
+            cleanup_paths.add(produced)
+            result = await self._post_speech(produced)
+            return result if result.success else None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[%s] send() TTS synthesis failed (%s); announcing text", self.name, exc)
+            return None
+        finally:
+            for path in cleanup_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     async def _post_speech(self, audio_path: str) -> SendResult:
         """POST an audio file to the daemon's /v1/speak for robot playback."""

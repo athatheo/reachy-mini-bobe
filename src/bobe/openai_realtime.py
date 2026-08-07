@@ -1,3 +1,4 @@
+import os
 import json
 import time
 import uuid
@@ -163,6 +164,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         self.gradio_mode = gradio_mode
         self.instance_path = instance_path
+        # Voice backend: "openai" streams awake audio to OpenAI Realtime;
+        # "hermes" keeps awake audio on the LAN — the Mac wake daemon captures
+        # utterances for the Hermes agent and relays its TTS replies back as
+        # speech clips. Wake/sleep gating and cues are shared by both.
+        backend = (os.getenv("BOBE_VOICE_BACKEND") or "openai").strip().lower()
+        if backend not in ("openai", "hermes"):
+            logger.warning("Unknown BOBE_VOICE_BACKEND=%r; using 'openai'", backend)
+            backend = "openai"
+        self.voice_backend = backend
         # Track how the API key was provided (env vs textbox) and its value
         self._key_source: Literal["env", "textbox"] = "env"
         self._provided_api_key: str | None = None
@@ -363,7 +373,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         sessions are retried with capped exponential backoff (counting
         consecutive failures, reset once a session connects); cleanly-ended
         sessions park until someone requests a restart via _restart_requested.
+
+        With the Hermes voice backend there is no realtime session at all:
+        only the wake gate runs, and this task parks until shutdown.
         """
+        if self.voice_backend == "hermes":
+            logger.info("Hermes voice backend active: OpenAI Realtime disabled; conversations run on the Mac daemon")
+            self.wake_gate.start()
+            while not self._shutdown_requested:
+                self._restart_requested.clear()
+                await self._restart_requested.wait()
+            return
+
         openai_api_key = config.OPENAI_API_KEY
         if self.gradio_mode and not openai_api_key:
             # api key was not found in .env or in the environment variables
@@ -1257,6 +1278,25 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def _transition_to_awake(self) -> bool:
         """Open the streaming window after a local wake-word detection."""
+        if self.voice_backend == "hermes":
+            # No upstream to connect or flush: the daemon already heard the
+            # wake utterance and its converse mode takes over from here.
+            self._sleep_pending = False
+            self.wake_gate.enter_awake(converse=True)
+            logger.info("Wake word heard: conversing via Hermes until timeout or sleep phrase")
+            await self._play_chime(ascending=True)
+            self._queue_antenna_cue(awake=True)
+            self._announce_wake_allowed = True
+            pending = self._pending_announcements
+            self._pending_announcements = []
+            for text in pending:
+                await self._speak_announcement(text)
+            pending_speech = self._pending_speech
+            self._pending_speech = []
+            for pcm, rate in pending_speech:
+                await self._play_speech_clip(pcm, rate)
+            return True
+
         if not await self._ensure_openai_connection():
             logger.error("Wake ignored: OpenAI Realtime unavailable")
             return False
@@ -1402,6 +1442,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 return
 
             self.wake_gate.feed(audio_frame, input_sample_rate)
+
+        if self.voice_backend == "hermes":
+            # Awake audio stays on the LAN: the daemon's converse mode captures
+            # utterances for Hermes; nothing streams to OpenAI in this backend.
+            return
 
         if not self.connection:
             now = time.monotonic()

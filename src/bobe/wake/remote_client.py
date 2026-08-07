@@ -146,6 +146,10 @@ class RemoteWakeClient:
         """Listen for sleep phrases while BoBe is awake."""
         self._set_listen_mode("sleep")
 
+    def listen_for_converse(self) -> None:
+        """Capture awake utterances for the agent (sleep phrases still work)."""
+        self._set_listen_mode("converse")
+
     def listen_for_wake(self) -> None:
         """Listen for wake phrases while BoBe is asleep."""
         self._set_listen_mode("wake")
@@ -359,7 +363,7 @@ class RemoteWakeClient:
                 mode = self._current_listen_mode()
                 payload = listen_message(
                     mode=mode,
-                    sleep_phrases=self._sleep_phrases if mode == "sleep" else None,
+                    sleep_phrases=self._sleep_phrases if mode in ("sleep", "converse") else None,
                 )
                 try:
                     await ws.send(json.dumps(payload))
@@ -370,6 +374,8 @@ class RemoteWakeClient:
                     raise
                 if mode == "sleep":
                     self._log_event("info", "Listening for sleep phrases (BoBe awake)")
+                elif mode == "converse":
+                    self._log_event("info", "Capturing conversation for the agent (BoBe awake)")
                 else:
                     self._log_event("info", "Listening for wake phrase (BoBe asleep)")
                 # Re-check for an even newer mode before blocking on audio.

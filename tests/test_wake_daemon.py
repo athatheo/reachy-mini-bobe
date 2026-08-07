@@ -595,9 +595,123 @@ def test_decode_audio_rejects_empty_and_oversized():
 def test_decode_audio_wav_stdlib_fallback_resamples(monkeypatch):
     from bobe.wake_daemon import audio as audio_module
 
-    monkeypatch.setattr(audio_module, "_ffmpeg_available", lambda: False)
+    monkeypatch.setattr(audio_module, "_find_ffmpeg", lambda: None)
     pcm = np.ones(16000, dtype=np.int16) * 2000  # 1 s @ 16 kHz
     decoded = audio_module.decode_audio_to_pcm(_wav_bytes(pcm, rate=16000), rate=24000)
 
     assert decoded.dtype == np.int16
     assert decoded.size == 24000
+
+
+# ---- converse mode ----
+
+
+def _feed_utterance(session, transcribe_result):
+    """Push a voiced utterance plus trailing silence through the session."""
+    pcm = np.zeros(16000, dtype=np.int16)
+    pcm[:8000] = 5000
+    event = None
+    for offset in range(0, pcm.size, 1600):
+        maybe = session.feed(pcm[offset : offset + 1600])
+        if maybe is not None:
+            event = maybe
+    return event
+
+
+def test_converse_mode_emits_utterance_event(monkeypatch):
+    session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: "what's the weather today")
+    session.set_listen_mode("converse")
+
+    event = _feed_utterance(session, "what's the weather today")
+
+    assert event is not None
+    assert event["type"] == "utterance"
+    assert event["transcript"] == "what's the weather today"
+
+
+def test_converse_mode_still_detects_sleep_phrase(monkeypatch):
+    session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: "go to sleep")
+    session.set_listen_mode("converse")
+
+    event = _feed_utterance(session, "go to sleep")
+
+    assert event is not None
+    assert event["type"] == "sleep"
+
+
+def test_converse_mode_does_not_emit_utterance_on_partial(monkeypatch):
+    calls = []
+
+    def transcribe(_audio):
+        calls.append(True)
+        return "tell me a story"
+
+    session = _session(monkeypatch=monkeypatch, transcribe=transcribe)
+    session.set_listen_mode("converse")
+
+    # Feed voiced audio WITHOUT trailing silence: partials run, no final.
+    pcm = np.full(16000, 5000, dtype=np.int16)
+    events = [session.feed(pcm[offset : offset + 1600]) for offset in range(0, pcm.size, 1600)]
+
+    assert all(event is None for event in events)
+    assert calls  # partial transcription did run
+
+
+def test_stream_converse_mode_enqueues_utterances(monkeypatch):
+    from bobe.wake_daemon.server import create_app
+
+    app = create_app(load_wake_daemon_config(_TEST_ENV))
+    client = TestClient(app)
+
+    def fake_transcribe(self, pcm, *, config=None):
+        return "hello agent"
+
+    monkeypatch.setattr(engine_module.WhisperWakeEngine, "transcribe", fake_transcribe)
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "listen", "mode": "converse", "sleep_phrases": ["go to sleep"]})
+
+        pcm = np.zeros(16000, dtype=np.int16)
+        pcm[:8000] = 5000
+        for offset in range(0, pcm.size, 1600):
+            ws.send_bytes(pcm[offset : offset + 1600].tobytes())
+
+        response = client.get(
+            "/v1/utterances",
+            params={"wait": 5},
+            headers={"X-BoBe-Wake-Token": "test-token"},
+        )
+
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert len(events) >= 1
+    assert events[0]["text"] == "hello agent"
+
+
+def test_utterances_rejects_bad_token():
+    client = _announce_client()
+
+    response = client.get("/v1/utterances", headers={"X-BoBe-Wake-Token": "nope"})
+
+    assert response.status_code == 401
+
+
+def test_inject_utterance_roundtrip():
+    client = _announce_client()
+
+    post = client.post(
+        "/v1/utterances",
+        headers={"X-BoBe-Wake-Token": "test-token"},
+        json={"text": "ping"},
+    )
+    assert post.status_code == 200
+
+    got = client.get(
+        "/v1/utterances",
+        params={"wait": 0},
+        headers={"X-BoBe-Wake-Token": "test-token"},
+    )
+    assert got.status_code == 200
+    assert [event["text"] for event in got.json()["events"]] == ["ping"]

@@ -380,10 +380,17 @@ class WakeGate:
         """Put drained audio back at the front of the buffer after a failed flush."""
         self.buffer.restore(samples)
 
-    def enter_awake(self) -> None:
-        """Open the gate: detector listens for the sleep phrase, session wakes."""
+    def enter_awake(self, *, converse: bool = False) -> None:
+        """Open the gate: detector listens for the sleep phrase, session wakes.
+
+        With ``converse=True`` (Hermes voice backend) the daemon additionally
+        captures full awake utterances for the agent.
+        """
         if self.detector is not None:
-            self.detector.listen_for_sleep()
+            if converse and hasattr(self.detector, "listen_for_converse"):
+                self.detector.listen_for_converse()
+            else:
+                self.detector.listen_for_sleep()
         self.session.wake()
 
     def sleep(self) -> None:

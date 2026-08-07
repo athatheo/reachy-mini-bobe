@@ -94,6 +94,12 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     pass
 
     app.state.enqueue_utterance = enqueue_utterance
+    # Half-duplex echo guard: while a relayed speech clip is playing on the
+    # robot there is no echo cancellation, so converse-mode capture would
+    # transcribe the robot's own voice. /v1/speak advances this deadline by
+    # the clip duration plus a grace second; converse capture drops frames
+    # until it passes.
+    app.state.speak_suppress_until = 0.0
 
     @app.get("/status")
     def status() -> JSONResponse:
@@ -197,6 +203,9 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         if delivered == 0:
             return JSONResponse({"ok": False, "error": "delivery_failed"}, status_code=502)
         seconds = round(pcm.size / ROBOT_SPEECH_RATE, 2)
+        # The robot primes ~1 s of buffer before real-time playback; suppress
+        # converse capture for the clip length plus that lead and a grace tail.
+        app.state.speak_suppress_until = time.monotonic() + seconds + 2.0
         logger.info("Relayed speech clip %s (%.1fs) to %d robot stream(s)", clip_id, seconds, delivered)
         return JSONResponse({"ok": True, "delivered": delivered, "seconds": seconds})
 
@@ -217,16 +226,23 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         except (TypeError, ValueError):
             wait_s = 25.0
 
-        events: list[dict[str, object]] = []
-        try:
-            events.append(await asyncio.wait_for(app.state.utterances.get(), timeout=wait_s))
-        except asyncio.TimeoutError:
-            return JSONResponse({"ok": True, "events": []})
-        while True:
+        def drain() -> list[dict[str, object]]:
+            drained: list[dict[str, object]] = []
+            while True:
+                try:
+                    drained.append(app.state.utterances.get_nowait())
+                except asyncio.QueueEmpty:
+                    return drained
+
+        # Drain non-blocking first: waiting on get() would miss items that are
+        # already queued when ``wait`` is 0.
+        events = drain()
+        if not events and wait_s > 0:
             try:
-                events.append(app.state.utterances.get_nowait())
-            except asyncio.QueueEmpty:
-                break
+                events.append(await asyncio.wait_for(app.state.utterances.get(), timeout=wait_s))
+                events.extend(drain())
+            except asyncio.TimeoutError:
+                pass
         return JSONResponse({"ok": True, "events": events})
 
     @app.post("/v1/utterances")
@@ -251,18 +267,22 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         client_phrase = runtime.phrase
         last_stats_at = 0.0
         session: WhisperWakeSession | None = None
+        listen_mode = "wake"
+        suppressed = False
 
         def apply_listen(payload: dict[str, object]) -> None:
+            nonlocal listen_mode
             if session is None:
                 return
             mode = str(payload.get("mode") or "wake").casefold()
-            if mode not in {"wake", "sleep"}:
+            if mode not in {"wake", "sleep", "converse"}:
                 return
             raw_phrases = payload.get("sleep_phrases")
             sleep_phrases = None
             if isinstance(raw_phrases, list):
                 sleep_phrases = tuple(str(item) for item in raw_phrases if str(item).strip())
             session.set_listen_mode(mode, sleep_phrases=sleep_phrases)  # type: ignore[arg-type]
+            listen_mode = mode
             logger.info("Wake stream listen mode set to %r", mode)
 
         try:
@@ -311,12 +331,28 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 if not data or session is None:
                     continue
 
+                # Echo guard: drop converse-mode audio while a relayed clip is
+                # playing on the robot, and clear any half-captured utterance
+                # when suppression ends so clip tails never reach the agent.
+                if listen_mode == "converse":
+                    if time.monotonic() < app.state.speak_suppress_until:
+                        if not suppressed:
+                            suppressed = True
+                            session.reset()
+                        continue
+                    if suppressed:
+                        suppressed = False
+                        session.reset()
+
                 pcm = np.frombuffer(data, dtype=np.int16)
                 event = await asyncio.to_thread(session.feed, pcm)
                 if event is not None:
                     transcript = str(event["transcript"])
                     latency_ms = float(event["latency_ms"])
                     event_type = str(event.get("type") or "wake")
+                    if event_type == "utterance":
+                        enqueue_utterance(transcript)
+                        continue
                     if event_type == "sleep":
                         logger.info("Sleep phrase detected (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
                         await websocket.send_json(

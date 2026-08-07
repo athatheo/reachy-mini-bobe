@@ -104,9 +104,13 @@ def listen_message(
     mode: str,
     sleep_phrases: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
-    """Tell the daemon which phrase class to listen for."""
+    """Tell the daemon which phrase class to listen for.
+
+    ``sleep`` and ``converse`` both carry sleep phrases: converse mode keeps
+    sleep-phrase preemption while additionally capturing utterances.
+    """
     payload: dict[str, Any] = {"type": MSG_LISTEN, "mode": mode}
-    if mode == "sleep" and sleep_phrases:
+    if mode in ("sleep", "converse") and sleep_phrases:
         payload["sleep_phrases"] = list(sleep_phrases)
     return payload
 

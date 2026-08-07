@@ -31,13 +31,24 @@ class AudioDecodeError(RuntimeError):
     """Raised when an audio payload cannot be decoded to PCM."""
 
 
-def _ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+# LaunchAgents run with a minimal PATH that omits Homebrew's bin directories,
+# so PATH lookup alone would miss the ffmpeg that is actually installed.
+_FFMPEG_FALLBACK_PATHS = ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg")
 
 
-def _decode_with_ffmpeg(data: bytes, rate: int) -> NDArray[np.int16]:
+def _find_ffmpeg() -> str | None:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for candidate in _FFMPEG_FALLBACK_PATHS:
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
+def _decode_with_ffmpeg(ffmpeg: str, data: bytes, rate: int) -> NDArray[np.int16]:
     cmd = [
-        "ffmpeg",
+        ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
@@ -103,7 +114,8 @@ def decode_audio_to_pcm(data: bytes, rate: int = ROBOT_SPEECH_RATE) -> NDArray[n
         raise AudioDecodeError("empty audio payload")
     if len(data) > MAX_AUDIO_BYTES:
         raise AudioDecodeError(f"audio payload too large ({len(data)} bytes)")
-    if _ffmpeg_available():
-        return _decode_with_ffmpeg(data, rate)
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg is not None:
+        return _decode_with_ffmpeg(ffmpeg, data, rate)
     logger.warning("ffmpeg not found; falling back to WAV-only decoding")
     return _decode_wav_stdlib(data, rate)

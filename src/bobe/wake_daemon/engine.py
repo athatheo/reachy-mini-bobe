@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 PARTIAL_TRANSCRIBE_INTERVAL_S = 0.45
 STATS_PARTIAL_MIN_SAMPLES = int(0.35 * WAKE_SAMPLE_RATE)
 TRANSCRIPT_HISTORY_MAX = 30
-ListenMode = Literal["wake", "sleep"]
+# "converse" is awake conversation capture for the Hermes voice backend:
+# sleep phrases still end the session, every other finalized utterance is
+# emitted as an "utterance" event for the agent.
+ListenMode = Literal["wake", "sleep", "converse"]
 
 
 def warn_if_phrases_unsupported(
@@ -204,7 +207,7 @@ class WhisperWakeSession:
         }
 
     def _maybe_emit_sleep(self, transcript: str, *, latency_ms: float) -> dict[str, Any] | None:
-        if self._listen_mode != "sleep":
+        if self._listen_mode not in ("sleep", "converse"):
             return None
         # Strict command match: sleep phrases are ordinary n-grams, and a
         # substring match would put BoBe to sleep mid-conversation ("my
@@ -271,8 +274,10 @@ class WhisperWakeSession:
                 self._last_partial_at = time.monotonic()
                 # Wake/sleep on partials: finals often arrive late and re-transcribe
                 # trailing noise into junk ("Thank you."), wiping a good live match.
+                # Converse utterances are NOT emitted on partials — the agent
+                # should get the whole request, so only the sleep preempt runs.
                 if partial:
-                    if self._listen_mode == "sleep":
+                    if self._listen_mode in ("sleep", "converse"):
                         event = self._maybe_emit_sleep(partial, latency_ms=latency_ms)
                     else:
                         event = self._maybe_emit_wake(partial, latency_ms=latency_ms)
@@ -307,4 +312,18 @@ class WhisperWakeSession:
             return None
         if self._listen_mode == "sleep":
             return self._maybe_emit_sleep(transcript, latency_ms=latency_ms)
+        if self._listen_mode == "converse":
+            sleep_event = self._maybe_emit_sleep(transcript, latency_ms=latency_ms)
+            if sleep_event is not None:
+                return sleep_event
+            if matches_sleep_command(transcript, self._sleep_phrases):
+                # The sleep already fired from a partial (refractory) — the
+                # finalized tail must not reach the agent as an utterance.
+                return None
+            logger.info("Utterance captured (transcript=%r, latency_ms=%.1f)", transcript, latency_ms)
+            return {
+                "type": "utterance",
+                "transcript": transcript,
+                "latency_ms": latency_ms,
+            }
         return self._maybe_emit_wake(transcript, latency_ms=latency_ms)
