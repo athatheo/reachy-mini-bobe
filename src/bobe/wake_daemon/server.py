@@ -3,6 +3,8 @@
 from __future__ import annotations
 import hmac
 import time
+import uuid
+import base64
 import asyncio
 import logging
 import threading
@@ -23,10 +25,12 @@ from bobe.wake.protocol import (
     wake_message,
     ready_message,
     sleep_message,
+    speak_message,
     stats_message,
     announce_message,
 )
 from bobe.wake.constants import WAKE_SAMPLE_RATE
+from bobe.wake_daemon.audio import ROBOT_SPEECH_RATE, AudioDecodeError, decode_audio_to_pcm
 from bobe.wake_daemon.config import WakeDaemonConfig, load_wake_daemon_config
 from bobe.wake_daemon.engine import WhisperWakeEngine, WhisperWakeSession, warn_if_phrases_unsupported
 
@@ -110,6 +114,71 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         if delivered == 0:
             return JSONResponse({"ok": False, "error": "delivery_failed"}, status_code=502)
         return JSONResponse({"ok": True, "delivered": delivered})
+
+    @app.post("/v1/speak")
+    async def speak(request: Request) -> JSONResponse:
+        """Relay pre-synthesized speech audio (e.g. Hermes TTS) to the robot.
+
+        Accepts either raw audio bytes (``Content-Type: audio/*``) or JSON
+        ``{"audio_b64": ...}``. Any common container is decoded to mono s16le
+        PCM at the robot's output rate and chunked over the wake WebSocket.
+        """
+        provided_token = (request.headers.get("x-bobe-wake-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, runtime.token or ""):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+        content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if content_type.startswith("audio/") or content_type == "application/octet-stream":
+            audio_bytes = await request.body()
+        else:
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = {}
+            audio_b64 = payload.get("audio_b64") if isinstance(payload, dict) else None
+            if not isinstance(audio_b64, str) or not audio_b64:
+                return JSONResponse({"ok": False, "error": "missing_audio"}, status_code=400)
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "bad_audio_b64"}, status_code=400)
+
+        try:
+            pcm = await asyncio.to_thread(decode_audio_to_pcm, audio_bytes, ROBOT_SPEECH_RATE)
+        except AudioDecodeError as exc:
+            logger.warning("Rejected /v1/speak audio: %s", exc)
+            return JSONResponse({"ok": False, "error": f"undecodable_audio: {exc}"}, status_code=400)
+        if pcm.size == 0:
+            return JSONResponse({"ok": False, "error": "empty_audio"}, status_code=400)
+
+        connections = list(app.state.stream_connections)
+        if not connections:
+            return JSONResponse({"ok": False, "error": "no_robot_connected"}, status_code=409)
+
+        clip_id = uuid.uuid4().hex[:12]
+        chunk_samples = ROBOT_SPEECH_RATE  # 1 s per chunk keeps messages small
+        delivered = 0
+        for connection in connections:
+            try:
+                for seq, start in enumerate(range(0, pcm.size, chunk_samples)):
+                    chunk = pcm[start : start + chunk_samples]
+                    await connection.send_json(
+                        speak_message(
+                            clip_id=clip_id,
+                            seq=seq,
+                            pcm_b64=base64.b64encode(chunk.tobytes()).decode("ascii"),
+                            rate=ROBOT_SPEECH_RATE,
+                            last=start + chunk_samples >= pcm.size,
+                        )
+                    )
+                delivered += 1
+            except Exception:
+                logger.warning("Failed to deliver speech clip to a robot stream", exc_info=True)
+        if delivered == 0:
+            return JSONResponse({"ok": False, "error": "delivery_failed"}, status_code=502)
+        seconds = round(pcm.size / ROBOT_SPEECH_RATE, 2)
+        logger.info("Relayed speech clip %s (%.1fs) to %d robot stream(s)", clip_id, seconds, delivered)
+        return JSONResponse({"ok": True, "delivered": delivered, "seconds": seconds})
 
     @app.websocket("/v1/stream")
     async def stream(websocket: WebSocket) -> None:

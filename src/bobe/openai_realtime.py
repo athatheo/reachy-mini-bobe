@@ -209,6 +209,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # here until the wake transition opens a session to speak through.
         self._announce_tasks: set[asyncio.Task[None]] = set()
         self._pending_announcements: list[str] = []
+        # Pre-synthesized speech clips (Hermes TTS audio relayed by the wake
+        # daemon) follow the same asleep-parking policy as text announcements.
+        self._pending_speech: list[Tuple[NDArray[np.int16], int]] = []
         # A spoken "go to sleep" flips this off so announcements queue without
         # waking the robot; any real wake flips it back on.
         self._announce_wake_allowed: bool = True
@@ -814,6 +817,63 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             )
         self.wake_session.touch()
 
+    def _start_speech_clip(self, pcm: NDArray[np.int16], rate: int) -> None:
+        """Handle a daemon-relayed speech clip without stalling the mic loop."""
+        if self._shutdown_requested:
+            return
+        task = asyncio.create_task(self._handle_speech_clip(pcm, rate), name="speech-clip")
+        self._announce_tasks.add(task)
+        task.add_done_callback(self._announce_tasks.discard)
+
+    async def _handle_speech_clip(self, pcm: NDArray[np.int16], rate: int) -> None:
+        """Play a speech clip now, or park it and wake the robot first."""
+        try:
+            if self.wake_gate.enabled and not self.wake_session.awake:
+                self._pending_speech.append((pcm, rate))
+                if self._announce_wake_allowed:
+                    self.wake_session.request_wake()
+                else:
+                    logger.info("Holding speech clip until the next wake (user asked for sleep)")
+                return
+            await self._play_speech_clip(pcm, rate)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Speech clip handling failed")
+
+    async def _play_speech_clip(self, pcm: NDArray[np.int16], rate: int) -> None:
+        """Queue a PCM clip for the speaker at (near) real-time pace.
+
+        A ~1 s primed buffer plus real-time pacing keeps the assistant-echo
+        VAD guard tracking actual playback and feeds the head wobbler at the
+        cadence it expects, instead of dumping a whole minute of audio into
+        the output queue at once.
+        """
+        if self.wake_gate.enabled and not self.wake_session.awake:
+            # Sleep landed between scheduling and playing; hold the clip.
+            self._pending_speech.append((pcm, rate))
+            return
+        chunk_samples = max(1, rate // 2)
+        primed_s = 1.0
+        elapsed_s = 0.0
+        for start in range(0, pcm.size, chunk_samples):
+            if self._sleep_pending or (self.wake_gate.enabled and not self.wake_session.awake):
+                # Sleep interrupts playback; the remainder is dropped, not
+                # parked — sleep means silence, matching dropped tool results.
+                logger.info("Speech clip playback stopped by sleep")
+                return
+            chunk = pcm[start : start + chunk_samples]
+            self._last_assistant_audio_at = time.monotonic()
+            self.wake_session.touch()
+            if self.deps.head_wobbler is not None and rate == OPEN_AI_OUTPUT_SAMPLE_RATE:
+                self.deps.head_wobbler.feed(base64.b64encode(chunk.tobytes()).decode("utf-8"))
+            await self.output_queue.put((rate, chunk.reshape(1, -1)))
+            chunk_s = chunk.size / rate
+            if elapsed_s >= primed_s:
+                await asyncio.sleep(chunk_s)
+            elapsed_s += chunk_s
+        self._last_assistant_audio_at = time.monotonic()
+
     def _record_user_transcript(self, transcript: str | None) -> None:
         """Track the latest user transcript for early sleep detection."""
         if transcript:
@@ -1244,6 +1304,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._pending_announcements = []
         for text in pending:
             await self._speak_announcement(text)
+        pending_speech = self._pending_speech
+        self._pending_speech = []
+        for pcm, rate in pending_speech:
+            await self._play_speech_clip(pcm, rate)
         return True
 
     async def _transition_to_sleep(self, reason: str) -> None:
@@ -1329,6 +1393,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             for announcement in self.wake_gate.drain_announcements():
                 self._start_announcement(announcement)
+            for speech_pcm, speech_rate in self.wake_gate.drain_speech():
+                self._start_speech_clip(speech_pcm, speech_rate)
 
             if not self.wake_gate.awake:
                 self.wake_gate.buffer_frame(upstream_frame.reshape(-1))

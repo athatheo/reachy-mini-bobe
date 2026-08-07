@@ -233,6 +233,7 @@ def create_wake_detector(
     *,
     on_sleep: Callable[[], None] | None = None,
     on_announce: Callable[[str], None] | None = None,
+    on_speech: Callable[[NDArray[np.int16], int], None] | None = None,
 ) -> RemoteWakeClient | None:
     """Instantiate the configured wake-word backend."""
     error = wake_detector_error(config)
@@ -249,6 +250,7 @@ def create_wake_detector(
         phrase=config.phrase,
         on_sleep=on_sleep,
         on_announce=on_announce,
+        on_speak=on_speech,
         sleep_phrases=config.sleep_phrases,
     )
 
@@ -286,16 +288,23 @@ class WakeGate:
         self.config = load_wake_config() if config is None else config
         self.session = WakeSession(timeout_s=self.config.timeout_s)
         self.buffer = AudioRingBuffer(sample_rate=input_sample_rate)
-        # Announcements arrive on the detector thread; the handler's mic loop
-        # drains them on the event loop via drain_announcements().
+        # Announcements and speech clips arrive on the detector thread; the
+        # handler's mic loop drains them on the event loop via
+        # drain_announcements() / drain_speech().
         self._announce_lock = threading.Lock()
         self._announcements: list[str] = []
-        self.detector = detector_factory(
-            on_wake=self.session.request_wake,
-            config=self.config,
-            on_sleep=self.session.request_sleep,
-            on_announce=self.request_announce,
-        )
+        self._speech_clips: list[tuple[NDArray[np.int16], int]] = []
+        detector_kwargs: dict[str, Any] = {
+            "on_wake": self.session.request_wake,
+            "config": self.config,
+            "on_sleep": self.session.request_sleep,
+            "on_announce": self.request_announce,
+        }
+        try:
+            self.detector = detector_factory(on_speech=self.request_speech, **detector_kwargs)
+        except TypeError:
+            # Older factories/test stubs predate the speech downlink.
+            self.detector = detector_factory(**detector_kwargs)
         self.enabled = self.detector is not None
         self.error: str | None
         if self.enabled:
@@ -334,6 +343,20 @@ class WakeGate:
         with self._announce_lock:
             pending = self._announcements
             self._announcements = []
+        return pending
+
+    def request_speech(self, pcm: NDArray[np.int16], rate: int) -> None:
+        """Queue a speech clip for playback (thread-safe; detector thread)."""
+        if pcm.size == 0 or rate <= 0:
+            return
+        with self._announce_lock:
+            self._speech_clips.append((pcm, rate))
+
+    def drain_speech(self) -> list[tuple[NDArray[np.int16], int]]:
+        """Return and clear queued speech clips (consumed by the mic loop)."""
+        with self._announce_lock:
+            pending = self._speech_clips
+            self._speech_clips = []
         return pending
 
     def feed(self, audio_frame: NDArray[Any], input_sample_rate: int) -> None:

@@ -20,6 +20,7 @@ MSG_SLEEP = "sleep"
 MSG_STATS = "stats"
 MSG_LISTEN = "listen"
 MSG_ANNOUNCE = "announce"
+MSG_SPEAK = "speak"
 
 # WebSocket close codes used by the daemon handshake (RFC 6455).
 CLOSE_UNSUPPORTED_DATA = 1003
@@ -79,6 +80,22 @@ def announce_message(*, text: str) -> dict[str, Any]:
     return {
         "type": MSG_ANNOUNCE,
         "text": text,
+    }
+
+
+def speak_message(*, clip_id: str, seq: int, pcm_b64: str, rate: int, last: bool) -> dict[str, Any]:
+    """Build one chunk of daemon-to-robot speech audio (mono s16le PCM).
+
+    Clips are chunked so a long reply never exceeds websocket message limits;
+    the robot reassembles by ``id`` and plays the clip once ``last`` arrives.
+    """
+    return {
+        "type": MSG_SPEAK,
+        "id": clip_id,
+        "seq": seq,
+        "pcm_b64": pcm_b64,
+        "rate": rate,
+        "last": last,
     }
 
 

@@ -449,3 +449,155 @@ def test_announce_after_stream_disconnect_returns_conflict():
     )
 
     assert response.status_code == 409
+
+
+# ---- /v1/speak ----
+
+
+def _wav_bytes(pcm, rate=24000):
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+def test_speak_rejects_bad_token():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/speak",
+        headers={"X-BoBe-Wake-Token": "wrong-token", "Content-Type": "audio/wav"},
+        content=_wav_bytes(np.zeros(100, dtype=np.int16)),
+    )
+
+    assert response.status_code == 401
+
+
+def test_speak_rejects_missing_audio():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/speak",
+        headers={"X-BoBe-Wake-Token": "test-token"},
+        json={},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "missing_audio"
+
+
+def test_speak_rejects_undecodable_audio():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/speak",
+        headers={"X-BoBe-Wake-Token": "test-token", "Content-Type": "audio/wav"},
+        content=b"this is not audio at all",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"].startswith("undecodable_audio")
+
+
+def test_speak_without_robot_returns_conflict():
+    client = _announce_client()
+
+    response = client.post(
+        "/v1/speak",
+        headers={"X-BoBe-Wake-Token": "test-token", "Content-Type": "audio/wav"},
+        content=_wav_bytes(np.zeros(2400, dtype=np.int16)),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "no_robot_connected"
+
+
+def test_speak_relays_chunked_pcm_to_robot_stream():
+    import base64 as b64
+
+    client = _announce_client()
+    rng = np.random.default_rng(7)
+    pcm = rng.integers(-2000, 2000, size=60000, dtype=np.int16)  # 2.5 s @ 24 kHz
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+
+        response = client.post(
+            "/v1/speak",
+            headers={"X-BoBe-Wake-Token": "test-token", "Content-Type": "audio/wav"},
+            content=_wav_bytes(pcm),
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["ok"] is True
+        assert body["delivered"] == 1
+        assert body["seconds"] == 2.5
+
+        frames = []
+        while True:
+            frame = ws.receive_json()
+            assert frame["type"] == "speak"
+            frames.append(frame)
+            if frame["last"]:
+                break
+
+    assert [frame["seq"] for frame in frames] == [0, 1, 2]
+    assert {frame["id"] for frame in frames} == {frames[0]["id"]}
+    assert all(frame["rate"] == 24000 for frame in frames)
+    assert [frame["last"] for frame in frames] == [False, False, True]
+    rebuilt = np.concatenate(
+        [np.frombuffer(b64.b64decode(frame["pcm_b64"]), dtype=np.int16) for frame in frames]
+    )
+    assert rebuilt.size == pcm.size
+    assert np.array_equal(rebuilt, pcm)
+
+
+def test_speak_accepts_base64_json_payload():
+    import base64 as b64
+
+    client = _announce_client()
+    pcm = np.ones(24000, dtype=np.int16) * 1000
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+
+        response = client.post(
+            "/v1/speak",
+            headers={"X-BoBe-Wake-Token": "test-token"},
+            json={"audio_b64": b64.b64encode(_wav_bytes(pcm)).decode("ascii")},
+        )
+
+        assert response.status_code == 200
+        frame = ws.receive_json()
+
+    assert frame["type"] == "speak"
+    assert frame["last"] is True
+
+
+def test_decode_audio_rejects_empty_and_oversized():
+    from bobe.wake_daemon.audio import MAX_AUDIO_BYTES, AudioDecodeError, decode_audio_to_pcm
+
+    with pytest.raises(AudioDecodeError):
+        decode_audio_to_pcm(b"")
+    with pytest.raises(AudioDecodeError):
+        decode_audio_to_pcm(b"\0" * (MAX_AUDIO_BYTES + 1))
+
+
+def test_decode_audio_wav_stdlib_fallback_resamples(monkeypatch):
+    from bobe.wake_daemon import audio as audio_module
+
+    monkeypatch.setattr(audio_module, "_ffmpeg_available", lambda: False)
+    pcm = np.ones(16000, dtype=np.int16) * 2000  # 1 s @ 16 kHz
+    decoded = audio_module.decode_audio_to_pcm(_wav_bytes(pcm, rate=16000), rate=24000)
+
+    assert decoded.dtype == np.int16
+    assert decoded.size == 24000

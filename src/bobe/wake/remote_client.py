@@ -20,6 +20,7 @@ from bobe.wake.protocol import (
     MSG_WAKE,
     MSG_READY,
     MSG_SLEEP,
+    MSG_SPEAK,
     MSG_STATS,
     MSG_ANNOUNCE,
     CLOSE_POLICY_VIOLATION,
@@ -37,6 +38,11 @@ RECONNECT_MAX_S = 10.0
 # A 1008 (policy violation) close means the daemon rejected our handshake —
 # usually a bad/missing BOBE_WAKE_TOKEN. Fast retries can never succeed.
 AUTH_RETRY_S = 60.0
+# Speech-clip reassembly bounds: a clip larger than this is hostile or corrupt
+# (2 minutes at 24 kHz mono int16), and a partial clip whose chunks stop
+# arriving is evicted so buffers can never grow without bound.
+SPEAK_MAX_CLIP_SECONDS = 120.0
+SPEAK_CLIP_STALE_S = 30.0
 
 
 def _close_code(exc: BaseException) -> int | None:
@@ -62,11 +68,15 @@ class RemoteWakeClient:
         sample_rate: int = WAKE_SAMPLE_RATE,
         on_sleep: Any | None = None,
         on_announce: Any | None = None,
+        on_speak: Any | None = None,
         sleep_phrases: tuple[str, ...] = DEFAULT_SLEEP_PHRASES,
     ) -> None:
         self._on_wake = on_wake
         self._on_sleep = on_sleep
         self._on_announce = on_announce
+        self._on_speak = on_speak
+        # Partial speech clips being reassembled: id -> (last_chunk_at, rate, chunks).
+        self._speak_buffers: dict[str, tuple[float, int, list[NDArray[np.int16]]]] = {}
         self._phrase = phrase.strip().casefold() or WAKE_PHRASE
         self._sleep_phrases = sleep_phrases
         self._url = url
@@ -448,6 +458,58 @@ class RemoteWakeClient:
         if self._on_announce is not None:
             self._on_announce(text)
 
+    def _evict_stale_speak_buffers(self, now: float) -> None:
+        stale = [
+            clip_id
+            for clip_id, (last_at, _rate, _chunks) in self._speak_buffers.items()
+            if now - last_at > SPEAK_CLIP_STALE_S
+        ]
+        for clip_id in stale:
+            self._speak_buffers.pop(clip_id, None)
+            self._log_event("warn", f"Dropped stale speech clip {clip_id!r}")
+
+    def _handle_speak_payload(self, payload: dict[str, Any]) -> None:
+        if self._on_speak is None:
+            return
+        clip_id = str(payload.get("id") or "")
+        pcm_b64 = payload.get("pcm_b64")
+        if not clip_id or not isinstance(pcm_b64, str):
+            return
+        try:
+            rate = int(payload.get("rate") or 0)
+        except (TypeError, ValueError):
+            return
+        if rate <= 0:
+            return
+        try:
+            chunk = np.frombuffer(base64.b64decode(pcm_b64), dtype=np.int16)
+        except Exception:
+            self._log_event("warn", f"Undecodable speech chunk for clip {clip_id!r}")
+            return
+
+        now = time.monotonic()
+        self._evict_stale_speak_buffers(now)
+
+        _prev_at, _prev_rate, chunks = self._speak_buffers.get(clip_id, (now, rate, []))
+        if chunk.size:
+            chunks.append(chunk)
+        total = sum(c.size for c in chunks)
+        if total > SPEAK_MAX_CLIP_SECONDS * rate:
+            self._speak_buffers.pop(clip_id, None)
+            self._log_event("warn", f"Dropped oversized speech clip {clip_id!r}")
+            return
+        if not payload.get("last"):
+            self._speak_buffers[clip_id] = (now, rate, chunks)
+            return
+
+        self._speak_buffers.pop(clip_id, None)
+        if not chunks:
+            return
+        pcm = np.concatenate(chunks)
+        self._log_event("info", f"Speech clip received ({pcm.size / rate:.1f}s @ {rate} Hz)")
+        logger.info("Remote speech clip received (%.1fs @ %d Hz)", pcm.size / rate, rate)
+        self._on_speak(pcm, rate)
+
     async def _recv_loop(self, ws: Any) -> None:
         async for message in ws:
             if self._stop_event.is_set():
@@ -478,3 +540,5 @@ class RemoteWakeClient:
                 self._handle_sleep_payload(payload)
             elif msg_type == MSG_ANNOUNCE:
                 self._handle_announce_payload(payload)
+            elif msg_type == MSG_SPEAK:
+                self._handle_speak_payload(payload)
