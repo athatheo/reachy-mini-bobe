@@ -74,6 +74,26 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
     app.state.wake_engine = None
     # Authenticated robot wake streams, used to push announcements robot-ward.
     app.state.stream_connections = set()
+    # Robot utterances awaiting pickup by the Hermes bobe plugin (long-poll
+    # consumer). Bounded so an absent consumer can never grow memory; a full
+    # queue drops the OLDEST utterance — the newest one is what the user just
+    # said and still expects an answer to.
+    app.state.utterances = asyncio.Queue(maxsize=16)
+
+    def enqueue_utterance(text: str) -> None:
+        """Queue an utterance for the agent, evicting the oldest when full."""
+        while True:
+            try:
+                app.state.utterances.put_nowait({"text": text, "ts": round(time.time(), 3)})
+                return
+            except asyncio.QueueFull:
+                try:
+                    dropped = app.state.utterances.get_nowait()
+                    logger.warning("Utterance queue full; dropped %r", dropped.get("text"))
+                except asyncio.QueueEmpty:
+                    pass
+
+    app.state.enqueue_utterance = enqueue_utterance
 
     @app.get("/status")
     def status() -> JSONResponse:
@@ -179,6 +199,51 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         seconds = round(pcm.size / ROBOT_SPEECH_RATE, 2)
         logger.info("Relayed speech clip %s (%.1fs) to %d robot stream(s)", clip_id, seconds, delivered)
         return JSONResponse({"ok": True, "delivered": delivered, "seconds": seconds})
+
+    @app.get("/v1/utterances")
+    async def utterances(request: Request) -> JSONResponse:
+        """Long-poll robot utterances (consumed by the Hermes bobe plugin).
+
+        Waits up to ``wait`` seconds (default 25, capped at 60) for the first
+        utterance, then drains everything queued so multi-utterance bursts
+        arrive together.
+        """
+        provided_token = (request.headers.get("x-bobe-wake-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, runtime.token or ""):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+        try:
+            wait_s = min(max(float(request.query_params.get("wait", 25.0)), 0.0), 60.0)
+        except (TypeError, ValueError):
+            wait_s = 25.0
+
+        events: list[dict[str, object]] = []
+        try:
+            events.append(await asyncio.wait_for(app.state.utterances.get(), timeout=wait_s))
+        except asyncio.TimeoutError:
+            return JSONResponse({"ok": True, "events": []})
+        while True:
+            try:
+                events.append(app.state.utterances.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return JSONResponse({"ok": True, "events": events})
+
+    @app.post("/v1/utterances")
+    async def inject_utterance(request: Request) -> JSONResponse:
+        """Inject an utterance as if the robot heard it (testing / text lane)."""
+        provided_token = (request.headers.get("x-bobe-wake-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, runtime.token or ""):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+        if not text:
+            return JSONResponse({"ok": False, "error": "empty_text"}, status_code=400)
+        enqueue_utterance(text)
+        return JSONResponse({"ok": True})
 
     @app.websocket("/v1/stream")
     async def stream(websocket: WebSocket) -> None:

@@ -1,9 +1,18 @@
 """BoBe (Reachy Mini) platform adapter — Hermes plugin.
 
-Outbound-only channel: ``send()`` POSTs the message to the BoBe wake
-daemon's ``/v1/announce`` endpoint on this Mac; the daemon relays it over
-the robot's wake WebSocket and the robot speaks it aloud. There is no
-inbound side — voice requests reach Hermes through the API server.
+Two-way voice channel backed by the BoBe wake daemon on this Mac:
+
+- **Outbound text**: ``send()`` POSTs to the daemon's ``/v1/announce``; the
+  daemon relays it over the robot's wake WebSocket and the robot speaks it.
+- **Outbound voice**: ``play_tts()`` / ``send_voice()`` POST synthesized audio
+  to ``/v1/speak``; the daemon decodes it to PCM and the robot plays it.
+- **Inbound voice**: a long-poll loop reads robot utterance transcripts from
+  ``/v1/utterances`` and dispatches them as ``MessageType.VOICE`` events, so
+  Hermes auto-TTS answers with audio (the chat is opted in on connect).
+
+Authorization is upstream: the robot's stream is authenticated to the daemon
+with ``BOBE_WAKE_TOKEN`` and this adapter authenticates with the same shared
+secret, so utterances are treated as the owner speaking at home.
 
 Install: copy or symlink this directory to ``~/.hermes/plugins/bobe/``,
 set ``BOBE_WAKE_TOKEN`` in ``~/.hermes/.env`` (same value as the wake
@@ -14,19 +23,28 @@ daemon's token), enable the platform in ``~/.hermes/config.yaml``::
         enabled: true
 
 then run ``hermes gateway restart``. After that, "send it to bobe",
-cron ``deliver=bobe``, and webhook delivery all reach the robot's voice.
+cron ``deliver=bobe``, and webhook delivery all reach the robot's voice,
+and anything the robot hears in converse mode reaches the agent.
 """
 
 # ruff: noqa: D102, D107, D401 — runs inside Hermes, not this repo; keep it
 # close to the upstream ntfy plugin's shape rather than this repo's docstyle.
 
 import os
+import time
+import asyncio
 import logging
+import mimetypes
 from typing import Any, Dict, List, Optional
 
 import httpx
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import SendResult, BasePlatformAdapter
+from gateway.platforms.base import (
+    SendResult,
+    MessageType,
+    MessageEvent,
+    BasePlatformAdapter,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -35,10 +53,28 @@ DEFAULT_ANNOUNCE_URL = "http://127.0.0.1:8765/v1/announce"
 # Announcements are spoken aloud — anything longer than this is a bad fit.
 MAX_MESSAGE_LENGTH = 2000
 SEND_TIMEOUT_S = 15.0
+# TTS clips are larger than announce payloads and the daemon decodes them
+# before answering; give it real time.
+SPEAK_TIMEOUT_S = 30.0
+# Long-poll window for /v1/utterances; the HTTP timeout adds slack on top.
+POLL_WAIT_S = 25.0
+POLL_ERROR_BACKOFF_S = 3.0
+POLL_AUTH_BACKOFF_S = 60.0
+# After play_tts delivers a reply as audio, the gateway still sends the same
+# reply as text; suppress that echo briefly so the robot doesn't speak twice.
+TTS_TEXT_SUPPRESS_S = 5.0
+# The robot is a single implicit channel.
+ROBOT_CHAT_ID = "robot"
 
 
 def _announce_url(extra: Dict[str, Any]) -> str:
     return (extra.get("announce_url") or os.getenv("BOBE_ANNOUNCE_URL", DEFAULT_ANNOUNCE_URL)).strip()
+
+
+def _daemon_endpoint(announce_url: str, endpoint: str) -> str:
+    """Derive a sibling daemon endpoint from the configured announce URL."""
+    base = announce_url.rsplit("/v1/", 1)[0].rstrip("/")
+    return f"{base}/v1/{endpoint}"
 
 
 def _wake_token(extra: Dict[str, Any]) -> str:
@@ -75,26 +111,107 @@ def check_requirements() -> bool:
 
 
 class BobeAdapter(BasePlatformAdapter):
-    """Speak Hermes messages through the Reachy Mini robot."""
+    """Two-way voice bridge between Hermes and the Reachy Mini robot."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    # Utterances arrive over the daemon's token-authenticated link and the
+    # robot mic belongs to the owner at home; no per-user allowlist applies.
+    authorization_is_upstream = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config=config, platform=Platform("bobe"))
         extra = config.extra or {}
         self._url = _announce_url(extra)
+        self._speak_url = _daemon_endpoint(self._url, "speak")
+        self._utterances_url = _daemon_endpoint(self._url, "utterances")
         self._token = _wake_token(extra)
+        self._poll_task: Optional[asyncio.Task] = None
+        self._suppress_text_until = 0.0
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self._token:
             logger.warning("[%s] BOBE_WAKE_TOKEN not configured", self.name)
             return False
+        # Robot conversations are voice-first: opt the channel into auto-TTS
+        # so VOICE-typed utterances get spoken replies even when the global
+        # ``voice.auto_tts`` default is off.
+        self._auto_tts_enabled_chats.add(ROBOT_CHAT_ID)
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = asyncio.create_task(self._poll_utterances(), name="bobe-utterance-poll")
         self._mark_connected()
-        logger.info("[%s] Connected — announcements go to %s", self.name, self._url)
+        logger.info("[%s] Connected — announcements to %s, utterances from %s", self.name, self._url, self._utterances_url)
         return True
 
     async def disconnect(self) -> None:
-        return None
+        task, self._poll_task = self._poll_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._mark_disconnected()
+
+    # ------------------------------------------------------------------
+    # Inbound: robot utterances -> agent
+    # ------------------------------------------------------------------
+
+    async def _poll_utterances(self) -> None:
+        """Long-poll the wake daemon for robot utterances forever."""
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=POLL_WAIT_S + 10.0) as client:
+                    resp = await client.get(
+                        self._utterances_url,
+                        params={"wait": POLL_WAIT_S},
+                        headers={"X-BoBe-Wake-Token": self._token},
+                    )
+                if resp.status_code == 401:
+                    logger.error("[%s] Wake daemon rejected the token; utterance polling paused", self.name)
+                    await asyncio.sleep(POLL_AUTH_BACKOFF_S)
+                    continue
+                resp.raise_for_status()
+                events = resp.json().get("events", [])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[%s] Utterance poll failed (%s); retrying", self.name, exc)
+                await asyncio.sleep(POLL_ERROR_BACKOFF_S)
+                continue
+
+            for event in events:
+                text = str(event.get("text") or "").strip() if isinstance(event, dict) else ""
+                if not text:
+                    continue
+                try:
+                    await self._dispatch_utterance(text)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[%s] Failed to dispatch utterance", self.name)
+
+    async def _dispatch_utterance(self, text: str) -> None:
+        """Hand one robot utterance to the gateway as a VOICE message."""
+        logger.info("[%s] Robot utterance: %r", self.name, text)
+        source = self.build_source(
+            chat_id=ROBOT_CHAT_ID,
+            chat_name="BoBe robot",
+            chat_type="dm",
+            user_id="bobe-voice",
+            user_name="BoBe",
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.VOICE,
+            user_id="bobe-voice",
+            user_name="BoBe",
+            source=source,
+        )
+        await self.handle_message(event)
+
+    # ------------------------------------------------------------------
+    # Outbound: agent replies -> robot
+    # ------------------------------------------------------------------
 
     async def send(
         self,
@@ -103,8 +220,73 @@ class BobeAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """POST the message to the wake daemon; the robot speaks it."""
+        """POST the message to the wake daemon; the robot speaks it.
+
+        Skipped briefly after a successful TTS delivery: the gateway sends the
+        reply text after ``play_tts`` and the robot must not speak it twice.
+        """
+        if time.monotonic() < self._suppress_text_until:
+            logger.debug("[%s] Suppressing text echo after TTS delivery", self.name)
+            return SendResult(success=True, message_id="bobe-tts-audio")
         return await _post_announcement(self._url, self._token, content)
+
+    async def _post_speech(self, audio_path: str) -> SendResult:
+        """POST an audio file to the daemon's /v1/speak for robot playback."""
+        try:
+            with open(audio_path, "rb") as audio_file:
+                audio_bytes = audio_file.read()
+        except OSError as exc:
+            return SendResult(success=False, error=f"Cannot read TTS audio: {exc}")
+        content_type = mimetypes.guess_type(audio_path)[0] or "application/octet-stream"
+        if not content_type.startswith("audio/"):
+            content_type = "application/octet-stream"
+        try:
+            async with httpx.AsyncClient(timeout=SPEAK_TIMEOUT_S) as client:
+                resp = await client.post(
+                    self._speak_url,
+                    content=audio_bytes,
+                    headers={"X-BoBe-Wake-Token": self._token, "Content-Type": content_type},
+                )
+        except httpx.TimeoutException:
+            return SendResult(success=False, error="Timeout sending speech to the BoBe wake daemon")
+        except Exception as exc:
+            return SendResult(success=False, error=f"BoBe wake daemon unreachable: {exc}")
+
+        if resp.status_code < 300:
+            return SendResult(success=True, message_id="bobe-speak")
+        try:
+            error = resp.json().get("error", "")
+        except Exception:
+            error = resp.text[:200]
+        if resp.status_code == 409:
+            return SendResult(success=False, error="Robot is not connected to the wake daemon")
+        return SendResult(success=False, error=f"HTTP {resp.status_code}: {error}")
+
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        """Deliver auto-TTS reply audio straight to the robot's speaker."""
+        result = await self._post_speech(audio_path)
+        if result.success:
+            self._suppress_text_until = time.monotonic() + TTS_TEXT_SUPPRESS_S
+        else:
+            # Fall through silently: the gateway sends the reply text next and
+            # send() will announce it, so the answer is spoken either way.
+            logger.warning("[%s] TTS delivery failed (%s); falling back to text announce", self.name, result.error)
+        return result
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Play an audio attachment through the robot's speaker."""
+        result = await self._post_speech(audio_path)
+        if not result.success and caption:
+            return await _post_announcement(self._url, self._token, caption)
+        return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """There is a single implicit channel: the robot's voice."""
@@ -146,7 +328,8 @@ def register(ctx) -> None:
         emoji="🤖",
         pii_safe=True,
         platform_hint=(
-            "Messages to bobe are spoken aloud by a home robot. "
+            "Messages to bobe are spoken aloud by a home robot, and voice "
+            "questions heard by the robot arrive from this channel. "
             "Write short, plain spoken sentences — no markdown, no links, "
             "no code, nothing sensitive."
         ),

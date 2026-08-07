@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import time
 import queue
+import base64
 import asyncio
 import logging
 import threading

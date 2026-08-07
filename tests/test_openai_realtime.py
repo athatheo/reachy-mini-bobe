@@ -7,6 +7,7 @@ import threading
 from typing import Any
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 import bobe.openai_realtime as rt_mod
@@ -2054,3 +2055,73 @@ def test_sleep_request_gates_responses_before_transition() -> None:
     handler.wake_session.request_sleep()
 
     assert not handler._session_accepts_responses()
+
+
+# ---- speech-clip playback (Hermes TTS downlink) ----
+
+
+@pytest.mark.asyncio
+async def test_play_speech_clip_queues_paced_chunks_and_feeds_wobbler():
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    deps.head_wobbler = MagicMock()
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler.wake_gating_enabled = True
+    handler.wake_session.wake()
+    pcm = np.ones(36000, dtype=np.int16)  # 1.5 s @ 24 kHz -> 3 half-second chunks
+
+    await handler._play_speech_clip(pcm, 24000)
+
+    chunks = []
+    while not handler.output_queue.empty():
+        item = handler.output_queue.get_nowait()
+        assert isinstance(item, tuple)
+        rate, audio = item
+        assert rate == 24000
+        chunks.append(audio.reshape(-1))
+    assert sum(chunk.size for chunk in chunks) == pcm.size
+    assert deps.head_wobbler.feed.call_count == len(chunks)
+    assert handler._last_assistant_audio_at > 0.0
+
+
+@pytest.mark.asyncio
+async def test_handle_speech_clip_parks_and_requests_wake_while_asleep():
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler.wake_gating_enabled = True
+    handler.wake_session.sleep()
+    pcm = np.ones(100, dtype=np.int16)
+
+    await handler._handle_speech_clip(pcm, 24000)
+
+    assert len(handler._pending_speech) == 1
+    assert handler.wake_session.consume_wake_request() is True
+    assert handler.output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_handle_speech_clip_holds_wake_after_spoken_sleep():
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler.wake_gating_enabled = True
+    handler.wake_session.sleep()
+    handler._announce_wake_allowed = False
+    pcm = np.ones(100, dtype=np.int16)
+
+    await handler._handle_speech_clip(pcm, 24000)
+
+    assert len(handler._pending_speech) == 1
+    assert handler.wake_session.consume_wake_request() is False
+
+
+@pytest.mark.asyncio
+async def test_play_speech_clip_stops_when_sleep_lands_mid_clip():
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+    handler = rt_mod.OpenaiRealtimeHandler(deps)
+    handler.wake_gating_enabled = True
+    handler.wake_session.wake()
+    handler._sleep_pending = True
+    pcm = np.ones(48000, dtype=np.int16)
+
+    await handler._play_speech_clip(pcm, 24000)
+
+    assert handler.output_queue.empty()

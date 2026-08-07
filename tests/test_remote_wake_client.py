@@ -399,3 +399,104 @@ def test_auth_rejection_surfaces_error_and_backs_off_long(monkeypatch):
     assert "BOBE_WAKE_TOKEN" in state["auth_error"]
     assert sleeps == [AUTH_RETRY_S]
     assert any(e["level"] == "error" for e in state["events"])
+
+
+# ---- speak downlink ----
+
+
+def _speak_payload(clip_id, seq, pcm, rate=24000, last=False):
+    import base64
+
+    return {
+        "type": "speak",
+        "id": clip_id,
+        "seq": seq,
+        "pcm_b64": base64.b64encode(pcm.tobytes()).decode("ascii"),
+        "rate": rate,
+        "last": last,
+    }
+
+
+def test_remote_client_assembles_speak_chunks_in_order():
+    received = []
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://mac:8765/v1/stream",
+        on_speak=lambda pcm, rate: received.append((pcm, rate)),
+    )
+    first = np.arange(10, dtype=np.int16)
+    second = np.arange(10, 15, dtype=np.int16)
+
+    client._handle_speak_payload(_speak_payload("clip", 0, first))
+    assert received == []
+
+    client._handle_speak_payload(_speak_payload("clip", 1, second, last=True))
+    assert len(received) == 1
+    pcm, rate = received[0]
+    assert rate == 24000
+    assert np.array_equal(pcm, np.concatenate([first, second]))
+    assert client._speak_buffers == {}
+
+
+def test_remote_client_speak_without_callback_is_ignored():
+    client = RemoteWakeClient(lambda: None, url="ws://mac:8765/v1/stream")
+
+    client._handle_speak_payload(_speak_payload("clip", 0, np.ones(10, dtype=np.int16), last=True))
+
+    assert client._speak_buffers == {}
+
+
+def test_remote_client_drops_oversized_speak_clip():
+    from bobe.wake.remote_client import SPEAK_MAX_CLIP_SECONDS
+
+    received = []
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://mac:8765/v1/stream",
+        on_speak=lambda pcm, rate: received.append((pcm, rate)),
+    )
+    oversized = np.zeros(int(SPEAK_MAX_CLIP_SECONDS) + 1, dtype=np.int16)
+
+    client._handle_speak_payload(_speak_payload("clip", 0, oversized, rate=1, last=True))
+
+    assert received == []
+    assert client._speak_buffers == {}
+
+
+def test_remote_client_ignores_malformed_speak_payloads():
+    received = []
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://mac:8765/v1/stream",
+        on_speak=lambda pcm, rate: received.append((pcm, rate)),
+    )
+
+    client._handle_speak_payload({"type": "speak"})
+    client._handle_speak_payload({"type": "speak", "id": "c", "pcm_b64": 123, "rate": 24000})
+    client._handle_speak_payload({"type": "speak", "id": "c", "pcm_b64": "aGk=", "rate": 0})
+    client._handle_speak_payload({"type": "speak", "id": "c", "pcm_b64": "!!!not-base64", "rate": 24000})
+
+    assert received == []
+    assert client._speak_buffers == {}
+
+
+def test_remote_client_evicts_stale_speak_buffers(monkeypatch):
+    from bobe.wake import remote_client as rc_mod
+
+    received = []
+    client = RemoteWakeClient(
+        lambda: None,
+        url="ws://mac:8765/v1/stream",
+        on_speak=lambda pcm, rate: received.append((pcm, rate)),
+    )
+    now = {"t": 1000.0}
+    monkeypatch.setattr(rc_mod.time, "monotonic", lambda: now["t"])
+
+    client._handle_speak_payload(_speak_payload("stale", 0, np.ones(10, dtype=np.int16)))
+    assert "stale" in client._speak_buffers
+
+    now["t"] += rc_mod.SPEAK_CLIP_STALE_S + 1.0
+    client._handle_speak_payload(_speak_payload("fresh", 0, np.ones(5, dtype=np.int16), last=True))
+
+    assert "stale" not in client._speak_buffers
+    assert len(received) == 1

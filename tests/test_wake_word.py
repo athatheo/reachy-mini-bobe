@@ -226,3 +226,67 @@ def test_wake_session_sleep_requested_property():
     assert not session.sleep_requested
     session.request_sleep()
     assert session.sleep_requested
+
+
+# ---- speech downlink queue ----
+
+
+def test_wake_gate_queues_and_drains_speech_clips():
+    import numpy as np
+
+    from bobe.wake_word import WakeGate, WakeConfig
+
+    gate = WakeGate(
+        input_sample_rate=24000,
+        config=WakeConfig(remote_url="ws://mac:8765/v1/stream", remote_token="secret"),
+        detector_factory=lambda **kwargs: None,
+    )
+    pcm = np.ones(100, dtype=np.int16)
+
+    gate.request_speech(pcm, 24000)
+    gate.request_speech(np.zeros(0, dtype=np.int16), 24000)  # empty: ignored
+    gate.request_speech(pcm, 0)  # bad rate: ignored
+
+    clips = gate.drain_speech()
+    assert len(clips) == 1
+    assert np.array_equal(clips[0][0], pcm)
+    assert clips[0][1] == 24000
+    assert gate.drain_speech() == []
+
+
+def test_wake_gate_supports_legacy_detector_factories():
+    from bobe.wake_word import WakeGate, WakeConfig
+
+    calls = []
+
+    def legacy_factory(on_wake, config, on_sleep=None, on_announce=None):
+        calls.append(True)
+        return None
+
+    gate = WakeGate(
+        input_sample_rate=24000,
+        config=WakeConfig(remote_url="ws://mac:8765/v1/stream", remote_token="secret"),
+        detector_factory=legacy_factory,
+    )
+
+    assert calls == [True]
+    assert gate.detector is None
+
+
+def test_create_wake_detector_passes_speech_callback():
+    from bobe.wake_word import WakeConfig, create_wake_detector
+
+    config = WakeConfig(remote_url="ws://mac:8765/v1/stream", remote_token="secret")
+    received = []
+    detector = create_wake_detector(
+        lambda: None,
+        config,
+        on_speech=lambda pcm, rate: received.append((pcm, rate)),
+    )
+
+    assert detector is not None
+    import numpy as np
+
+    pcm = np.arange(4, dtype=np.int16)
+    detector._on_speak(pcm, 24000)
+    assert len(received) == 1
