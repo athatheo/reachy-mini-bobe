@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 # How often a frame is checked, and the minimum spacing between reports.
 CHECK_INTERVAL_S = 5.0
 REPORT_INTERVAL_S = 30.0
+# Dwell requirement: this many consecutive positive checks before a sighting
+# is reported. With 5 s checks, 3 hits ≈ 10-15 s of continuous presence —
+# someone sitting down, not walking past.
+DWELL_CHECKS = 3
 # Haar tuning: robust-ish defaults; a desk-distance face is well over 60 px.
 _SCALE_FACTOR = 1.1
 _MIN_NEIGHBORS = 5
@@ -36,6 +40,7 @@ class PresenceWatcher:
         *,
         check_interval_s: float = CHECK_INTERVAL_S,
         report_interval_s: float = REPORT_INTERVAL_S,
+        dwell_checks: int = DWELL_CHECKS,
         detector: Callable[[Any], bool] | None = None,
     ) -> None:
         """Create the watcher; ``detector`` is injectable for tests."""
@@ -43,8 +48,10 @@ class PresenceWatcher:
         self._on_present = on_present
         self._check_interval_s = check_interval_s
         self._report_interval_s = report_interval_s
+        self._dwell_checks = max(1, dwell_checks)
         self._detector = detector or self._haar_face_present
         self._cascade: Any = None
+        self._consecutive_hits = 0
         self._last_report_at = 0.0
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -64,17 +71,27 @@ class PresenceWatcher:
         return len(faces) > 0
 
     def check_once(self) -> bool:
-        """Run one detection pass; report (throttled) when a face is seen."""
+        """Run one detection pass; report (dwell-gated, throttled) on presence.
+
+        A sighting is only reported after ``dwell_checks`` consecutive
+        positive checks, so someone walking past the camera between two
+        checks never counts as "sat down".
+        """
         frame = self._camera_worker.get_latest_frame()
         if frame is None:
+            self._consecutive_hits = 0
             return False
         try:
             present = bool(self._detector(frame))
         except Exception:
             logger.debug("Presence detection failed on a frame", exc_info=True)
-            return False
+            present = False
         if not present:
+            self._consecutive_hits = 0
             return False
+        self._consecutive_hits += 1
+        if self._consecutive_hits < self._dwell_checks:
+            return True
         now = time.monotonic()
         if now - self._last_report_at >= self._report_interval_s:
             self._last_report_at = now

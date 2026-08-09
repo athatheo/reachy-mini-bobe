@@ -16,7 +16,8 @@ def test_presence_reports_when_face_detected(monkeypatch):
     reports = []
     watcher = PresenceWatcher(
         FakeCamera(np.zeros((10, 10, 3), dtype=np.uint8)),
-        reports.append.__self__.append if False else lambda: reports.append(1),
+        lambda: reports.append(1),
+        dwell_checks=1,
         detector=lambda frame: True,
     )
 
@@ -34,6 +35,7 @@ def test_presence_rate_limits_reports(monkeypatch):
         FakeCamera(np.zeros((10, 10, 3), dtype=np.uint8)),
         lambda: reports.append(1),
         report_interval_s=30.0,
+        dwell_checks=1,
         detector=lambda frame: True,
     )
 
@@ -58,3 +60,44 @@ def test_presence_no_frame_or_no_face_is_quiet():
     )
     assert watcher2.check_once() is False
     assert reports == []
+
+
+def test_presence_dwell_requires_consecutive_hits():
+    reports = []
+    seen = {"present": True}
+    watcher = PresenceWatcher(
+        FakeCamera(np.zeros((10, 10, 3), dtype=np.uint8)),
+        lambda: reports.append(1),
+        dwell_checks=3,
+        detector=lambda frame: seen["present"],
+    )
+
+    watcher.check_once()  # hit 1
+    watcher.check_once()  # hit 2 — still below dwell
+    assert reports == []
+
+    watcher.check_once()  # hit 3 — sat down
+    assert reports == [1]
+
+
+def test_presence_dwell_resets_on_gap():
+    reports = []
+    seen = {"present": True}
+    watcher = PresenceWatcher(
+        FakeCamera(np.zeros((10, 10, 3), dtype=np.uint8)),
+        lambda: reports.append(1),
+        dwell_checks=3,
+        detector=lambda frame: seen["present"],
+    )
+
+    watcher.check_once()
+    watcher.check_once()
+    seen["present"] = False  # walked away between checks
+    watcher.check_once()
+    seen["present"] = True
+    watcher.check_once()
+    watcher.check_once()
+    assert reports == []  # never 3 in a row
+
+    watcher.check_once()
+    assert reports == [1]

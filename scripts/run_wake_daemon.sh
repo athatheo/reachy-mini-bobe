@@ -24,4 +24,7 @@ if [[ -z "${UV_BIN}" ]]; then
   exit 127
 fi
 
-exec "${UV_BIN}" run bobe-wake-daemon
+# --extra wake-daemon keeps faster-whisper/fastapi installed even when other
+# uv operations re-sync the venv without extras (this bit us once: a dependency
+# change pruned the extras and the daemon lost Whisper until restart).
+exec "${UV_BIN}" run --extra wake-daemon bobe-wake-daemon
