@@ -268,4 +268,164 @@ def register(ctx: Any) -> None:
         handler=_handle_append,
         description="Append to an Obsidian note (append-only; no edit/delete).",
     )
-    logger.info("obsidian-scoped plugin registered: search/read/list/append only")
+    _register_semantic(ctx)
+    logger.info("obsidian-scoped plugin registered: search/semantic/read/list/append only")
+
+
+# ----------------------------------------------------------------------
+# Layer 4: local semantic search (fastembed ONNX; index outside the vault)
+# ----------------------------------------------------------------------
+
+_INDEX_DIR = Path(os.path.expanduser("~/.hermes/obsidian-index"))
+_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+_CHUNK_CHARS = 1200
+_EMBEDDER = None
+
+
+def _get_embedder() -> Any:
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        from fastembed import TextEmbedding
+
+        _EMBEDDER = TextEmbedding(model_name=_EMBED_MODEL)
+    return _EMBEDDER
+
+
+def _chunk_note(rel: str, text: str) -> list:
+    """Split a note into overlapping-ish chunks keyed by heading context."""
+    chunks = []
+    buf: list = []
+    size = 0
+    for line in text.splitlines():
+        buf.append(line)
+        size += len(line) + 1
+        if size >= _CHUNK_CHARS:
+            chunks.append("\n".join(buf).strip())
+            buf, size = buf[-3:], sum(len(b) + 1 for b in buf[-3:])
+    tail = "\n".join(buf).strip()
+    if tail:
+        chunks.append(tail)
+    return [{"note": rel, "text": chunk} for chunk in chunks if len(chunk) > 40]
+
+
+def _build_or_update_index(root: Path) -> dict:
+    """Incrementally (re)embed changed notes; returns the loaded index."""
+    import numpy as np
+
+    _INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    manifest_path = _INDEX_DIR / "manifest.json"
+    chunks_path = _INDEX_DIR / "chunks.json"
+    vectors_path = _INDEX_DIR / "vectors.npy"
+
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    chunks = json.loads(chunks_path.read_text()) if chunks_path.exists() else []
+    vectors = np.load(vectors_path) if vectors_path.exists() and chunks else None
+
+    current: dict = {}
+    for note in _iter_notes(root):
+        rel = str(note.relative_to(root))
+        stat = note.stat()
+        current[rel] = f"{stat.st_mtime_ns}:{stat.st_size}"
+
+    stale = {rel for rel in manifest if manifest.get(rel) != current.get(rel)}
+    fresh = {rel for rel in current if rel not in manifest}
+    to_embed = sorted(stale | fresh)
+
+    if to_embed or (set(manifest) - set(current)):
+        keep_mask = [c["note"] not in stale and c["note"] in current for c in chunks]
+        chunks = [c for c, keep in zip(chunks, keep_mask) if keep]
+        if vectors is not None and len(keep_mask) == vectors.shape[0]:
+            vectors = vectors[np.array(keep_mask, dtype=bool)] if chunks else None
+        else:
+            vectors, chunks = None, []
+            to_embed = sorted(current)
+
+        new_chunks = []
+        for rel in to_embed:
+            try:
+                text = (root / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            new_chunks.extend(_chunk_note(rel, text))
+        if new_chunks:
+            embedder = _get_embedder()
+            new_vecs = np.array(list(embedder.embed([c["text"] for c in new_chunks])), dtype=np.float32)
+            vectors = new_vecs if vectors is None else np.vstack([vectors, new_vecs])
+            chunks = chunks + new_chunks
+
+        manifest_path.write_text(json.dumps(current))
+        chunks_path.write_text(json.dumps(chunks))
+        if vectors is not None:
+            np.save(vectors_path, vectors)
+
+    return {"chunks": chunks, "vectors": vectors}
+
+
+def _handle_semantic_search(params: Dict[str, Any], **kwargs: Any) -> str:
+    del kwargs
+    try:
+        import numpy as np
+
+        query = (params.get("query") or "").strip()
+        if len(query) < 3:
+            return json.dumps({"success": False, "error": "query must be at least 3 characters"})
+        max_results = min(int(params.get("max_results") or 8), 15)
+        root = _vault_root()
+        index = _build_or_update_index(root)
+        if index["vectors"] is None or not index["chunks"]:
+            return json.dumps({"success": True, "results": [], "note": "vault index is empty"})
+
+        embedder = _get_embedder()
+        query_vec = np.array(list(embedder.embed([query])), dtype=np.float32)[0]
+        vectors = index["vectors"]
+        scores = vectors @ query_vec / (
+            (np.linalg.norm(vectors, axis=1) * np.linalg.norm(query_vec)) + 1e-9
+        )
+        order = np.argsort(-scores)
+
+        seen_notes: dict = {}
+        results = []
+        for idx in order:
+            chunk = index["chunks"][int(idx)]
+            if seen_notes.get(chunk["note"], 0) >= 2:
+                continue
+            seen_notes[chunk["note"]] = seen_notes.get(chunk["note"], 0) + 1
+            results.append(
+                {
+                    "note": chunk["note"],
+                    "score": round(float(scores[int(idx)]), 3),
+                    "snippet": chunk["text"][:300],
+                }
+            )
+            if len(results) >= max_results:
+                break
+        return json.dumps({"success": True, "query": query, "results": results})
+    except Exception as exc:
+        logger.exception("obsidian_semantic_search failed")
+        return json.dumps({"success": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _register_semantic(ctx: Any) -> None:
+    ctx.register_tool(
+        name="obsidian_semantic_search",
+        toolset="obsidian",
+        schema={
+            "name": "obsidian_semantic_search",
+            "description": (
+                "Semantic (meaning-based) search over the user's Obsidian vault — finds "
+                "relevant notes even when they use different words than the query. Use for "
+                "fuzzy recall; use obsidian_search for exact terms. Follow up promising "
+                "hits with obsidian_read."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What you are looking for, phrased naturally"},
+                    "max_results": {"type": "integer", "description": "Max passages (default 8)"},
+                },
+                "required": ["query"],
+            },
+        },
+        handler=_handle_semantic_search,
+        description="Semantic search over the Obsidian vault (read-only, fully local).",
+    )
