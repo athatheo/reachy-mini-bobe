@@ -1,13 +1,13 @@
-"""Lightweight person-presence detection from the camera frame buffer.
+"""Ship periodic camera snapshots to the Mac daemon for presence detection.
 
-Watches the camera worker's latest frame for a frontal face (OpenCV Haar
-cascade — no extra ML dependencies) and reports sightings to a callback at a
-throttled rate. The Mac wake daemon turns those sightings into behavior (e.g.
-the first-sighting-after-6am morning briefing); the robot only reports.
+The robot's bundled OpenCV is a minimal build without object detection, so
+face-finding happens on the Mac: this watcher just downscales the latest
+camera frame to a small JPEG every few seconds and hands it to a callback
+(which relays it over the authenticated wake WebSocket). The daemon runs the
+face detector and the sit-vs-pass-by dwell logic.
 """
 
 from __future__ import annotations
-import time
 import logging
 import threading
 from typing import Any, Callable
@@ -17,92 +17,70 @@ import cv2
 
 logger = logging.getLogger(__name__)
 
-# How often a frame is checked, and the minimum spacing between reports.
+# How often a snapshot is shipped. Policy (dwell, daily gates) lives daemon-side.
 CHECK_INTERVAL_S = 5.0
-REPORT_INTERVAL_S = 30.0
-# Dwell requirement: this many consecutive positive checks before a sighting
-# is reported. With 5 s checks, 3 hits ≈ 10-15 s of continuous presence —
-# someone sitting down, not walking past.
-DWELL_CHECKS = 3
-# Haar tuning: robust-ish defaults; a desk-distance face is well over 60 px.
-_SCALE_FACTOR = 1.1
-_MIN_NEIGHBORS = 5
-_MIN_SIZE = (60, 60)
+# Downscale target width: plenty for a desk-distance face, tiny on the wire.
+FRAME_WIDTH = 320
+_JPEG_QUALITY = 70
 
 
 class PresenceWatcher:
-    """Poll camera frames for a face and report sightings (rate-limited)."""
+    """Ship small camera snapshots for daemon-side presence detection."""
 
     def __init__(
         self,
         camera_worker: Any,
-        on_present: Callable[[], None],
+        on_frame: Callable[[bytes], None],
         *,
         check_interval_s: float = CHECK_INTERVAL_S,
-        report_interval_s: float = REPORT_INTERVAL_S,
-        dwell_checks: int = DWELL_CHECKS,
-        detector: Callable[[Any], bool] | None = None,
+        encoder: Callable[[Any], bytes | None] | None = None,
     ) -> None:
-        """Create the watcher; ``detector`` is injectable for tests."""
+        """Create the watcher; ``encoder`` is injectable for tests."""
         self._camera_worker = camera_worker
-        self._on_present = on_present
+        self._on_frame = on_frame
         self._check_interval_s = check_interval_s
-        self._report_interval_s = report_interval_s
-        self._dwell_checks = max(1, dwell_checks)
-        self._detector = detector or self._haar_face_present
-        self._cascade: Any = None
-        self._consecutive_hits = 0
-        self._last_report_at = 0.0
+        self._encoder = encoder or self._encode_jpeg
+        # Diagnostics surfaced via /status.
+        self._checks = 0
+        self._frames = 0
+        self._shipped = 0
+        self._last_error = ""
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def _haar_face_present(self, frame: Any) -> bool:
-        if self._cascade is None:
-            # cv2.data is untyped in the opencv stubs; resolve defensively.
-            haar_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
-            self._cascade = cv2.CascadeClassifier(haar_dir + "haarcascade_frontalface_default.xml")
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self._cascade.detectMultiScale(
-            gray,
-            scaleFactor=_SCALE_FACTOR,
-            minNeighbors=_MIN_NEIGHBORS,
-            minSize=_MIN_SIZE,
-        )
-        return len(faces) > 0
+    def _encode_jpeg(self, frame: Any) -> bytes | None:
+        height, width = frame.shape[:2]
+        if width > FRAME_WIDTH:
+            scale = FRAME_WIDTH / float(width)
+            frame = cv2.resize(frame, (FRAME_WIDTH, max(1, int(height * scale))))
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+        return encoded.tobytes() if ok else None
 
     def check_once(self) -> bool:
-        """Run one detection pass; report (dwell-gated, throttled) on presence.
-
-        A sighting is only reported after ``dwell_checks`` consecutive
-        positive checks, so someone walking past the camera between two
-        checks never counts as "sat down".
-        """
+        """Grab, downscale, and ship one snapshot; returns True when shipped."""
+        self._checks += 1
         frame = self._camera_worker.get_latest_frame()
         if frame is None:
-            self._consecutive_hits = 0
+            return False
+        self._frames += 1
+        try:
+            jpeg = self._encoder(frame)
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"[:200]
+            logger.debug("Snapshot encoding failed", exc_info=True)
+            return False
+        if not jpeg:
             return False
         try:
-            present = bool(self._detector(frame))
+            self._on_frame(jpeg)
+            self._shipped += 1
         except Exception:
-            logger.debug("Presence detection failed on a frame", exc_info=True)
-            present = False
-        if not present:
-            self._consecutive_hits = 0
+            logger.exception("Snapshot ship callback failed")
             return False
-        self._consecutive_hits += 1
-        if self._consecutive_hits < self._dwell_checks:
-            return True
-        now = time.monotonic()
-        if now - self._last_report_at >= self._report_interval_s:
-            self._last_report_at = now
-            try:
-                self._on_present()
-            except Exception:
-                logger.exception("Presence report callback failed")
         return True
 
     def _run(self) -> None:
-        logger.info("Presence watcher started (every %.0fs)", self._check_interval_s)
+        logger.info("Presence snapshot shipper started (every %.0fs)", self._check_interval_s)
         while not self._stop_event.wait(self._check_interval_s):
             self.check_once()
 
@@ -121,3 +99,13 @@ class PresenceWatcher:
         if thread is not None:
             thread.join(timeout=2.0)
             self._thread = None
+
+    def debug_state(self) -> dict[str, object]:
+        """Snapshot of watcher counters for the /status diagnostics page."""
+        return {
+            "running": self._thread is not None and self._thread.is_alive(),
+            "checks": self._checks,
+            "frames": self._frames,
+            "snapshots_shipped": self._shipped,
+            "last_error": self._last_error or None,
+        }

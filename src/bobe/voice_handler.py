@@ -76,6 +76,8 @@ class BobeVoiceHandler(AsyncStreamHandler):
         # waking the robot; any real wake flips it back on.
         self._announce_wake_allowed: bool = True
         self._wake_transition_task: asyncio.Task[None] | None = None
+        # Set by main.run() when a camera is present; surfaced in /status.
+        self.presence_watcher: Any = None
 
         # Local wake-word gating. The factory is looked up in this module's
         # namespace at call time so tests can stub

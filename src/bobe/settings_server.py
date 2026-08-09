@@ -144,6 +144,11 @@ class SettingsUIServer:
                     "wake_remote_url": wake_remote_url,
                     "wake_timeout_s": wake_config.timeout_s if wake_config else None,
                     "wake_debug": wake_debug,
+                    "presence": (
+                        handler.presence_watcher.debug_state()
+                        if handler is not None and getattr(handler, "presence_watcher", None) is not None
+                        else None
+                    ),
                 }
             )
 

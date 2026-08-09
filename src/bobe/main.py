@@ -183,6 +183,8 @@ def run(
 
         presence_watcher = PresenceWatcher(camera_worker, handler.wake_gate.notify_presence)
         presence_watcher.start()
+        # Expose watcher diagnostics through the settings /status page.
+        handler.presence_watcher = presence_watcher
 
     def poll_stop_event() -> None:
         """Poll the stop event to allow graceful shutdown."""

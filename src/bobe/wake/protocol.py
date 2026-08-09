@@ -85,9 +85,16 @@ def announce_message(*, text: str) -> dict[str, Any]:
     }
 
 
-def presence_message() -> dict[str, Any]:
-    """Build a robot-to-daemon report that a person is in front of the camera."""
-    return {"type": MSG_PRESENCE}
+def presence_message(*, jpeg_b64: str | None = None) -> dict[str, Any]:
+    """Build a robot-to-daemon presence payload.
+
+    With ``jpeg_b64`` the daemon runs face detection on the snapshot; without
+    it the message is a bare (already-detected) sighting report.
+    """
+    payload: dict[str, Any] = {"type": MSG_PRESENCE}
+    if jpeg_b64 is not None:
+        payload["jpeg_b64"] = jpeg_b64
+    return payload
 
 
 def emote_message(*, emotion: str) -> dict[str, Any]:
