@@ -48,32 +48,68 @@ def _calendar_id() -> str:
     return calendar_id
 
 
+def _configured_calendar_ids() -> list:
+    """Calendar IDs to read, from GCAL_CALENDAR_IDS (comma-separated).
+
+    Service accounts do not auto-list calendars shared with them, so IDs are
+    configured explicitly (a primary calendar's ID is its Gmail address).
+    Falls back to the single CALENDAR_ID.
+    """
+    raw = (os.getenv("GCAL_CALENDAR_IDS") or "").strip()
+    ids = [part.strip() for part in raw.split(",") if part.strip()]
+    if not ids:
+        ids = [_calendar_id()]
+    return ids
+
+
 def _handle_list(params: Dict[str, Any], **kwargs: Any) -> str:
     del kwargs
     try:
         service = _calendar_service()
-        request: Dict[str, Any] = {
-            "calendarId": _calendar_id(),
-            "singleEvents": True,
-            "orderBy": "startTime",
-            "maxResults": min(int(params.get("max_results") or 20), 50),
-        }
-        if params.get("time_min"):
-            request["timeMin"] = params["time_min"]
-        if params.get("time_max"):
-            request["timeMax"] = params["time_max"]
-        result = service.events().list(**request).execute()
-        events = [
-            {
-                "summary": item.get("summary", "(no title)"),
-                "start": (item.get("start") or {}).get("dateTime") or (item.get("start") or {}).get("date"),
-                "end": (item.get("end") or {}).get("dateTime") or (item.get("end") or {}).get("date"),
-                "location": item.get("location"),
-                "description": (item.get("description") or "")[:200] or None,
+        max_results = min(int(params.get("max_results") or 20), 50)
+        calendar_ids = _configured_calendar_ids()
+        visible, unavailable = [], []
+        events = []
+        for cal_id in calendar_ids:
+            request: Dict[str, Any] = {
+                "calendarId": cal_id,
+                "singleEvents": True,
+                "orderBy": "startTime",
+                "maxResults": max_results,
             }
-            for item in result.get("items", [])
-        ]
-        return json.dumps({"success": True, "events": events, "count": len(events)})
+            if params.get("time_min"):
+                request["timeMin"] = params["time_min"]
+            if params.get("time_max"):
+                request["timeMax"] = params["time_max"]
+            try:
+                result = service.events().list(**request).execute()
+            except Exception:
+                logger.warning("Listing calendar %r failed (not shared yet?); skipping", cal_id)
+                unavailable.append(cal_id)
+                continue
+            visible.append(cal_id)
+            for item in result.get("items", []):
+                events.append(
+                    {
+                        "calendar": result.get("summary") or cal_id,
+                        "summary": item.get("summary", "(no title)"),
+                        "start": (item.get("start") or {}).get("dateTime") or (item.get("start") or {}).get("date"),
+                        "end": (item.get("end") or {}).get("dateTime") or (item.get("end") or {}).get("date"),
+                        "location": item.get("location"),
+                        "description": (item.get("description") or "")[:200] or None,
+                    }
+                )
+        events.sort(key=lambda e: e.get("start") or "")
+        events = events[:max_results]
+        return json.dumps(
+            {
+                "success": True,
+                "calendars_visible": visible,
+                "calendars_unavailable_not_shared": unavailable,
+                "events": events,
+                "count": len(events),
+            }
+        )
     except Exception as exc:
         logger.exception("calendar_list_events failed")
         return json.dumps({"success": False, "error": f"{type(exc).__name__}: {exc}"})
@@ -121,8 +157,8 @@ def register(ctx: Any) -> None:
         schema={
             "name": "calendar_list_events",
             "description": (
-                "List upcoming events from the user's Google Calendar. Read-only. "
-                "Times are ISO 8601; defaults to upcoming events when no range is given."
+                "List events across ALL of the user's visible Google Calendars, merged and "
+                "sorted. Read-only. Times are ISO 8601; pass time_min/time_max to bound the range."
             ),
             "parameters": {
                 "type": "object",

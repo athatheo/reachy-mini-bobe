@@ -47,11 +47,12 @@ logger = logging.getLogger(__name__)
 MORNING_BRIEF_PROMPT = (
     "Automated morning briefing trigger (the user just sat down at their desk "
     "for the first time today — this is not spoken input). Check the kanban "
-    "board and todo lists for items relevant today. If anything is genuinely "
-    "important or time-sensitive today, greet the user briefly and tell them "
-    "only those few most important items, concisely. If nothing is truly "
-    "important, just wish them a good morning and say there is nothing "
-    "pressing today. Plain spoken sentences, at most four."
+    "board and todo lists AND today's calendar events (calendar_list_events "
+    "bounded to today). Greet the user briefly, then: mention today's "
+    "meetings/appointments with their times if there are any, and the few "
+    "genuinely important or time-sensitive tasks if there are any. If neither "
+    "exists, just wish them a good morning and say the day is clear. Plain "
+    "spoken sentences, at most five."
 )
 
 
