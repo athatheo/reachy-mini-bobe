@@ -1,0 +1,19 @@
+name: obsidian-scoped
+label: Obsidian Vault (scoped)
+kind: tool
+version: 1.0.0
+description: >
+  Deliberately scoped Obsidian vault access: search, read, list, and APPEND
+  (append to any note; create new notes only in allowed folders). No delete,
+  overwrite, rename, or truncate tools exist. Enforcement at the tool layer.
+author: athatheoc
+requires_env:
+  - name: OBSIDIAN_VAULT
+    description: "Absolute path to the Obsidian vault"
+    prompt: "Vault path"
+    password: false
+optional_env:
+  - name: OBSIDIAN_CREATE_FOLDERS
+    description: "Comma-separated folders where new notes may be created (default: Hermes,Journal)"
+    prompt: "Creation folders"
+    password: false
