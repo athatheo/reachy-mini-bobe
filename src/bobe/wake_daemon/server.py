@@ -48,11 +48,14 @@ MORNING_BRIEF_PROMPT = (
     "Automated morning briefing trigger (the user just sat down at their desk "
     "for the first time today — this is not spoken input). Check the kanban "
     "board and todo lists AND today's calendar events (calendar_list_events "
-    "bounded to today). Greet the user briefly, then: mention today's "
-    "meetings/appointments with their times if there are any, and the few "
-    "genuinely important or time-sensitive tasks if there are any. If neither "
-    "exists, just wish them a good morning and say the day is clear. Plain "
-    "spoken sentences, at most five."
+    "bounded to today). Also try obsidian_read on yesterday's journal digest "
+    "at 'Hermes/Journal/<yesterday YYYY-MM-DD>.md' for continuity. Greet the "
+    "user briefly, then: mention today's meetings/appointments with their "
+    "times if any, the few genuinely important or time-sensitive tasks if "
+    "any, and at most ONE natural continuity remark from yesterday's digest "
+    "(an open loop or follow-up) if one clearly deserves it. If there is "
+    "nothing at all, wish them a good morning and say the day is clear. "
+    "Plain spoken sentences, at most six."
 )
 
 
