@@ -22,6 +22,7 @@ MSG_LISTEN = "listen"
 MSG_ANNOUNCE = "announce"
 MSG_SPEAK = "speak"
 MSG_EMOTE = "emote"
+MSG_PRESENCE = "presence"
 
 # WebSocket close codes used by the daemon handshake (RFC 6455).
 CLOSE_UNSUPPORTED_DATA = 1003
