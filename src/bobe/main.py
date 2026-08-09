@@ -174,8 +174,15 @@ def run(
     # Each async service → its own thread/loop
     movement_manager.start()
     head_wobbler.start()
+    presence_watcher = None
     if camera_worker:
         camera_worker.start()
+        # Report person-sightings to the wake daemon; the daemon decides what
+        # they mean (e.g. the once-a-day morning briefing trigger).
+        from bobe.vision.presence import PresenceWatcher
+
+        presence_watcher = PresenceWatcher(camera_worker, handler.wake_gate.notify_presence)
+        presence_watcher.start()
 
     def poll_stop_event() -> None:
         """Poll the stop event to allow graceful shutdown."""
@@ -198,6 +205,8 @@ def run(
     finally:
         movement_manager.stop()
         head_wobbler.stop()
+        if presence_watcher:
+            presence_watcher.stop()
         if camera_worker:
             camera_worker.stop()
 

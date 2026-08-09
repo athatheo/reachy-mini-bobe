@@ -39,6 +39,10 @@ class WakeDaemonConfig:
     max_utterance_s: float = DEFAULT_MAX_UTTERANCE_S
     speech_rms: float = DEFAULT_SPEECH_RMS
     refractory_s: float = DEFAULT_REFRACTORY_S
+    # Morning briefing: on the first person-sighting at/after this hour (local
+    # time), inject the briefing request once per day. Negative disables.
+    brief_after_hour: int = 6
+    brief_state_file: str = ""
 
 
 def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConfig:
@@ -92,4 +96,6 @@ def load_wake_daemon_config(env: dict[str, str] | None = None) -> WakeDaemonConf
         max_utterance_s=max(0.5, _float("VAD_MAX_UTTERANCE_S", DEFAULT_MAX_UTTERANCE_S)),
         speech_rms=max(50.0, _float("VAD_SPEECH_RMS", DEFAULT_SPEECH_RMS)),
         refractory_s=max(0.5, _float("WAKE_REFRACTORY_S", DEFAULT_REFRACTORY_S)),
+        brief_after_hour=_int("BOBE_BRIEF_AFTER_HOUR", 6),
+        brief_state_file=(source.get("BOBE_BRIEF_STATE_FILE") or "").strip(),
     )

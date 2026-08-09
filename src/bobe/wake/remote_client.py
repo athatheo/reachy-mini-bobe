@@ -29,6 +29,7 @@ from bobe.wake.protocol import (
     parse_json,
     hello_message,
     listen_message,
+    presence_message,
 )
 from bobe.wake.constants import WAKE_SAMPLE_RATE, DEBUG_WINDOW_SECONDS
 
@@ -95,6 +96,11 @@ class RemoteWakeClient:
         self._mode_lock = threading.Lock()
         self._listen_mode = "wake"
         self._mode_send_pending = threading.Event()
+        # Robot-to-daemon control messages (e.g. presence reports): queued
+        # here by any thread, drained by the send loop. Bounded and
+        # drop-on-full — control reports are advisory, never worth blocking
+        # the mic path for.
+        self._control_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=8)
         self._thread: threading.Thread | None = None
         self._stats_lock = threading.Lock()
         self._recent_stats: deque[tuple[float, float, str]] = deque()
@@ -156,6 +162,13 @@ class RemoteWakeClient:
     def listen_for_wake(self) -> None:
         """Listen for wake phrases while BoBe is asleep."""
         self._set_listen_mode("wake")
+
+    def notify_presence(self) -> None:
+        """Report that a person is visible (thread-safe, best-effort)."""
+        try:
+            self._control_queue.put_nowait(presence_message())
+        except queue.Full:
+            pass
 
     def _set_listen_mode(self, mode: str) -> None:
         with self._mode_lock:
@@ -382,6 +395,14 @@ class RemoteWakeClient:
                 else:
                     self._log_event("info", "Listening for wake phrase (BoBe asleep)")
                 # Re-check for an even newer mode before blocking on audio.
+                continue
+
+            try:
+                control = self._control_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                await ws.send(json.dumps(control))
                 continue
 
             try:

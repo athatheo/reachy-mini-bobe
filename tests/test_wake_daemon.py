@@ -776,3 +776,74 @@ def test_converse_mode_drops_junk_utterances(monkeypatch):
     session = _session(monkeypatch=monkeypatch, transcribe=lambda _audio: ". . . . . .")
     session.set_listen_mode("converse")
     assert _feed_utterance(session, ". . . . . .") is None
+
+
+# ---- presence + morning briefing ----
+
+
+def _brief_env(tmp_path, hour=0):
+    return {
+        **_TEST_ENV,
+        "BOBE_BRIEF_AFTER_HOUR": str(hour),
+        "BOBE_BRIEF_STATE_FILE": str(tmp_path / "brief-state"),
+    }
+
+
+def test_presence_fires_briefing_once_per_day(tmp_path):
+    from bobe.wake_daemon.server import MORNING_BRIEF_PROMPT, create_app
+
+    app = create_app(load_wake_daemon_config(_brief_env(tmp_path, hour=0)))
+    client = TestClient(app)
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "presence"})
+        ws.send_json({"type": "presence"})
+
+        got = client.get(
+            "/v1/utterances", params={"wait": 2}, headers={"X-BoBe-Wake-Token": "test-token"}
+        )
+        status = client.get("/v1/presence", headers={"X-BoBe-Wake-Token": "test-token"})
+
+    events = got.json()["events"]
+    assert [e["text"] for e in events] == [MORNING_BRIEF_PROMPT]
+    body = status.json()
+    assert body["last_presence_at"] is not None
+    assert body["brief_fired_on"] is not None
+
+
+def test_presence_respects_after_hour_gate(tmp_path):
+    from bobe.wake_daemon.server import create_app
+
+    # Hour 25 can never be reached: the gate must hold all day.
+    app = create_app(load_wake_daemon_config(_brief_env(tmp_path, hour=25)))
+    client = TestClient(app)
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "presence"})
+
+        got = client.get(
+            "/v1/utterances", params={"wait": 0}, headers={"X-BoBe-Wake-Token": "test-token"}
+        )
+
+    assert got.json()["events"] == []
+
+
+def test_presence_disabled_with_negative_hour(tmp_path):
+    from bobe.wake_daemon.server import create_app
+
+    app = create_app(load_wake_daemon_config(_brief_env(tmp_path, hour=-1)))
+    client = TestClient(app)
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+        ws.send_json({"type": "presence"})
+        got = client.get(
+            "/v1/utterances", params={"wait": 0}, headers={"X-BoBe-Wake-Token": "test-token"}
+        )
+
+    assert got.json()["events"] == []

@@ -51,9 +51,9 @@ class PresenceWatcher:
 
     def _haar_face_present(self, frame: Any) -> bool:
         if self._cascade is None:
-            self._cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            )
+            # cv2.data is untyped in the opencv stubs; resolve defensively.
+            haar_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
+            self._cascade = cv2.CascadeClassifier(haar_dir + "haarcascade_frontalface_default.xml")
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self._cascade.detectMultiScale(
             gray,

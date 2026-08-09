@@ -8,6 +8,8 @@ import base64
 import asyncio
 import logging
 import threading
+from pathlib import Path
+from datetime import date, datetime
 from contextlib import asynccontextmanager
 from dataclasses import replace
 
@@ -19,6 +21,7 @@ from bobe.wake.phrases import matches_wake_phrase
 from bobe.wake.protocol import (
     MSG_HELLO,
     MSG_LISTEN,
+    MSG_PRESENCE,
     CLOSE_POLICY_VIOLATION,
     CLOSE_UNSUPPORTED_DATA,
     parse_json,
@@ -37,6 +40,25 @@ from bobe.wake_daemon.engine import WhisperWakeEngine, WhisperWakeSession, warn_
 
 
 logger = logging.getLogger(__name__)
+
+# The morning briefing injected as an utterance on the first person-sighting
+# of the day: it flows through the normal bobe conversation lane, so Hermes
+# answers by voice with its kanban/todo tools.
+MORNING_BRIEF_PROMPT = (
+    "Automated morning briefing trigger (the user just sat down at their desk "
+    "for the first time today — this is not spoken input). Check the kanban "
+    "board and todo lists for items relevant today. If anything is genuinely "
+    "important or time-sensitive today, greet the user briefly and tell them "
+    "only those few most important items, concisely. If nothing is truly "
+    "important, just wish them a good morning and say there is nothing "
+    "pressing today. Plain spoken sentences, at most four."
+)
+
+
+def _brief_state_path(config: WakeDaemonConfig) -> Path:
+    if config.brief_state_file:
+        return Path(config.brief_state_file).expanduser()
+    return Path.home() / ".bobe-wake-daemon-brief-date"
 
 
 def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
@@ -95,6 +117,30 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     pass
 
     app.state.enqueue_utterance = enqueue_utterance
+    app.state.last_presence_at = None
+
+    def handle_presence() -> None:
+        """Record a person-sighting; fire the once-a-day morning briefing."""
+        app.state.last_presence_at = time.time()
+        if config_brief_hour < 0:
+            return
+        now = datetime.now()
+        if now.hour < config_brief_hour:
+            return
+        state_path = _brief_state_path(runtime)
+        today = date.today().isoformat()
+        try:
+            if state_path.exists() and state_path.read_text().strip() == today:
+                return
+            state_path.write_text(today)
+        except OSError:
+            logger.exception("Could not persist morning-brief state; skipping to avoid repeats")
+            return
+        logger.info("First sighting of the day (hour=%d): queuing morning briefing", now.hour)
+        enqueue_utterance(MORNING_BRIEF_PROMPT)
+
+    config_brief_hour = runtime.brief_after_hour
+    app.state.handle_presence = handle_presence
     # Half-duplex echo guard: while a relayed speech clip is playing on the
     # robot there is no echo cancellation, so converse-mode capture would
     # transcribe the robot's own voice. /v1/speak advances this deadline by
@@ -239,6 +285,25 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
         logger.info("Relayed emote %r to %d robot stream(s)", emotion, delivered)
         return JSONResponse({"ok": True, "delivered": delivered})
 
+    @app.get("/v1/presence")
+    async def presence_status(request: Request) -> JSONResponse:
+        """Report the last person-sighting time (diagnostics)."""
+        provided_token = (request.headers.get("x-bobe-wake-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, runtime.token or ""):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        last = app.state.last_presence_at
+        state_path = _brief_state_path(runtime)
+        fired = state_path.read_text().strip() if state_path.exists() else None
+        return JSONResponse(
+            {
+                "ok": True,
+                "last_presence_at": last,
+                "seconds_since_presence": round(time.time() - last, 1) if last else None,
+                "brief_fired_on": fired,
+                "brief_after_hour": runtime.brief_after_hour,
+            }
+        )
+
     @app.get("/v1/utterances")
     async def utterances(request: Request) -> JSONResponse:
         """Long-poll robot utterances (consumed by the Hermes bobe plugin).
@@ -355,6 +420,8 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     msg_type = payload.get("type")
                     if msg_type == MSG_LISTEN:
                         apply_listen(payload)
+                    elif msg_type == MSG_PRESENCE:
+                        handle_presence()
                     continue
 
                 data = message.get("bytes")

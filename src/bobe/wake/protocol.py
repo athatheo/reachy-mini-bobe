@@ -85,6 +85,11 @@ def announce_message(*, text: str) -> dict[str, Any]:
     }
 
 
+def presence_message() -> dict[str, Any]:
+    """Build a robot-to-daemon report that a person is in front of the camera."""
+    return {"type": MSG_PRESENCE}
+
+
 def emote_message(*, emotion: str) -> dict[str, Any]:
     """Build a daemon-to-robot request to play a recorded emotion move."""
     return {

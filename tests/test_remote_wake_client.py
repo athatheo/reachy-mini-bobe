@@ -514,3 +514,12 @@ def test_remote_client_dispatches_emotes():
     client._handle_emote_payload({"type": "emote", "emotion": "  "})
 
     assert received == ["amazed1"]
+
+
+def test_remote_client_queues_presence_control_message():
+    client = RemoteWakeClient(lambda: None, url="ws://mac:8765/v1/stream")
+
+    client.notify_presence()
+
+    control = client._control_queue.get_nowait()
+    assert control == {"type": "presence"}

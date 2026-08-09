@@ -431,6 +431,12 @@ class WakeGate:
         """Re-queue a wake request (used when a wake transition fails and backs off)."""
         self.session.request_wake()
 
+    def notify_presence(self) -> None:
+        """Forward a person-sighting to the daemon (no-op without a detector)."""
+        detector = self.detector
+        if detector is not None and hasattr(detector, "notify_presence"):
+            detector.notify_presence()
+
     def touch(self) -> None:
         """Record session activity, resetting the inactivity timer."""
         self.session.touch()
