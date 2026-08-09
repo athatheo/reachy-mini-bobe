@@ -789,17 +789,32 @@ def _brief_env(tmp_path, hour=0):
     }
 
 
-def test_presence_fires_briefing_once_per_day(tmp_path):
-    from bobe.wake_daemon.server import MORNING_BRIEF_PROMPT, create_app
+def _fake_jpeg():
+    import base64
 
-    app = create_app(load_wake_daemon_config(_brief_env(tmp_path, hour=0)))
+    return base64.b64encode(b"\xff\xd8fakejpegdata").decode("ascii")
+
+
+def _presence_app(tmp_path, hour=0, detector=None):
+    from bobe.wake_daemon.server import create_app
+
+    app = create_app(load_wake_daemon_config(_brief_env(tmp_path, hour=hour)))
+    if detector is not None:
+        app.state.face_detector = detector
+    return app
+
+
+def test_dwell_frames_fire_briefing_once(tmp_path):
+    from bobe.wake_daemon.server import MORNING_BRIEF_PROMPT
+
+    app = _presence_app(tmp_path, hour=0, detector=lambda jpeg: True)
     client = TestClient(app)
 
     with client.websocket_connect("/v1/stream") as ws:
         ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
         assert ws.receive_json()["type"] == "ready"
-        ws.send_json({"type": "presence"})
-        ws.send_json({"type": "presence"})
+        for _ in range(4):
+            ws.send_json({"type": "presence", "jpeg_b64": _fake_jpeg()})
 
         got = client.get(
             "/v1/utterances", params={"wait": 2}, headers={"X-BoBe-Wake-Token": "test-token"}
@@ -809,22 +824,39 @@ def test_presence_fires_briefing_once_per_day(tmp_path):
     events = got.json()["events"]
     assert [e["text"] for e in events] == [MORNING_BRIEF_PROMPT]
     body = status.json()
-    assert body["last_presence_at"] is not None
+    assert body["frames_received"] == 4
+    assert body["face_hits"] == 4
     assert body["brief_fired_on"] is not None
 
 
-def test_presence_respects_after_hour_gate(tmp_path):
-    from bobe.wake_daemon.server import create_app
-
-    # Hour 25 can never be reached: the gate must hold all day.
-    app = create_app(load_wake_daemon_config(_brief_env(tmp_path, hour=25)))
+def test_dwell_requires_consecutive_face_frames(tmp_path):
+    hits = iter([True, True, False, True, True])
+    app = _presence_app(tmp_path, hour=0, detector=lambda jpeg: next(hits))
     client = TestClient(app)
 
     with client.websocket_connect("/v1/stream") as ws:
         ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
         assert ws.receive_json()["type"] == "ready"
-        ws.send_json({"type": "presence"})
+        for _ in range(5):
+            ws.send_json({"type": "presence", "jpeg_b64": _fake_jpeg()})
 
+        got = client.get(
+            "/v1/utterances", params={"wait": 1}, headers={"X-BoBe-Wake-Token": "test-token"}
+        )
+
+    # Never three faces in a row: no briefing.
+    assert got.json()["events"] == []
+
+
+def test_presence_respects_after_hour_gate(tmp_path):
+    app = _presence_app(tmp_path, hour=25, detector=lambda jpeg: True)
+    client = TestClient(app)
+
+    with client.websocket_connect("/v1/stream") as ws:
+        ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
+        assert ws.receive_json()["type"] == "ready"
+        for _ in range(4):
+            ws.send_json({"type": "presence", "jpeg_b64": _fake_jpeg()})
         got = client.get(
             "/v1/utterances", params={"wait": 0}, headers={"X-BoBe-Wake-Token": "test-token"}
         )
@@ -833,15 +865,14 @@ def test_presence_respects_after_hour_gate(tmp_path):
 
 
 def test_presence_disabled_with_negative_hour(tmp_path):
-    from bobe.wake_daemon.server import create_app
-
-    app = create_app(load_wake_daemon_config(_brief_env(tmp_path, hour=-1)))
+    app = _presence_app(tmp_path, hour=-1, detector=lambda jpeg: True)
     client = TestClient(app)
 
     with client.websocket_connect("/v1/stream") as ws:
         ws.send_json({"type": "hello", "token": "test-token", "sample_rate": 16000, "phrase": "hey bobe"})
         assert ws.receive_json()["type"] == "ready"
-        ws.send_json({"type": "presence"})
+        for _ in range(4):
+            ws.send_json({"type": "presence", "jpeg_b64": _fake_jpeg()})
         got = client.get(
             "/v1/utterances", params={"wait": 0}, headers={"X-BoBe-Wake-Token": "test-token"}
         )

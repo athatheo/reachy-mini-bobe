@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 
 import numpy as np
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from bobe.wake.phrases import matches_wake_phrase
@@ -53,6 +53,69 @@ MORNING_BRIEF_PROMPT = (
     "important, just wish them a good morning and say there is nothing "
     "pressing today. Plain spoken sentences, at most four."
 )
+
+
+# Sit-vs-pass-by dwell: this many consecutive face-bearing snapshots
+# (robot ships one every ~5s) before a sighting counts as "sat down".
+PRESENCE_DWELL_FRAMES = 3
+
+
+_YOLO_MODEL: list = []
+
+
+def _person_present(jpeg_bytes: bytes) -> bool:
+    """Detect a person in a snapshot: YOLO (pose-proof) with Haar fallback.
+
+    Haar face cascades miss the common desk posture (facing the monitor, not
+    the robot — verified against a real snapshot); YOLOv8n's person class
+    detects a seated human from any angle at ~30 ms per 320 px frame.
+    """
+    try:
+        if not _YOLO_MODEL:
+            from ultralytics import YOLO
+
+            _YOLO_MODEL.append(YOLO("yolov8n.pt"))
+        import cv2
+
+        buffer = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        if frame is None:
+            return False
+        results = _YOLO_MODEL[0].predict(frame, classes=[0], conf=0.5, verbose=False)
+        return len(results[0].boxes) > 0
+    except ImportError:
+        return _haar_face_present(jpeg_bytes)
+
+
+_HAAR_CASCADES: list = []
+
+
+def _haar_face_present(jpeg_bytes: bytes) -> bool:
+    """Detect a face in a JPEG snapshot (full OpenCV on the Mac).
+
+    Checks frontal AND profile poses (plus the mirrored profile — the profile
+    cascade is single-sided): someone working at a desk usually faces their
+    monitor, not the robot.
+    """
+    import cv2
+
+    buffer = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(buffer, cv2.IMREAD_GRAYSCALE)
+    if frame is None:
+        return False
+    if not _HAAR_CASCADES:
+        haar_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
+        for name in ("haarcascade_frontalface_default.xml", "haarcascade_profileface.xml"):
+            cascade = cv2.CascadeClassifier(haar_dir + name)
+            if not cascade.empty():
+                _HAAR_CASCADES.append(cascade)
+    variants = (frame, cv2.flip(frame, 1))
+    for cascade in _HAAR_CASCADES:
+        for variant in variants:
+            faces = cascade.detectMultiScale(variant, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+            if len(faces) > 0:
+                return True
+    return False
 
 
 def _brief_state_path(config: WakeDaemonConfig) -> Path:
@@ -118,6 +181,12 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
 
     app.state.enqueue_utterance = enqueue_utterance
     app.state.last_presence_at = None
+    app.state.face_detector = _person_present
+    app.state.presence_frames = 0
+    app.state.presence_face_hits = 0
+    app.state.presence_consecutive = 0
+    app.state.presence_last_error = None
+    app.state.presence_last_jpeg = None
 
     def handle_presence() -> None:
         """Record a person-sighting; fire the once-a-day morning briefing."""
@@ -141,6 +210,27 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
 
     config_brief_hour = runtime.brief_after_hour
     app.state.handle_presence = handle_presence
+
+    def handle_presence_frame(jpeg_b64: str) -> None:
+        """Run face detection on a robot snapshot; dwell-gate the sighting."""
+        app.state.presence_frames += 1
+        try:
+            jpeg = base64.b64decode(jpeg_b64)
+            app.state.presence_last_jpeg = jpeg
+            present = bool(app.state.face_detector(jpeg))
+        except Exception as exc:
+            app.state.presence_last_error = f"{type(exc).__name__}: {exc}"[:200]
+            logger.debug("Presence frame detection failed", exc_info=True)
+            return
+        if not present:
+            app.state.presence_consecutive = 0
+            return
+        app.state.presence_face_hits += 1
+        app.state.presence_consecutive += 1
+        if app.state.presence_consecutive >= PRESENCE_DWELL_FRAMES:
+            handle_presence()
+
+    app.state.handle_presence_frame = handle_presence_frame
     # Half-duplex echo guard: while a relayed speech clip is playing on the
     # robot there is no echo cancellation, so converse-mode capture would
     # transcribe the robot's own voice. /v1/speak advances this deadline by
@@ -301,8 +391,22 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                 "seconds_since_presence": round(time.time() - last, 1) if last else None,
                 "brief_fired_on": fired,
                 "brief_after_hour": runtime.brief_after_hour,
+                "frames_received": app.state.presence_frames,
+                "face_hits": app.state.presence_face_hits,
+                "consecutive": app.state.presence_consecutive,
+                "detect_error": app.state.presence_last_error,
             }
         )
+
+    @app.get("/v1/presence-frame")
+    async def presence_frame(request: Request) -> Response:
+        """Return the most recent robot snapshot (diagnostics)."""
+        provided_token = (request.headers.get("x-bobe-wake-token") or "").strip()
+        if not provided_token or not hmac.compare_digest(provided_token, runtime.token or ""):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        if app.state.presence_last_jpeg is None:
+            return JSONResponse({"ok": False, "error": "no_frame_yet"}, status_code=404)
+        return Response(content=app.state.presence_last_jpeg, media_type="image/jpeg")
 
     @app.get("/v1/utterances")
     async def utterances(request: Request) -> JSONResponse:
@@ -421,7 +525,11 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
                     if msg_type == MSG_LISTEN:
                         apply_listen(payload)
                     elif msg_type == MSG_PRESENCE:
-                        handle_presence()
+                        jpeg_b64 = payload.get("jpeg_b64")
+                        if isinstance(jpeg_b64, str) and jpeg_b64:
+                            await asyncio.to_thread(handle_presence_frame, jpeg_b64)
+                        else:
+                            handle_presence()
                     continue
 
                 data = message.get("bytes")

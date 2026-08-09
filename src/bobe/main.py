@@ -181,7 +181,7 @@ def run(
         # they mean (e.g. the once-a-day morning briefing trigger).
         from bobe.vision.presence import PresenceWatcher
 
-        presence_watcher = PresenceWatcher(camera_worker, handler.wake_gate.notify_presence)
+        presence_watcher = PresenceWatcher(camera_worker, handler.wake_gate.notify_presence_frame)
         presence_watcher.start()
         # Expose watcher diagnostics through the settings /status page.
         handler.presence_watcher = presence_watcher

@@ -519,7 +519,7 @@ def test_remote_client_dispatches_emotes():
 def test_remote_client_queues_presence_control_message():
     client = RemoteWakeClient(lambda: None, url="ws://mac:8765/v1/stream")
 
-    client.notify_presence()
+    client.notify_presence("aGVsbG8=")
 
     control = client._control_queue.get_nowait()
-    assert control == {"type": "presence"}
+    assert control == {"type": "presence", "jpeg_b64": "aGVsbG8="}

@@ -431,11 +431,13 @@ class WakeGate:
         """Re-queue a wake request (used when a wake transition fails and backs off)."""
         self.session.request_wake()
 
-    def notify_presence(self) -> None:
-        """Forward a person-sighting to the daemon (no-op without a detector)."""
+    def notify_presence_frame(self, jpeg: bytes) -> None:
+        """Ship a camera snapshot to the daemon (no-op without a detector)."""
+        import base64 as _b64
+
         detector = self.detector
         if detector is not None and hasattr(detector, "notify_presence"):
-            detector.notify_presence()
+            detector.notify_presence(_b64.b64encode(jpeg).decode("ascii"))
 
     def touch(self) -> None:
         """Record session activity, resetting the inactivity timer."""

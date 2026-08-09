@@ -163,10 +163,10 @@ class RemoteWakeClient:
         """Listen for wake phrases while BoBe is asleep."""
         self._set_listen_mode("wake")
 
-    def notify_presence(self) -> None:
-        """Report that a person is visible (thread-safe, best-effort)."""
+    def notify_presence(self, jpeg_b64: str | None = None) -> None:
+        """Report presence (optionally with a snapshot) — thread-safe, best-effort."""
         try:
-            self._control_queue.put_nowait(presence_message())
+            self._control_queue.put_nowait(presence_message(jpeg_b64=jpeg_b64))
         except queue.Full:
             pass
 

@@ -61,3 +61,4 @@ cache/
 # Wake-word training artifacts (local experiments only)
 wake_training/
 .heed/
+yolov8n.pt

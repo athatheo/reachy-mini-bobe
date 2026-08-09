@@ -1,0 +1,18 @@
+name: gcal-scoped
+label: Google Calendar (scoped)
+kind: tool
+version: 1.0.0
+description: >
+  Deliberately scoped Google Calendar access: the agent can LIST events and
+  CREATE new ones — update and delete tools intentionally do not exist. Uses a
+  service-account credential; the enforcement lives at the tool layer.
+author: athatheoc
+requires_env:
+  - name: GCAL_SERVICE_ACCOUNT_FILE
+    description: "Path to the Google service-account JSON (calendar scope)"
+    prompt: "Service account JSON path"
+    password: false
+  - name: CALENDAR_ID
+    description: "Google Calendar ID shared with the service account"
+    prompt: "Calendar ID"
+    password: false
