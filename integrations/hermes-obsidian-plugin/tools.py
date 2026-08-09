@@ -177,7 +177,7 @@ def _handle_append(params: Dict[str, Any], **kwargs: Any) -> str:
                 "success": True,
                 "note": rel,
                 "created": created,
-                "note_to_agent": "Appended. You cannot edit or delete notes — additions are permanent.",
+                "note_to_agent": "Appended. Edits are possible via obsidian_edit (snapshotted); deletion is not.",
             }
         )
     except Exception as exc:
@@ -269,6 +269,7 @@ def register(ctx: Any) -> None:
         description="Append to an Obsidian note (append-only; no edit/delete).",
     )
     _register_semantic(ctx)
+    _register_edit(ctx)
     logger.info("obsidian-scoped plugin registered: search/semantic/read/list/append only")
 
 
@@ -428,4 +429,100 @@ def _register_semantic(ctx: Any) -> None:
         },
         handler=_handle_semantic_search,
         description="Semantic search over the Obsidian vault (read-only, fully local).",
+    )
+
+
+# ----------------------------------------------------------------------
+# Editable-but-not-deletable: exact-match edits, git-snapshotted first
+# ----------------------------------------------------------------------
+
+_VAULT_GIT_DIR = os.path.expanduser(os.getenv("OBSIDIAN_GIT_DIR", "~/.hermes/vault-git"))
+
+
+def _snapshot_before_edit(root: "Path", rel: str) -> None:
+    """Commit the file's current state to the external vault git.
+
+    Every edit is individually revertible. If the snapshot cannot be taken,
+    the edit is refused — safety is not optional.
+    """
+    import subprocess
+
+    git_dir = os.path.expanduser(_VAULT_GIT_DIR)
+    if not os.path.exists(os.path.join(git_dir, "HEAD")):
+        raise RuntimeError("vault git snapshot repo missing; refusing to edit without a safety net")
+    base = ["git", "--git-dir", git_dir, "--work-tree", str(root)]
+    subprocess.run(base + ["add", "--", rel], check=True, capture_output=True, timeout=20)
+    subprocess.run(
+        base + ["commit", "-q", "--no-gpg-sign", "-m", f"pre-edit snapshot: {rel}"],
+        capture_output=True,
+        timeout=20,
+    )  # exit 1 when nothing to commit (already snapshotted) — fine either way
+
+
+def _handle_edit(params: Dict[str, Any], **kwargs: Any) -> str:
+    del kwargs
+    try:
+        old_text = params.get("old_text") or ""
+        new_text = params.get("new_text")
+        if not old_text or new_text is None:
+            return json.dumps({"success": False, "error": "old_text and new_text are required"})
+        root = _vault_root()
+        note = _resolve_note(root, params.get("path") or "", must_exist=True)
+        rel = str(note.relative_to(root))
+        content = note.read_text(encoding="utf-8")
+        count = content.count(old_text)
+        if count == 0:
+            return json.dumps(
+                {"success": False, "error": "old_text not found — it must match the note exactly (read the note first)"}
+            )
+        if count > 1:
+            return json.dumps(
+                {"success": False, "error": f"old_text matches {count} places — include more surrounding context"}
+            )
+        updated = content.replace(old_text, str(new_text), 1)
+        if not updated.strip():
+            return json.dumps(
+                {"success": False, "error": "refused: this edit would leave the note empty (deletion is not allowed)"}
+            )
+        _snapshot_before_edit(root, rel)
+        note.write_text(updated, encoding="utf-8")
+        return json.dumps(
+            {
+                "success": True,
+                "note": rel,
+                "chars_before": len(content),
+                "chars_after": len(updated),
+                "note_to_agent": "Edited (previous state git-snapshotted). Note files can never be deleted or renamed.",
+            }
+        )
+    except Exception as exc:
+        logger.exception("obsidian_edit failed")
+        return json.dumps({"success": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _register_edit(ctx: Any) -> None:
+    ctx.register_tool(
+        name="obsidian_edit",
+        toolset="obsidian",
+        schema={
+            "name": "obsidian_edit",
+            "description": (
+                "Edit a note in the user's Obsidian vault by EXACT text replacement: "
+                "old_text must match the current note content exactly and uniquely "
+                "(obsidian_read first). The previous state is git-snapshotted before "
+                "every edit, and an edit may never leave a note empty. There are no "
+                "tools to delete or rename notes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Vault-relative note path"},
+                    "old_text": {"type": "string", "description": "Exact existing text to replace (unique in the note)"},
+                    "new_text": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+        handler=_handle_edit,
+        description="Edit an Obsidian note via exact replacement (snapshotted; no delete).",
     )
