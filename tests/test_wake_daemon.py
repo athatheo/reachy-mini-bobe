@@ -821,8 +821,11 @@ def test_dwell_frames_fire_briefing_once(tmp_path):
         )
         status = client.get("/v1/presence", headers={"X-BoBe-Wake-Token": "test-token"})
 
+    from datetime import date, timedelta
+
+    expected = MORNING_BRIEF_PROMPT.format(yesterday=(date.today() - timedelta(days=1)).isoformat())
     events = got.json()["events"]
-    assert [e["text"] for e in events] == [MORNING_BRIEF_PROMPT]
+    assert [e["text"] for e in events] == [expected]
     body = status.json()
     assert body["frames_received"] == 4
     assert body["face_hits"] == 4

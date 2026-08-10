@@ -287,14 +287,18 @@ class BobeVoiceHandler(AsyncStreamHandler):
         task.add_done_callback(self._announce_tasks.discard)
 
     async def _handle_speech_clip(self, pcm: NDArray[np.int16], rate: int) -> None:
-        """Play a speech clip now, or park it and wake the robot first."""
+        """Play a speech clip now, or park it and wake the robot first.
+
+        Unlike text announcements, speech clips ALWAYS wake the robot — they
+        are deliberate spoken content (conversation replies, the
+        presence-triggered morning brief), and the brief in particular only
+        fires when the user is demonstrably sitting at the desk. A spoken
+        "go to sleep" therefore holds ambient announcements, but never a clip.
+        """
         try:
             if self.wake_gate.enabled and not self.wake_session.awake:
                 self._pending_speech.append((pcm, rate))
-                if self._announce_wake_allowed:
-                    self.wake_session.request_wake()
-                else:
-                    logger.info("Holding speech clip until the next wake (user asked for sleep)")
+                self.wake_session.request_wake()
                 return
             await self._play_speech_clip(pcm, rate)
         except asyncio.CancelledError:

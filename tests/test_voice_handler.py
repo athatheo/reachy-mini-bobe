@@ -263,7 +263,8 @@ async def test_handle_speech_clip_parks_and_requests_wake_while_asleep():
 
 
 @pytest.mark.asyncio
-async def test_handle_speech_clip_holds_wake_after_spoken_sleep():
+async def test_speech_clip_wakes_even_after_spoken_sleep():
+    """Clips are deliberate spoken content: the announce hold never applies."""
     handler = _build_handler()
     handler._announce_wake_allowed = False
     pcm = np.ones(100, dtype=np.int16)
@@ -271,7 +272,7 @@ async def test_handle_speech_clip_holds_wake_after_spoken_sleep():
     await handler._handle_speech_clip(pcm, 24000)
 
     assert len(handler._pending_speech) == 1
-    assert handler.wake_session.consume_wake_request() is False
+    assert handler.wake_session.consume_wake_request() is True
 
 
 @pytest.mark.asyncio

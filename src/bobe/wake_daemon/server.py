@@ -49,7 +49,7 @@ MORNING_BRIEF_PROMPT = (
     "for the first time today — this is not spoken input). Check the kanban "
     "board and todo lists AND today's calendar events (calendar_list_events "
     "bounded to today). Also try obsidian_read on yesterday's journal digest "
-    "at 'Hermes/Journal/<yesterday YYYY-MM-DD>.md' for continuity. Greet the "
+    "at 'Hermes/Journal/{yesterday}.md' for continuity. Greet the "
     "user briefly, then: mention today's meetings/appointments with their "
     "times if any, the few genuinely important or time-sensitive tasks if "
     "any, and at most ONE natural continuity remark from yesterday's digest "
@@ -210,7 +210,12 @@ def create_app(config: WakeDaemonConfig | None = None) -> FastAPI:
             logger.exception("Could not persist morning-brief state; skipping to avoid repeats")
             return
         logger.info("First sighting of the day (hour=%d): queuing morning briefing", now.hour)
-        enqueue_utterance(MORNING_BRIEF_PROMPT)
+        # Compute "yesterday" here — the model repeatedly gets date arithmetic
+        # wrong (read the digest for the 7th when yesterday was the 9th).
+        from datetime import timedelta
+
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        enqueue_utterance(MORNING_BRIEF_PROMPT.format(yesterday=yesterday))
 
     config_brief_hour = runtime.brief_after_hour
     app.state.handle_presence = handle_presence
